@@ -110,7 +110,7 @@ backend `.…` keys below, written inline (`backend = { address = "…" }`) or a
 | `oauth.issuers[].client_claim` | string | `azp` | claim naming the OAuth client |
 | `scope.internal_networks` | array of CIDR | empty (default: the `[password_gate]` networks) | label `scope=internal` in logs and metrics; allows nothing |
 | `legacy.rules[].name` | string | required | unique, 1-64 of `A-Z a-z 0-9 . _ -`; logged as `rule=` |
-| `legacy.rules[].networks` | array of CIDR | required | client source networks; the real boundary |
+| `legacy.rules[].networks` | array of CIDR | required | client source networks; the rule's security boundary |
 | `legacy.rules[].sni` | array | any SNI (also none) | names the client must have asked for |
 | `legacy.rules[].users` | array | any user | `user@domain` (local part exact, domain case-insensitive) or `*@domain` |
 | `legacy.rules[].users_file` | path | none | more `users` entries, one per line, `#` comments; re-read on change |

@@ -1,13 +1,11 @@
 # Installing mail-auth-proxy
 
-The proxy is one static binary (`x86_64-unknown-linux-musl`, no runtime dependencies
-besides the system CA store) with a systemd unit. Packages are published for
-Debian/Ubuntu (APT repository) and RHEL-compatible systems (RPM release asset). Building
-from source is described in [CONTRIBUTING.md](CONTRIBUTING.md#building-and-testing).
-
-Releases, packages and the release signing key are published at
-<https://github.com/NK-IT-CLOUD/mail-auth-proxy/releases>. The packages are built for
-Linux on x86_64.
+The proxy is one static binary for Linux on x86_64 (`x86_64-unknown-linux-musl`, no
+runtime dependencies besides the system CA store) with a systemd unit. Packages are
+published for Debian/Ubuntu (APT repository) and RHEL-compatible systems (RPM release
+asset). Releases, packages and the release signing key are at
+<https://github.com/NK-IT-CLOUD/mail-auth-proxy/releases>. Building from source is
+described in [CONTRIBUTING.md](CONTRIBUTING.md#building-and-testing).
 
 Before you start, set up the backend and the identity provider:
 [docs/backend-dovecot-postfix.md](docs/backend-dovecot-postfix.md) and
@@ -17,24 +15,27 @@ Before you start, set up the backend and the identity provider:
 
 ### Debian, Ubuntu (APT repository)
 
+Download the repository key and compare its fingerprint before you add the repository:
+
 ```bash
 sudo install -d -m755 /etc/apt/keyrings
 curl -fsSL https://apt.nk-it.cloud/gpg.key \
   | sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/nk-it-cloud.gpg
+gpg --show-keys /etc/apt/keyrings/nk-it-cloud.gpg
+```
+
+> **APT repository key:** `A66E 54ED 9E75 BF3D E610  2ED5 AE60 35D7 D6D3 1EB4` (rsa4096)
+
+If the fingerprint matches, add the repository and install:
+
+```bash
 echo "deb [signed-by=/etc/apt/keyrings/nk-it-cloud.gpg] https://apt.nk-it.cloud/apt stable main" \
   | sudo tee /etc/apt/sources.list.d/nk-it-cloud.list
 sudo apt update
 sudo apt install mail-auth-proxy
 ```
 
-APT checks the repository signature itself; the key above signs the repository index.
-Before trusting it, compare its fingerprint:
-
-```bash
-gpg --show-keys /etc/apt/keyrings/nk-it-cloud.gpg
-```
-
-> **APT repository key:** `A66E 54ED 9E75 BF3D E610  2ED5 AE60 35D7 D6D3 1EB4` (rsa4096)
+The key signs the repository index, and APT checks that signature on every update.
 
 ### RHEL-compatible systems (RPM)
 
@@ -82,8 +83,8 @@ Each release publishes, next to the `.deb`, `.rpm` and `.tar.gz`:
   signing key.
 
 The release signing key `release-signing-key.asc` is attached to every release and is
-also `packaging/release-signing-key.asc` in the repository; its fingerprint is also listed
-in [SECURITY.md](SECURITY.md).
+`packaging/release-signing-key.asc` in the repository. [SECURITY.md](SECURITY.md) lists
+its fingerprint as well.
 
 > **Release signing key:** `0B58 3E99 144D CD9B 5A34  D96B E52C 6D1E FB67 927B`
 > (ed25519, `Norbert Krucky (mail-auth-proxy release signing) <developers@nk-it.cloud>`)
@@ -145,10 +146,8 @@ The same applies to the TLS key, a doveadm key file and legacy users/domains fil
 
 ### Certificates
 
-The proxy serves one certificate chain for every name; it must cover every name clients
-use (the public name and, if you use `sni` in a legacy rule, those names too). Backends
-are always verified: against the system trust store, or the CAs in the backend's
-`ca_file`.
+The proxy serves one certificate chain for every name. It must cover every name clients
+use: the public name and, if you use `sni` in a legacy rule, those names too.
 
 After a renewal, copy the new files into place with the same owner and mode and send the
 process `SIGHUP`:
@@ -159,9 +158,12 @@ journalctl -u mail-auth-proxy -n 5    # expect "reload: certificate loaded"
 ```
 
 `SIGHUP` re-reads certificate and key and refreshes every JWKS without closing open
-connections. A certificate that fails to load is logged at `ERROR` and the old one stays in
-use. For certbot, a deploy hook can run these commands. The configuration file itself is
-not re-read; a configuration change needs a restart.
+connections. It does not re-read the configuration file; a configuration change needs a
+restart. A certificate that fails to load is logged at `ERROR` and the old one stays in
+use. For certbot, a deploy hook can run these commands.
+
+Backend certificates are always verified, against the system trust store or the CAs in
+the backend's `ca_file`.
 
 ## 4. Check and start
 
@@ -187,15 +189,14 @@ with the listen and backend addresses. Test with a mail client and look for
 
 ## 5. Upgrade
 
-With APT: `sudo apt update && sudo apt upgrade`. With RPM: verify and `dnf install` the new
-RPM as above.
+With APT: `sudo apt update && sudo apt upgrade`. With RPM: verify the new RPM and
+`dnf install` it as above. Read the [changelog](CHANGELOG.md) before upgrading.
 
 On upgrade the package restarts a **running** service only if the configuration passes
 `--check-config` with the service's credentials; otherwise the old process keeps running
 and a warning is printed. A stopped service stays stopped. Your `config.toml` is kept: on
 Debian, dpkg asks if the shipped example changed; with RPM, a changed example is written
-next to your file as `config.toml.rpmnew`. Read the [changelog](CHANGELOG.md) before
-upgrading.
+next to your file as `config.toml.rpmnew`.
 
 On `SIGTERM` (stop, restart) the proxy stops accepting and gives open sessions 10 s to
 finish; clients reconnect after that.
@@ -208,7 +209,10 @@ sudo apt purge mail-auth-proxy      # also removes the configuration
 sudo dnf remove mail-auth-proxy     # RPM
 ```
 
-Removal stops and disables the service. The user and group `mail-auth-proxy` stay, because
-files you created may belong to them; when nothing uses them any more, delete them with
-`sudo userdel mail-auth-proxy` (and `sudo groupdel mail-auth-proxy` if the group is left). On purge the directory `/etc/mail-auth-proxy` is removed only if it is
-empty. `dnf remove` keeps a `config.toml` you changed as `config.toml.rpmsave`.
+Removal stops and disables the service. On purge the directory `/etc/mail-auth-proxy`
+is removed only if it is empty. `dnf remove` keeps a `config.toml` you changed as
+`config.toml.rpmsave`.
+
+The user and group `mail-auth-proxy` stay, because files you created may belong to them.
+When nothing uses them any more, delete them with `sudo userdel mail-auth-proxy` (and
+`sudo groupdel mail-auth-proxy` if the group is left).

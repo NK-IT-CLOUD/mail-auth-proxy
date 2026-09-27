@@ -45,11 +45,11 @@ The proxy and the backend accept a token only if `aud` contains the mail audienc
 that audience only to mail clients: any token with it opens the user's mailbox.
 
 1. Create a client scope `mail` (protocol OpenID Connect) with a mapper of type
-   **Audience**: *Included Client Audience* `mail` (a client with that ID that stands for
+   *Audience*: *Included Client Audience* `mail` (a client with that ID that stands for
    the mail backend and has every flow switched off), *Add to access token* on, *Add to ID
    token* off. This is the form of the working installation; *Included Custom Audience*
    `mail` needs no extra client but was **not verified** there.
-2. Add the client scope `mail` as a **Default** client scope to each mail client, and to
+2. Add the client scope `mail` as a *Default* client scope to each mail client, and to
    no other client.
 
 ## Mail clients
@@ -70,12 +70,10 @@ user), create an OpenID Connect client:
 | Always use lightweight access token | off: a lightweight token leaves out claims such as `email` and `email_verified` |
 | Full scope allowed | off, unless the client needs realm roles |
 
-Keep the access token small: no group or role lists in mail tokens. The Dovecot backend
-rejects SASL responses above 8 KB of base64 (see
-[backend-dovecot-postfix.md](backend-dovecot-postfix.md#oauth2-passdb-with-local-jwks-validation)).
-
-With Dovecot local validation, each client ID also needs its key directory on the backend
-(same page).
+Keep group and role lists out of mail tokens: the Dovecot backend rejects SASL responses
+above 8 KB of base64. With Dovecot local validation, each client ID also needs its key
+directory on the backend. Both are described in
+[backend-dovecot-postfix.md](backend-dovecot-postfix.md#oauth2-passdb-with-local-jwks-validation).
 
 ## Proxy configuration
 

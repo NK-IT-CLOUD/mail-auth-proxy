@@ -4,9 +4,6 @@
 
 **OAuth2 authentication proxy for IMAP, SMTP submission and ManageSieve**
 
-Validates bearer tokens locally before your mail server sees them, and lets passwords in
-only where you allow them.
-
 [![CI](https://img.shields.io/github/actions/workflow/status/NK-IT-CLOUD/mail-auth-proxy/ci.yml?branch=main&label=CI)](https://github.com/NK-IT-CLOUD/mail-auth-proxy/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/NK-IT-CLOUD/mail-auth-proxy)](https://github.com/NK-IT-CLOUD/mail-auth-proxy/releases)
 [![MSRV](https://img.shields.io/badge/rust-1.88%2B-blue)](CONTRIBUTING.md#building-and-testing)
@@ -23,28 +20,20 @@ only where you allow them.
 
 ---
 
-mail-auth-proxy sits in front of your mail server, terminates TLS and decides every login
-before the backend sees it. It is written in async Rust and ships as one static binary
+mail-auth-proxy sits in front of your mail server, terminates TLS and checks every login
+before the backend sees it. OAuth2 tokens (`XOAUTH2`, `OAUTHBEARER`) are validated locally
+and then passed unchanged to the backend. Passwords (`PLAIN`, `LOGIN`) get in only through
+the legacy gate, which is off by default. After the login the proxy relays bytes; it does
+not implement IMAP or SMTP beyond the authentication preamble. It is one static Rust binary
 with one configuration file.
-
-- **OAuth2** (`XOAUTH2`, `OAUTHBEARER`): the bearer token is validated locally against the
-  issuer's JWKS, then the **same token** is replayed to the backend. No master password, no
-  shared secret, no introspection call per login.
-- **Passwords** (`PLAIN`, `LOGIN`): a separate path without SSO, through the **legacy
-  gate**. Rules by source network, TLS server name, protocol, mechanism and user, plus an
-  allowed-domain list, an account check against Dovecot and a per-account throttle. Off by
-  default: everything without a matching rule stays OAuth-only on the same IP and port.
-
-After a successful login the proxy only relays bytes. It does not implement IMAP or SMTP
-beyond the authentication preamble.
 
 ## Why
 
 Mail clients have moved to OAuth2, and providers are switching off password logins for
-IMAP and SMTP. Rolling OAuth2 out on your own mail server leaves a gap: you want one public
-endpoint that only accepts valid tokens, while a few legacy systems (scanners, monitoring,
-mailflow checks) still need passwords from known networks. mail-auth-proxy covers exactly
-that case.
+IMAP and SMTP. On your own mail server you want one public endpoint that accepts only valid
+tokens, while a few legacy systems (scanners, monitoring, mailflow checks) still need
+passwords from known networks. mail-auth-proxy serves both on the same IP and port and
+accepts a password only where a rule allows it.
 
 ## How it works
 
@@ -62,12 +51,14 @@ that case.
    side closes.
 
 > [!IMPORTANT]
-> The backend must validate the forwarded token itself. The proxy is a gate in front of
-> it, not a replacement for it.
+> The backend must still validate the forwarded token itself; the proxy does not replace
+> that check.
 
 ## Features
 
 **Token validation**
+- The backend receives the client's own token: no master password, no shared secret, no
+  introspection call per login.
 - Local JWT check against each issuer's JWKS: signature, `iss`, `aud`, `exp`/`nbf`, access
   token only (Keycloak `typ` or RFC 9068 `at+jwt`), `email_verified`, optional client
   allowlist.
@@ -77,6 +68,7 @@ that case.
   the client typed.
 
 **Password gate** (optional, off by default)
+- Connections without a matching rule are OAuth-only.
 - Rules per source network, TLS server name, protocol, mechanism and user; allowed domains;
   account check via the doveadm HTTP API; per-account throttle.
 - Refused and wrong passwords get the same reply with similar timing; the log keeps the
@@ -217,7 +209,7 @@ so an outage cannot turn into bans of legitimate users.
 <details>
 <summary>Prometheus metrics</summary>
 
-Off by default; enable with `metrics.listen` in `[metrics]`. The endpoint has no
+Off by default; enable with `enabled = true` and a `listen` address in `[metrics]`. The endpoint has no
 authentication, so keep it on loopback or a management network.
 
 | Metric | What it counts |
@@ -280,9 +272,7 @@ The complete list is in
 - **Stalwart**: a mail server with OAuth support of its own; its migration proxy forwards
   tokens without checking them.
 
-mail-auth-proxy combines local token validation with issuer-bound keys, a password gate by
-source network and TLS server name on the same port, and a fixed log line for log-based
-blocking. If your mail server already does what you need, you may not need it.
+If your mail server already covers your case, you do not need mail-auth-proxy.
 
 ## Status
 

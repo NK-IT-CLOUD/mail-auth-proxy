@@ -6,14 +6,13 @@ Logging, metrics, signals and troubleshooting. Where this document and the code 
 
 Output goes to stderr through `tracing-subscriber` in fmt format, with ANSI colours turned off.
 
-The level comes from `RUST_LOG` and defaults to `info` when it is unset, so `authresult` lines are always written. The shipped systemd unit sets `RUST_LOG=info` explicitly.
+The level comes from `RUST_LOG`. It defaults to `info` when unset, which writes every `authresult` line. The shipped systemd unit sets `RUST_LOG=info` explicitly.
 
 ### The `authresult` line
 
 One line per evaluated credential, target `authlog`. Its field names, order and quoting,
 the log targets, and the metric names below are a public interface: they change only
-in a release that says so in the changelog. A CrowdSec parser and scenarios for this line
-are in [contrib/crowdsec](../contrib/crowdsec/).
+in a release that says so in the changelog.
 
 ```
 2026-09-26T21:29:56.642346Z  WARN authlog: authresult result="fail" proto="imap" scope="internal" mech=XOAUTH2 user=evil?FAKE?authresult?result??ok??user?root peer=127.0.0.1 reason="bad_token" pwfp="" rule=""
@@ -29,10 +28,10 @@ Successful outcomes are logged at `INFO` and failures at `WARN`. The field order
 | `result` | `"ok"` or `"fail"` |
 | `proto` | `"imap"`, `"smtp"`, `"sieve"` |
 | `scope` | `"internal"` if the source IP is in `scope.internal_networks` (regardless of SNI), else `"external"` |
-| `mech` | the mechanism **as the client spelled it** (e.g. `xoauth2`), passed through `sanitize`. `LOGIN` covers both the IMAP LOGIN command and SASL LOGIN. `other` for `protocol` records. |
+| `mech` | the mechanism as the client spelled it (e.g. `xoauth2`), passed through `sanitize`. `LOGIN` covers both the IMAP LOGIN command and SASL LOGIN. `other` for `protocol` records. |
 | `user` | `ok`: the validated identity (OAuth) or the client-supplied login (password). `bad_token`, `authzid_mismatch`: the client-supplied SASL user (XOAUTH2 `user=`, OAUTHBEARER `a=`, possibly empty for `bad_token`). `blocked_endpoint`, `unknown_domain`, `unknown_account`, `throttled`, `oversize`: the client's login. `backend_reject`: the email (OAuth) or the client's login. Empty for `protocol`. |
 | `peer` | the client IP, without port; an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, from a dual-stack listener) is logged as the IPv4 address |
-| `reason` | `ok`; `bad_token` (JWT rejected locally); `authzid_mismatch` (valid token, but the client's XOAUTH2 `user=` / OAUTHBEARER `a=` names another identity; the backend is not contacted); `blocked_endpoint` (password with a mechanism the connection does not offer, or a user no legacy rule allows); `unknown_domain`, `unknown_account`, `throttled` ([legacy gate](architecture.md#legacy-gate)); `oversize` (a password over 1024 bytes, refused before the legacy gate); `backend_reject` (the backend rejected the credential: IMAP/ManageSieve `NO`, SMTP `510`–`599`; an unreachable backend or a reply without a verdict writes no record); `protocol` (the connection ended before a credential: EOF, timeout, unknown command, unsupported mech, SASL parse error, command limit). |
+| `reason` | `ok`; `bad_token` (JWT rejected locally); `authzid_mismatch` (valid token, but the client's XOAUTH2 `user=` / OAUTHBEARER `a=` names another identity; the backend is not contacted); `blocked_endpoint` (password with a mechanism the connection does not offer, or a user no legacy rule allows); `unknown_domain`, `unknown_account`, `throttled` ([legacy gate](architecture.md#legacy-gate)); `oversize` (a password over 1024 bytes, refused before the legacy gate); `backend_reject` (the backend rejected the credential: IMAP/ManageSieve `NO`, SMTP `510` to `599`; an unreachable backend or a reply without a verdict writes no record); `protocol` (the connection ended before a credential: EOF, timeout, unknown command, unsupported mech, SASL parse error, command limit). |
 | `rule` | the legacy rule that decided a password attempt (`ok`, `backend_reject`, `unknown_domain`, `unknown_account`, `throttled`); `""` for OAuth, `protocol`, `oversize`, when no rule applies (`blocked_endpoint`), and for `unknown_account` of an invalid login (empty, over 255 bytes, or with control characters). The `[password_gate]` short form is the rule `password_gate`. |
 | `pwfp` | 16 hex chars: the first 64 bits of HMAC-SHA256(password) under a random key generated per process. Set only for failed password credentials (`blocked_endpoint`, `unknown_domain`, `unknown_account`, `throttled`, `oversize`, `backend_reject`), otherwise `""`. It can be compared only within one process lifetime. |
 
@@ -76,15 +75,15 @@ When a `protocol` record is written:
 
 ## Prometheus metrics
 
-Metrics are an optional feature, off by default. With `metrics.enabled = true` (or only `metrics.listen` set), `metrics.listen` serves a minimal HTTP/1.1 responder. It answers **any** method and path with the exposition text after the first read, without authentication. All series are always present, starting at 0.
+Metrics are off by default. They are on with `metrics.enabled = true` or when only `metrics.listen` is set. `metrics.listen` then serves a minimal HTTP/1.1 responder without authentication: after the first read it answers any method and path with the exposition text. All series are always present, starting at 0.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `mail_auth_proxy_build_info` | gauge | `version` | always 1 |
-| `mail_auth_proxy_auth_attempts_total` | counter | `proto` (imap, smtp, sieve), `scope` (internal, external), `mechanism` (xoauth2, oauthbearer, plain, login, other), `result` (ok, fail) | a credential was evaluated. `fail` counts every refused credential, one per `authresult` line with reason `bad_token`, `authzid_mismatch`, `blocked_endpoint`, `unknown_domain`, `unknown_account`, `throttled`, `oversize` or `backend_reject` — not backend or account-check outages (no `authresult` line) and not `protocol` (counted in `mail_auth_proxy_preauth_aborts_total`). |
+| `mail_auth_proxy_auth_attempts_total` | counter | `proto` (imap, smtp, sieve), `scope` (internal, external), `mechanism` (xoauth2, oauthbearer, plain, login, other), `result` (ok, fail) | a credential was evaluated. `fail` counts every refused credential, one per `authresult` line with reason `bad_token`, `authzid_mismatch`, `blocked_endpoint`, `unknown_domain`, `unknown_account`, `throttled`, `oversize` or `backend_reject`. Backend and account-check outages (no `authresult` line) and `protocol` (counted in `mail_auth_proxy_preauth_aborts_total`) are not counted. |
 | `mail_auth_proxy_auth_refusals_total` | counter | `proto`, `reason` (`blocked_endpoint`, `bad_token`, `authzid_mismatch`, `backend_reject`, `unknown_domain`, `unknown_account`, `throttled`, `oversize`) | a refused credential, by the `reason` of its `authresult` line ([above](#the-authresult-line)). The sum over `reason` equals the `fail` side of `mail_auth_proxy_auth_attempts_total`. |
 | `mail_auth_proxy_preauth_aborts_total` | counter | `proto`, `scope` | the connection ended before a credential was presented. Sieve capability-probe failures are not counted. |
-| `mail_auth_proxy_token_validate_total` | counter | `result` | local JWT validations |
+| `mail_auth_proxy_token_validate_total` | counter | `result` (ok, fail) | local JWT validations |
 | `mail_auth_proxy_connections_total` | counter | `proto` | connections admitted past the limits |
 | `mail_auth_proxy_connections_rejected_total` | counter | `proto` | connections closed at accept by a limit |
 | `mail_auth_proxy_backend_errors_total` | counter | `proto` | backend or legacy account check (doveadm) unreachable or failing while a client waited for its verdict (outage, not a failed login) |
@@ -96,22 +95,22 @@ Metrics are an optional feature, off by default. With `metrics.enabled = true` (
 
 | Signal | Effect |
 |---|---|
-| `SIGHUP` | Reload: the TLS certificate and key are read again and every JWKS is refreshed (like the periodic refresh) in the background; a `SIGHUP` while that refresh still runs starts no second one, and `SIGTERM` is handled at once meanwhile. Open connections are not touched; new handshakes get the new certificate (a resumed TLS session keeps the one it was established with). A certificate or key that cannot be loaded, or that do not belong together, is logged at `ERROR` and the current certificate stays. The configuration file itself is **not** re-read; a configuration change needs a restart. |
-| `SIGTERM`, `SIGINT` | Shutdown: every listener is closed at once (new connections are refused), open sessions, including relayed ones, may continue for up to 10 s, then the process exits with status 0 and closes whatever is still open. |
+| `SIGHUP` | Reload the TLS certificate and key, and refresh every JWKS in the background (like the periodic refresh). The configuration file is **not** re-read; a configuration change needs a restart. New handshakes get the new certificate; open connections and resumed TLS sessions keep the one they were established with. A certificate or key that cannot be loaded, or a pair that does not belong together, is logged at `ERROR` and the current certificate stays. A `SIGHUP` while a refresh still runs starts no second one, and `SIGTERM` is handled at once meanwhile. |
+| `SIGTERM`, `SIGINT` | Shutdown: every listener closes at once and new connections are refused. Open sessions, including relayed ones, may continue for up to 10 s; then the process closes whatever is still open and exits with status 0. |
 
 The signal handlers are installed first at startup, so a `SIGHUP` during startup does not end the process.
 
 Under systemd, when `$NOTIFY_SOCKET` is set (`Type=notify`), the proxy sends `READY=1` from its main process once the JWKS are loaded and every listener is bound, and `STOPPING=1` when a shutdown starts. Without the variable nothing is sent.
 
-The shipped unit uses `Type=notify` (so `systemctl start` returns only when the proxy accepts connections, and fails if it never gets there) and `ExecReload=/bin/kill -HUP $MAINPID`, so `systemctl reload mail-auth-proxy` sends the `SIGHUP` reload above.
+The shipped unit uses `Type=notify`, so `systemctl start` returns only when the proxy accepts connections and fails if it never gets there. Its `ExecReload=/bin/kill -HUP $MAINPID` makes `systemctl reload mail-auth-proxy` send the `SIGHUP` reload above.
 
 ## Log-based blocking
 
-The proxy blocks nothing by itself beyond its connection limits and the per-account
-throttle of the legacy gate. Feed the `authresult` lines to a log-based blocker: the
-parser and five scenarios in [contrib/crowdsec](../contrib/crowdsec/) cover brute force,
-password spraying (`pwfp`), password probing on OAuth-only endpoints, slow guessing and
-honeypot account names. Whitelist your own management networks there.
+Apart from its connection limits and the per-account throttle of the legacy gate, the
+proxy blocks nothing. Feed the `authresult` lines to a log-based blocker. The parser and
+five scenarios in [contrib/crowdsec](../contrib/crowdsec/) cover brute force, password
+spraying (many accounts from one address), password probing on OAuth-only endpoints, slow guessing and honeypot
+account names. Whitelist your own management networks there.
 
 ## Troubleshooting
 
@@ -133,5 +132,5 @@ and an `Environment=` line) while you look for them, and switch back afterwards.
 | Postfix logs the proxy's address instead of the client's | Postfix log | `submission.xclient = true` but the proxy is not in `smtpd_authorized_xclient_hosts`: Postfix does not advertise `XCLIENT` and the step is skipped silently |
 | Every submission login gets `454` retry-later | `WARN … backend advertises XCLIENT to this proxy but submission.xclient = false` | the proxy is in `smtpd_authorized_xclient_hosts` but `submission.xclient` is off; set it to `true` or remove the proxy from that list |
 | Submission logins from some clients get `454` retry-later | `WARN … backend still advertises XCLIENT after XCLIENT ADDR=<client>` | the client's own address is in `smtpd_authorized_xclient_hosts` (e.g. a whole network listed); list only the proxy |
-| A client reports a connection loss after a wrong password | — | one authentication attempt per connection; the client must reconnect (see [protocols](protocols.md#surprising-and-client-incompatible-behaviour)) |
+| A client reports a connection loss after a wrong password | | one authentication attempt per connection; the client must reconnect (see [protocols](protocols.md#surprising-and-client-incompatible-behaviour)) |
 | New certificate not served | `reload: certificate loaded` / `ERROR reload: certificate unusable` | `SIGHUP` not sent after renewal, or the new files are not readable by the service group |

@@ -5,26 +5,27 @@ belong in the issue tracker: report them as described in [SECURITY.md](SECURITY.
 
 ## How the project is run
 
-- **One maintainer.** The project has a single maintainer who reviews and merges every
-  change and decides what goes in. There is no commercial support and no response-time
-  promise for issues or pull requests.
-- **Canonical repository and GitHub.** Development happens in a private repository.
-  GitHub carries the public part of it: the files listed in
-  `packaging/public-files.txt`, published with the release tags. Internal planning notes
-  and a maintainer file stay private, so the GitHub history is not a copy of the
-  canonical one. Pull requests on GitHub are welcome: accepted changes are applied in the
-  canonical repository with you credited as author, and reach GitHub with the next
-  publication. The pull request is then closed with a link to the commit.
-- **License.** The project is MIT-licensed; by contributing you agree that your
-  contribution is licensed under the same terms.
+The project has a single maintainer who reviews and merges every change and decides what
+goes in. There is no commercial support and no response-time promise for issues or pull
+requests.
+
+Development happens in a private canonical repository. GitHub carries its public part:
+the files listed in `packaging/public-files.txt`, published with the release tags.
+Internal planning notes and a maintainer file stay private, so the GitHub history is not
+a copy of the canonical one. Pull requests on GitHub are welcome. An accepted change is
+applied in the canonical repository with you credited as author and reaches GitHub with
+the next publication; the pull request is then closed with a link to the commit.
+
+The project is MIT-licensed. By contributing you agree that your contribution is licensed
+under the same terms.
 
 ## Use of AI tools
 
 Parts of the code and of the documentation were written with the help of AI coding
-assistants and reviewed by the maintainer. The same rules apply to every change,
-whoever or whatever wrote it: it needs tests for the behaviour it changes, it must pass
-all checks below, and the maintainer must understand and review every line. If you used
-an AI tool for a contribution, say so in the pull request.
+assistants and reviewed by the maintainer. Every change, whoever or whatever wrote it,
+needs tests for the behaviour it changes, must pass all checks below, and is read line by
+line by the maintainer. If you used an AI tool for a contribution, say so in the pull
+request.
 
 ## Source layout
 
@@ -79,18 +80,17 @@ If you change `contrib/crowdsec/`, run its hubtest cases as described in
 
 ## Rules for changes
 
-These hold for every change and are what review checks first.
+Review checks these first.
 
-1. **OAuth and passwords are separate paths.** OAuth logins are gated by local token
-   validation only. A password is forwarded only when a legacy rule matches source
-   network, SNI, protocol, mechanism and user, and the domain, account and throttle checks
-   pass, all before any backend contact and failing closed. Nothing in the OAuth path may
-   open the password path or the other way round. Every refusal must look like a wrong
-   password to the client (same reply, same timing); an outage must never be logged as a
-   failed login.
+1. **OAuth and passwords are separate paths.** OAuth logins pass on local token
+   validation only; passwords pass only through the legacy gate, before any backend
+   contact and failing closed ([SECURITY.md](SECURITY.md#invariants)). Nothing in the
+   OAuth path may open the password path or the other way round. Every refusal must look
+   like a wrong password to the client (same reply, same timing); an outage must never be
+   logged as a failed login.
 2. **No credential of its own.** The proxy logs in with the client's own token or
-   password. No master user, no shared secret, no impersonation; backend TLS is always
-   verified and there is no switch to turn that off.
+   password: no master user, no shared secret, no impersonation. Backend TLS is always
+   verified, and there is no switch to turn that off.
 3. **The public interface is API.** The `authresult` log line (field names, order,
    quoting, reason values), log targets, metric names and labels, configuration keys, the
    command line and exit codes are used by log parsers, dashboards and scripts. Changing
@@ -98,10 +98,10 @@ These hold for every change and are what review checks first.
    `authresult` fields go at the end.
 4. **Security-relevant code gets tests that fail without the change.** For the token
    check, the legacy gate, SASL parsing, the protocol dialogs and limits, add a black-box
-   test in `tests/` (or a unit test for pure parsing), and check that it fails when the
+   test in `tests/` (or a unit test for pure parsing) and check that it fails when the
    fix is reverted.
-5. **No `unsafe`.** The code contains none; keep it that way. New dependencies need a
-   reason, must pass `cargo deny`, and must not bring in `openssl` or `ring`.
+5. **No `unsafe`, few dependencies.** The code contains no `unsafe`. A new dependency
+   needs a reason, must pass `cargo deny`, and must not bring in `openssl` or `ring`.
 6. **Docs follow the code.** A change in behaviour updates the matching page under
    `docs/` in the same pull request. Public docs describe the current behaviour only;
    history goes into [CHANGELOG.md](CHANGELOG.md).
@@ -111,4 +111,4 @@ These hold for every change and are what review checks first.
 - One topic per pull request, with a description of what changes and why.
 - Commit messages: imperative summary line (`fix(sieve): …`, `feat(config): …`,
   `docs: …`), body with the reason.
-- All checks above green. Say which tests you added.
+- All checks above pass. Say which tests you added.

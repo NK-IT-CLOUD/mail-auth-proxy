@@ -17,8 +17,8 @@ Example values used throughout:
 
 ## What the backend must do
 
-The proxy validates every token before it contacts the backend, then logs in with **the
-same token** (always as `XOAUTH2`, also when the client used `OAUTHBEARER`) or the same
+The proxy validates every token before it contacts the backend, then logs in with the
+same token (always as `XOAUTH2`, also when the client used `OAUTHBEARER`) or the same
 password (always as `PLAIN`). The backend therefore needs:
 
 1. TLS on every listener the proxy uses, with a certificate for the name the proxy
@@ -120,13 +120,13 @@ passdb oauth2 {
   (default `email`); the proxy sends that claim's value as the XOAUTH2 `user=`.
 - Dovecot looks up keys as `<azp>/<alg>/<kid>` below the prefix, one PEM public key per
   file (`azp` of a token without that claim: `default`; `/` and `%` in a path component
-  escaped as `%2f` and `%25`). Dovecot does not fetch a JWKS itself. The working
-  installation fills the directory with a small timer job that fetches every issuer's
-  JWKS, converts each key to PEM and writes it once per client ID it serves (for example
-  `thunderbird/RS256/<kid>`). A client ID that has no directory there is rejected by
-  Dovecot even though the proxy accepted the token, so add every mail client's ID to that
-  job. Keys are cached in memory; after a key is removed, Dovecot needs a restart to
-  forget it.
+  escaped as `%2f` and `%25`). Dovecot rejects a client ID that has no directory there,
+  even though the proxy accepted the token.
+- Dovecot does not fetch a JWKS itself. The working installation fills the directory with
+  a small timer job that fetches every issuer's JWKS, converts each key to PEM and writes
+  it once per client ID it serves (for example `thunderbird/RS256/<kid>`). Add every mail
+  client's ID to that job.
+- Keys are cached in memory; after a key is removed, Dovecot needs a restart to forget it.
 - The working installation also sets `client_id` in the `oauth2` block. Whether Dovecot
   compares it with the token's `aud` in local mode is **not verified**; the proxy checks
   `aud` against the issuer's `audiences` in any case.
@@ -213,34 +213,47 @@ backend = { address = "192.0.2.10:587", verify_name = "imap.example.org" }
 xclient = true
 ```
 
-- **STARTTLS** is required: the proxy always upgrades the backend connection and expects
-  `STARTTLS` in the backend's first EHLO reply (`smtpd_tls_security_level = encrypt` or
-  `may`). Implicit TLS (port 465) is not supported as a backend.
-- **XCLIENT**: Postfix advertises `XCLIENT` only to `smtpd_authorized_xclient_hosts`. The
-  proxy then sends `XCLIENT NAME=[UNAVAILABLE] ADDR=<client>` and Postfix logs and
-  applies its restrictions with the client's address. If the proxy is not listed, Postfix
-  does not advertise it, the proxy skips the step silently and Postfix sees the proxy's
-  address. The reverse is refused: a backend that advertises `XCLIENT` while
-  `xclient = false` would let the logged-in client send its own `XCLIENT LOGIN=…`, so the
-  proxy answers every login there with a temporary failure and logs the misconfiguration. The
-  same applies when a client's own address is in `smtpd_authorized_xclient_hosts` (Postfix
-  still advertises `XCLIENT` after the proxy's): list only the proxy there.
-  Postfix has no PROXY protocol on this path; `proxy_protocol` on the submission
-  backend is rejected by the proxy's configuration check.
-- **Sender checks**: `smtpd_sender_login_maps` with
-  `reject_authenticated_sender_login_mismatch` work as without the proxy, because the SASL
-  login is the token's identity.
-- **EHLO list**: the proxy answers the client's EHLO itself with the static
-  `submission.ehlo_extensions`. Keep that list in line with what this service offers
-  (`postconf -n` and an `EHLO` against the backend show it); `SIZE` is not advertised
-  unless you add it.
-- **`line_length_limit`**: the proxy sends `AUTH XOAUTH2` without an initial response and
-  the token on its own line, which Postfix limits by `smtpd_sasl_response_limit`
-  (12288 octets), not by `line_length_limit` (default 2048). The working installation
-  raises `line_length_limit` to 16384 on the submission service; whether the default is
-  enough behind the proxy is **not verified** there. Clients that connect to Postfix
-  directly and send the token as an initial response on the `AUTH` line need the higher
-  value.
+### STARTTLS
+
+The backend must offer `STARTTLS` in its first EHLO reply (`smtpd_tls_security_level =
+encrypt` or `may`); the proxy always upgrades the backend connection. Implicit TLS
+(port 465) is not supported as a backend.
+
+### XCLIENT
+
+List only the proxy in `smtpd_authorized_xclient_hosts`. Postfix advertises `XCLIENT`
+only to those hosts; the proxy then sends `XCLIENT NAME=[UNAVAILABLE] ADDR=<client>`, and
+Postfix logs and applies its restrictions with the client's address. If the proxy is not
+listed, Postfix does not advertise `XCLIENT`, the proxy skips the step silently and
+Postfix sees the proxy's address.
+
+The proxy refuses the reverse case. A backend that advertises `XCLIENT` while
+`xclient = false` would let the logged-in client send its own `XCLIENT LOGIN=…`, so the
+proxy answers every login there with a temporary failure and logs the misconfiguration.
+It does the same when a client's own address is in `smtpd_authorized_xclient_hosts`
+(Postfix still advertises `XCLIENT` after the proxy's).
+
+Postfix has no PROXY protocol on this path; the proxy's configuration check rejects
+`proxy_protocol` on the submission backend.
+
+### Sender checks and EHLO
+
+`smtpd_sender_login_maps` with `reject_authenticated_sender_login_mismatch` work as
+without the proxy, because the SASL login is the token's identity.
+
+The proxy answers the client's EHLO itself with the static
+`submission.ehlo_extensions`. Keep that list in line with what this service offers
+(`postconf -n` and an `EHLO` against the backend show it); `SIZE` is not advertised
+unless you add it.
+
+### `line_length_limit`
+
+The proxy sends `AUTH XOAUTH2` without an initial response and the token on its own line,
+which Postfix limits by `smtpd_sasl_response_limit` (12288 octets), not by
+`line_length_limit` (default 2048). The working installation raises `line_length_limit`
+to 16384 on the submission service; whether the default is enough behind the proxy is
+**not verified** there. Clients that connect to Postfix directly and send the token as an
+initial response on the `AUTH` line need the higher value.
 
 ## Checking the setup
 
