@@ -1,11 +1,13 @@
-# Pull request and push checks for the public repository. No secrets, read-only
-# token: safe for pull requests from forks. Release builds, package install tests
-# and the leak gate run in .gitea/workflows/ci.yaml on the maintainer's runner.
+# CI for pushes and pull requests. The same file runs on GitHub (hosted runners) and
+# on the maintainer's Gitea (repository variable CI_RUNNER selects a self-hosted
+# runner there; CARGO_CACHE keeps build output between jobs). No secrets are needed
+# on GitHub; the leak gate over the public file set runs where its patterns exist.
 name: CI
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -17,12 +19,16 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: never
+  # Set on the maintainer's Gitea only (repository variables).
+  CARGO_CACHE: ${{ vars.CARGO_CACHE }}
 
 jobs:
-  # rustup is preinstalled on ubuntu-latest; it installs the toolchain pinned in
-  # rust-toolchain.toml (with rustfmt and clippy).
+  # rustup installs the toolchain pinned in rust-toolchain.toml (with rustfmt and
+  # clippy) on first use.
   check:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    # A self-hosted runner never runs pull requests from forks.
+    if: vars.CI_RUNNER == '' || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -31,8 +37,10 @@ jobs:
 
       - name: Toolchain
         run: |
-          rustup toolchain install
-          cargo --version
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          [ -z "$CARGO_CACHE" ] || echo "CARGO_TARGET_DIR=$CARGO_CACHE/target" >> "$GITHUB_ENV"
+          "$HOME/.cargo/bin/rustup" show active-toolchain || "$HOME/.cargo/bin/rustup" toolchain install
+          "$HOME/.cargo/bin/cargo" --version
 
       - name: Format
         run: cargo fmt --check
@@ -43,20 +51,109 @@ jobs:
       - name: Test
         run: cargo test --locked
 
-  # Licenses, bans, sources and RUSTSEC advisories (deny.toml). Same pinned,
-  # checksum-verified release as the maintainer's CI.
-  deny:
-    runs-on: ubuntu-latest
+      - name: Release build
+        run: |
+          cargo build --release --locked
+          bin=${CARGO_TARGET_DIR:-target}/release/mail-auth-proxy
+          "$bin" --version
+          sha256sum "$bin"
+          echo "BIN=$bin" >> "$GITHUB_ENV"
+
+      - name: Example config is valid
+        run: |
+          # The example names TLS files that do not exist here; everything else
+          # must pass.
+          out=$("$BIN" --check-config examples/config.example.toml 2>&1 || true)
+          echo "$out"
+          if echo "$out" | grep -E '^  - ' | grep -v -E '^  - tls\.(cert|key):'; then
+            echo "FAIL: examples/config.example.toml has problems besides the TLS files"
+            exit 1
+          fi
+
+  # Self-test of the leak gate and the public tree builder; then, where the
+  # patterns exist (secrets), nothing private in the public file set
+  # (packaging/public-files.txt).
+  leak-gate:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    if: vars.CI_RUNNER == '' || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
+      - name: Self-test
+        run: packaging/leak-gate-test.sh
+
+      - name: Public file set
+        env:
+          LEAK_PATTERNS: ${{ secrets.LEAK_PATTERNS }}
+          LEAK_ALLOW: ${{ secrets.LEAK_ALLOW }}
+          SELF_HOSTED: ${{ vars.CI_RUNNER }}
+        run: |
+          set -euo pipefail
+          if [ -z "$LEAK_PATTERNS" ]; then
+            # The maintainer's CI must scan; elsewhere there are no patterns.
+            [ -z "$SELF_HOSTED" ] || { echo "FAIL: secret LEAK_PATTERNS missing"; exit 1; }
+            echo "no leak patterns here: self-test only"; exit 0
+          fi
+          pub=$(mktemp -d)
+          trap 'rm -rf "$pub"' EXIT
+          packaging/public-tree.sh HEAD "$pub/tree"
+          (cd "$pub/tree" && "$GITHUB_WORKSPACE/packaging/leak-gate.sh" HEAD)
+
+  # Two hermetic builds of the same commit must give the same bytes: the binary,
+  # the third-party notices, and the deb and rpm built from them with the commit's
+  # SOURCE_DATE_EPOCH. The build image is packaging/build-image (no override).
+  # Not for pull requests (two full builds): pushes and manual runs.
+  reproducible:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    if: github.event_name != 'pull_request'
+    timeout-minutes: 60
+    env:
+      CONTAINER_ENGINE: ${{ vars.CONTAINER_ENGINE || 'docker' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Tools
+        run: packaging/ci-tools.sh
+
+      - name: Build twice and compare
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          for n in 1 2; do
+            AUDITABLE_BIN="$RUNNER_TEMP/bin/cargo-auditable" ABOUT_BIN="$RUNNER_TEMP/bin/cargo-about" \
+              packaging/build.sh "repro$n"
+            mkdir -p "repro$n/pkg"
+            mkdir -p dist && cp "repro$n/mail-auth-proxy" "repro$n/THIRD-PARTY-NOTICES.html" dist/
+            for p in deb rpm; do VERSION=0.0.0-repro.1 nfpm package -f packaging/nfpm.yaml -p "$p" -t "repro$n/pkg/"; done
+            rm -rf dist
+          done
+          (cd repro1 && sha256sum mail-auth-proxy THIRD-PARTY-NOTICES.html pkg/*) | tee sums1
+          (cd repro2 && sha256sum mail-auth-proxy THIRD-PARTY-NOTICES.html pkg/*) > sums2
+          diff sums1 sums2 || { echo "FAIL: builds differ"; exit 1; }
+
+  # Licenses, bans (ring, openssl-sys, rsa), sources and RUSTSEC advisories
+  # (deny.toml). Pinned release binary, checksum-verified.
+  deny:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    if: vars.CI_RUNNER == '' || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # cargo-deny runs `cargo metadata`, so cargo must be on PATH.
       - name: Toolchain
         run: |
-          rustup toolchain install
-          cargo --version
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" show active-toolchain || "$HOME/.cargo/bin/rustup" toolchain install
+          "$HOME/.cargo/bin/cargo" --version
 
       - name: cargo-deny
         run: |
@@ -71,7 +168,8 @@ jobs:
 
   # rust-version in Cargo.toml.
   msrv:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    if: vars.CI_RUNNER == '' || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -80,18 +178,46 @@ jobs:
 
       - name: cargo +1.88.0 check
         run: |
-          rustup toolchain install 1.88.0 --profile minimal
-          cargo +1.88.0 check --locked --all-targets
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          [ -z "$CARGO_CACHE" ] || export CARGO_TARGET_DIR="$CARGO_CACHE/target-msrv"
+          "$HOME/.cargo/bin/rustup" toolchain install 1.88.0 --profile minimal
+          "$HOME/.cargo/bin/cargo" +1.88.0 check --locked --all-targets
 
-  # Self-test of the leak gate and the public tree builder (throwaway
-  # repositories, no patterns from secrets needed).
-  leak-gate-test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  # Static musl build in the digest-pinned image, deb + rpm with nfpm, then
+  # install, upgrade and remove in throwaway containers (assertions in
+  # packaging/smoke-test.sh).
+  package-smoke:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    if: vars.CI_RUNNER == '' || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    timeout-minutes: 45
+    env:
+      CONTAINER_ENGINE: ${{ vars.CONTAINER_ENGINE || 'docker' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Self-test
-        run: packaging/leak-gate-test.sh
+      - name: Tools
+        run: packaging/ci-tools.sh
+
+      - name: Build
+        run: |
+          AUDITABLE_BIN="$RUNNER_TEMP/bin/cargo-auditable" ABOUT_BIN="$RUNNER_TEMP/bin/cargo-about" \
+            packaging/build.sh dist
+          dist/mail-auth-proxy --version
+          grep -c '<h3 id=' dist/THIRD-PARTY-NOTICES.html
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
+          export SOURCE_DATE_EPOCH
+          # ci.0 is the older version for the upgrade test.
+          for v in 0.0.0-ci.0 "0.0.0-ci.${{ github.run_number }}"; do
+            mkdir -p "dist/$v"
+            for p in deb rpm; do VERSION=$v nfpm package -f packaging/nfpm.yaml -p "$p" -t "dist/$v/"; done
+          done
+          ls -l dist/*/
+
+      - name: Install tests
+        run: packaging/ci-install-tests.sh "dist/0.0.0-ci.0" "dist/0.0.0-ci.${{ github.run_number }}"

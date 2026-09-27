@@ -2,7 +2,6 @@
 # docs/ is listed per file: docs/internal/ must never be public.
 # Everything else stays in the private ops repository.
 .gitignore
-.gitea/workflows/ci.yaml
 .github/
 Cargo.toml
 Cargo.lock
