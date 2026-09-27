@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 460" width="1000" height="460" role="img" aria-labelledby="t d">
+<title id="t">How mail-auth-proxy works</title>
+<desc id="d">Mail clients connect over TLS to mail-auth-proxy on ports 993, 587 and 4190. The SASL mechanism picks the path: XOAUTH2 or OAUTHBEARER tokens are validated locally against the identity provider's JWKS; PLAIN or LOGIN go through the legacy gate only where a rule allows. The proxy then logs in to Dovecot (PROXY protocol v2) or Postfix submission (XCLIENT) over verified TLS with the client's own credential.</desc>
+<defs>
+<marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 1L9 5L0 9z" fill="#656c76"/></marker>
+<marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 1L9 5L0 9z" fill="#4493f8"/></marker>
+</defs>
+<style>
+text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,Helvetica,Arial,sans-serif;font-size:12.5px;fill:#9198a1}
+.h{font-size:14px;font-weight:600;fill:#f0f6fc}
+.p{font-size:15px;font-weight:600;fill:#4493f8}
+.c{text-anchor:middle}
+.n{font-style:italic}
+.e{font-size:12px}
+.box{fill:#151b23;stroke:#3d444d;stroke-width:1}
+.in{fill:#0d1117;stroke:#1f6feb;stroke-width:1}
+.l{fill:none;stroke:#656c76;stroke-width:1.25;marker-end:url(#a)}
+.k{fill:none;stroke:#4493f8;stroke-width:1.25;stroke-dasharray:5 4;marker-end:url(#b)}
+</style>
+<rect class="box" x="16" y="236" width="114" height="88" rx="8"/>
+<text class="h c" x="73" y="268">Mail clients</text>
+<text class="c" x="73" y="290">Thunderbird,</text>
+<text class="c" x="73" y="306">phone, webmail</text>
+<text class="c e" x="184" y="270">TLS</text>
+<text class="c e" x="184" y="300">993 IMAPS</text>
+<text class="c e" x="184" y="316">587 submission</text>
+<text class="c e" x="184" y="332">4190 ManageSieve</text>
+<g transform="translate(10 0)">
+<rect x="240" y="120" width="536" height="320" rx="14" fill="#121d2f" stroke="#4493f8" stroke-width="1.5"/>
+<text class="p" x="258" y="146">mail-auth-proxy</text>
+<text class="c n" x="508" y="426">Nothing reaches the backend before the check has passed.</text>
+<path d="M276 262L294 280L276 298L258 280z" fill="#4493f8"/>
+<text class="h" x="304" y="276">SASL</text>
+<text class="h" x="304" y="293">mechanism</text>
+<path class="l" d="M276 262V198H444"/>
+<path class="l" d="M276 298V362H444"/>
+<text class="e" x="286" y="174">XOAUTH2 /</text>
+<text class="e" x="286" y="190">OAUTHBEARER</text>
+<text class="e" x="286" y="354">PLAIN / LOGIN</text>
+<text class="n e" x="286" y="380">only where a rule allows</text>
+<rect class="in" x="446" y="162" width="168" height="72" rx="8"/>
+<text class="h c" x="530" y="188">Validate JWT locally</text>
+<text class="c" x="530" y="208">signature via JWKS,</text>
+<text class="c" x="530" y="224">iss, aud, exp, …</text>
+<rect class="in" x="446" y="326" width="168" height="72" rx="8"/>
+<text class="h c" x="530" y="352">Legacy gate</text>
+<text class="c" x="530" y="372">rules, domains,</text>
+<text class="c" x="530" y="388">account, throttle</text>
+<path class="l" d="M614 198H646"/>
+<path class="l" d="M614 362H646"/>
+<rect class="in" x="648" y="162" width="112" height="236" rx="8"/>
+<text class="h c" x="704" y="250">Backend</text>
+<text class="h c" x="704" y="268">login</text>
+<text class="c" x="704" y="292">with the</text>
+<text class="c" x="704" y="308">client's own</text>
+<text class="c" x="704" y="324">credential</text>
+<rect class="box" x="440" y="20" width="180" height="56" rx="8"/>
+<text class="h c" x="530" y="44">Identity provider</text>
+<text class="c" x="530" y="62">e.g. Keycloak</text>
+<path class="k" d="M530 76V160"/>
+<text class="e" x="540" y="104">JWKS over HTTPS</text>
+<path class="l" d="M760 198H864"/>
+<path class="l" d="M760 362H864"/>
+<text class="e" x="786" y="190">verified TLS</text>
+<text class="e" x="786" y="216">PROXY v2</text>
+<text class="e" x="786" y="354">verified TLS</text>
+<text class="e" x="786" y="380">XCLIENT</text>
+<rect class="box" x="866" y="162" width="110" height="72" rx="8"/>
+<text class="h c" x="921" y="188">Dovecot</text>
+<text class="c" x="921" y="208">IMAP and</text>
+<text class="c" x="921" y="224">ManageSieve</text>
+<rect class="box" x="866" y="326" width="110" height="72" rx="8"/>
+<text class="h c" x="921" y="358">Postfix</text>
+<text class="c" x="921" y="378">submission</text>
+</g>
+<path class="l" d="M130 280H266"/>
+</svg>

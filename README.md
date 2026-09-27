@@ -48,31 +48,10 @@ that case.
 
 ## How it works
 
-```mermaid
-flowchart LR
-    client["Mail client"]
-    idp["Identity provider<br/>(e.g. Keycloak)"]
-
-    subgraph proxy["mail-auth-proxy"]
-        direction TB
-        mech{"SASL mechanism"}
-        jwt["Validate JWT locally<br/>signature, iss, aud, exp"]
-        gate["Legacy gate<br/>rule, domain, account, throttle"]
-        login["Backend login with the<br/>client's own credential"]
-        mech -->|"XOAUTH2 / OAUTHBEARER"| jwt
-        mech -->|"PLAIN / LOGIN<br/>only where a rule allows"| gate
-        jwt --> login
-        gate --> login
-    end
-
-    dovecot["Dovecot<br/>IMAP, ManageSieve"]
-    postfix["Postfix<br/>submission"]
-
-    client -->|"TLS: 993, 587, 4190"| mech
-    idp -.->|"JWKS over HTTPS"| jwt
-    login -->|"verified TLS, PROXY v2"| dovecot
-    login -->|"verified TLS, XCLIENT"| postfix
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/how-it-works-dark.svg">
+  <img alt="Mail clients connect over TLS (993 IMAPS, 587 submission, 4190 ManageSieve) to mail-auth-proxy. The SASL mechanism picks the path: XOAUTH2 or OAUTHBEARER tokens are validated locally against the identity provider's JWKS; PLAIN or LOGIN pass the legacy gate only where a rule allows. The proxy then logs in to Dovecot (PROXY v2) or Postfix submission (XCLIENT) over verified TLS with the client's own credential." src="docs/assets/how-it-works-light.svg" width="100%">
+</picture>
 
 1. The source IP and TLS server name decide which mechanisms the connection offers.
 2. The proxy reads `AUTHENTICATE` / `AUTH` and checks the credential: a token against the
