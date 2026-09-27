@@ -7,7 +7,7 @@
 Validates bearer tokens locally before your mail server sees them, and lets passwords in
 only where you allow them.
 
-[![CI](https://github.com/NK-IT-CLOUD/mail-auth-proxy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/NK-IT-CLOUD/mail-auth-proxy/actions/workflows/ci.yml)
+[![CI](https://img.shields.io/github/actions/workflow/status/NK-IT-CLOUD/mail-auth-proxy/ci.yml?branch=main&label=CI)](https://github.com/NK-IT-CLOUD/mail-auth-proxy/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/NK-IT-CLOUD/mail-auth-proxy)](https://github.com/NK-IT-CLOUD/mail-auth-proxy/releases)
 [![MSRV](https://img.shields.io/badge/rust-1.88%2B-blue)](CONTRIBUTING.md#building-and-testing)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
