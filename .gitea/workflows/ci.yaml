@@ -237,10 +237,10 @@ jobs:
             buildah rm "$ctr" >/dev/null
             ctr=
           }
-          # Debian without systemd takes the groupadd branch; Ubuntu and Rocky
+          # Debian without systemd takes the useradd branch; Ubuntu and Rocky
           # get systemd so preinstall uses systemd-sysusers.
           smoke docker.io/library/debian:12@sha256:f37a335e82bca302e955fa39f9dfe28f1be618f016f8a2b56318e5a5111afc26 \
-            true deb groupadd
+            true deb useradd
           smoke docker.io/library/ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3 \
             'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq systemd >/dev/null' deb systemd-sysusers
           smoke docker.io/rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f \

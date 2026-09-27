@@ -24,7 +24,7 @@ description: |
   Local OAuth2 token validation and an optional password gate in front of any
   standards-compliant mail server. Static binary, no runtime dependencies.
 # JWKS/OIDC over HTTPS use the system trust store.
-# preinstall needs systemd-sysusers or groupadd (shadow-utils / passwd). nfpm 2.47
+# preinstall needs systemd-sysusers or groupadd/useradd (shadow-utils / passwd). nfpm 2.47
 # can express Requires(post) only (rpm.requires.post), not Requires(pre), so this
 # is not declared; both tools are part of every supported base system.
 depends:

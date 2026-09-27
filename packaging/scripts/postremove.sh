@@ -1,6 +1,6 @@
 #!/bin/sh
-# The group stays (it may own files the admin created). On deb purge dpkg has
-# removed the conffile; drop the directory if nothing else is left in it.
+# The user and group stay (files the admin created may belong to them). On deb
+# purge dpkg has removed the conffile; drop the directory if nothing else is left.
 set -e
 if [ -d /run/systemd/system ]; then
     systemctl daemon-reload || true

@@ -144,7 +144,7 @@ sudo apt install mail-auth-proxy
 ```
 
 Compare the fingerprint before `apt update`. The package installs the binary, the systemd
-unit, the group `mail-auth-proxy` and a commented example configuration; the service is not
+unit, the system user `mail-auth-proxy` and a commented example configuration; the service is not
 started until you enable it.
 
 <details>
@@ -193,7 +193,7 @@ token_type = "keycloak"
 Add `[submission]` and `[sieve]` for SMTP submission and ManageSieve. Every key is described
 in [docs/configuration.md](docs/configuration.md); the shipped file
 ([examples/config.example.toml](examples/config.example.toml)) shows all sections. The
-service runs as a dynamic user in the group `mail-auth-proxy`, so configuration,
+service runs as the system user `mail-auth-proxy`, so configuration,
 certificate and key must be `root:mail-auth-proxy`, mode `0640`
 ([permissions](INSTALL.md#permissions)).
 

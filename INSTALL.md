@@ -57,7 +57,7 @@ sudo dnf install ./mail-auth-proxy-X.Y.Z-1.x86_64.rpm
 | `/etc/mail-auth-proxy/config.toml` | example configuration (a conffile: upgrades keep your changes), `root:mail-auth-proxy` `0640` |
 | `/etc/mail-auth-proxy/` | directory `root:mail-auth-proxy` `0750` |
 | `/usr/lib/systemd/system/mail-auth-proxy.service` | the unit |
-| `/usr/lib/sysusers.d/mail-auth-proxy.conf` | the system group `mail-auth-proxy` (created on install) |
+| `/usr/lib/sysusers.d/mail-auth-proxy.conf` | the system user and group `mail-auth-proxy` (created on install, no login; an existing group of that name is reused) |
 | `/usr/share/doc/mail-auth-proxy/` | README and changelog |
 | `/usr/share/doc/mail-auth-proxy/copyright` | the license (`.deb`) |
 | `/usr/share/licenses/mail-auth-proxy/LICENSE` | the license (`.rpm`) |
@@ -70,8 +70,8 @@ The service is **not** enabled or started on install.
 For other distributions each release also has a `.tar.gz` with the static binary, the
 README, the changelog, the license, the third-party license notices
 (`THIRD-PARTY-NOTICES.html`), the example configuration and the systemd unit. It has no
-installer: copy the files into place yourself and create the group `mail-auth-proxy`
-(see the table above for paths and modes).
+installer: copy the files into place yourself and create the system user and group
+`mail-auth-proxy` without a login shell (see the table above for paths and modes).
 
 ## 2. Verify a download
 
@@ -131,7 +131,7 @@ Add `[submission]` and `[sieve]` for SMTP submission and ManageSieve. Password l
 
 ### Permissions
 
-The service runs as a dynamic unprivileged user whose only extra group is
+The service runs as the unprivileged system user `mail-auth-proxy` in the group
 `mail-auth-proxy`, with `CAP_NET_BIND_SERVICE` as its only capability. Everything it
 reads must be readable by that group and by nobody else:
 
@@ -176,7 +176,7 @@ journalctl -u mail-auth-proxy -n 20
 script runs it with the service's credentials. To do the same by hand:
 
 ```bash
-sudo systemd-run --wait --pipe --quiet -p DynamicUser=yes -p SupplementaryGroups=mail-auth-proxy \
+sudo systemd-run --wait --pipe --quiet -p User=mail-auth-proxy -p Group=mail-auth-proxy \
   /usr/bin/mail-auth-proxy --check-config /etc/mail-auth-proxy/config.toml
 ```
 
@@ -208,7 +208,7 @@ sudo apt purge mail-auth-proxy      # also removes the configuration
 sudo dnf remove mail-auth-proxy     # RPM
 ```
 
-Removal stops and disables the service. The group `mail-auth-proxy` stays, because files
-you created may belong to it; delete it with `sudo groupdel mail-auth-proxy` when nothing
-uses it any more. On purge the directory `/etc/mail-auth-proxy` is removed only if it is
+Removal stops and disables the service. The user and group `mail-auth-proxy` stay, because
+files you created may belong to them; when nothing uses them any more, delete them with
+`sudo userdel mail-auth-proxy` (and `sudo groupdel mail-auth-proxy` if the group is left). On purge the directory `/etc/mail-auth-proxy` is removed only if it is
 empty. `dnf remove` keeps a `config.toml` you changed as `config.toml.rpmsave`.

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Package install test, run as root inside a throwaway container:
-#   smoke-test.sh OLD.deb|rpm NEW.deb|rpm COMMIT systemd-sysusers|groupadd
+#   smoke-test.sh OLD.deb|rpm NEW.deb|rpm COMMIT systemd-sysusers|useradd
 # OLD and NEW are the same build with two versions: install, check, upgrade with
 # a changed config, remove (and purge on deb). Then the restart logic of the
 # maintainer scripts against a stub systemctl (and systemd-run, where installed).
@@ -32,10 +32,14 @@ esac
 echo "== install $old"
 out=$(install_pkg "$old" 2>&1) || { echo "$out"; fail "install"; }
 echo "$out"
-echo "$out" | grep -q "mail-auth-proxy: group via $branch" || fail "preinstall did not take the $branch branch"
+echo "$out" | grep -q "mail-auth-proxy: user via $branch" || fail "preinstall did not take the $branch branch"
 
 mail-auth-proxy --version | grep -q "(commit $commit)" || fail "--version: $(mail-auth-proxy --version)"
 getent group mail-auth-proxy >/dev/null || fail "group missing"
+gid=$(getent group mail-auth-proxy | cut -d: -f3)
+# name:x:uid:gid:gecos:home:shell, with the group as primary group, no login shell.
+getent passwd mail-auth-proxy | grep -q -x "mail-auth-proxy:x:[0-9]*:$gid:[^:]*:/:/usr/sbin/nologin" \
+    || fail "user: $(getent passwd mail-auth-proxy)"
 [ "$(stat -c '%U:%G %a' $conf)" = "root:mail-auth-proxy 640" ] || fail "config: $(stat -c '%U:%G %a' $conf)"
 [ "$(stat -c '%U:%G %a' /etc/mail-auth-proxy)" = "root:mail-auth-proxy 750" ] \
     || fail "config dir: $(stat -c '%U:%G %a' /etc/mail-auth-proxy)"
@@ -86,6 +90,7 @@ else
 fi
 [ ! -e /usr/bin/mail-auth-proxy ] || fail "binary still installed"
 getent group mail-auth-proxy >/dev/null || fail "remove deleted the group"
+getent passwd mail-auth-proxy >/dev/null || fail "remove deleted the user"
 
 echo "== restart logic (stub systemctl, /run/systemd/system)"
 if [ $fmt = deb ]; then apt-get install -y -qq openssl >/dev/null; else dnf install -y -q openssl >/dev/null; fi
@@ -99,19 +104,18 @@ exit 0
 STUB
 chmod 0755 /usr/bin/systemctl
 if command -v systemd-run >/dev/null 2>&1; then
-    # Test stub: runs the command like DynamicUser=yes would, as an unprivileged
-    # user with the group from SupplementaryGroups=.
+    # Test stub: runs the command with the User= and Group= it is given.
     cat > "$(command -v systemd-run)" <<'STUB'
 #!/bin/sh
 echo "systemd-run $*" >> /tmp/systemctl.calls
 while [ $# -gt 0 ]; do
     case "$1" in
-        -p) case "$2" in SupplementaryGroups=*) group=${2#SupplementaryGroups=} ;; esac; shift 2 ;;
+        -p) case "$2" in User=*) user=${2#User=} ;; Group=*) group=${2#Group=} ;; esac; shift 2 ;;
         -*) shift ;;
         *) break ;;
     esac
 done
-exec setpriv --reuid=65534 --regid=65534 --groups="$(getent group "$group" | cut -d: -f3)" -- "$@"
+exec setpriv --reuid="$(id -u "$user")" --regid="$(getent group "$group" | cut -d: -f3)" --clear-groups -- "$@"
 STUB
     sd_run=1
 else
@@ -139,7 +143,7 @@ install_pkg "$new" >/dev/null
 called "try-restart mail-auth-proxy.service" || fail "upgrade, valid config: no try-restart: $(cat $calls)"
 ! called "disable" || fail "upgrade disabled the service"
 if [ $sd_run = 1 ]; then
-    called "systemd-run .*DynamicUser=yes" || fail "check did not run with the service's credentials"
+    called "systemd-run .*User=mail-auth-proxy -p Group=mail-auth-proxy" || fail "check did not run with the service's credentials"
     called "systemd-run .*--collect" || fail "check without --collect (a failed unit would stay loaded)"
 fi
 

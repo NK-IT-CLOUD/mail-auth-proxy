@@ -52,7 +52,7 @@ bind.
 
 ## File permissions
 
-The service runs as a dynamic user with the supplementary group `mail-auth-proxy`. The
+The service runs as the system user `mail-auth-proxy` in the group `mail-auth-proxy`. The
 configuration, the TLS key, the doveadm key file and the legacy list files must be readable
 by that group and by nobody else, for example `root:mail-auth-proxy` mode `0640`
 (directories `0750`).

@@ -11,10 +11,12 @@ ExecStart=/usr/bin/mail-auth-proxy /etc/mail-auth-proxy/config.toml
 # SIGHUP: reload the TLS certificate and refresh the JWKS (not the config file)
 ExecReload=/bin/kill -HUP $MAINPID
 Environment=RUST_LOG=info
-# Run as an ephemeral unprivileged user (not root)
-DynamicUser=yes
-# Group of the config and TLS key (root:mail-auth-proxy 0640), from sysusers.d
-SupplementaryGroups=mail-auth-proxy
+# Unprivileged system user from sysusers.d; its group owns the config and the TLS
+# key (root:mail-auth-proxy 0640).
+User=mail-auth-proxy
+Group=mail-auth-proxy
+# No System V IPC objects or POSIX shared memory outlive the service.
+RemoveIPC=yes
 # Only capability needed: bind privileged ports 993/587/4190
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE

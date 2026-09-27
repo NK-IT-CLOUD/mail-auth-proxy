@@ -17,7 +17,7 @@ conf=/etc/mail-auth-proxy/config.toml
 # the restart as it would block the start.
 check_config() {
     if command -v systemd-run >/dev/null 2>&1; then
-        systemd-run --wait --pipe --collect --quiet -p DynamicUser=yes -p SupplementaryGroups=mail-auth-proxy \
+        systemd-run --wait --pipe --collect --quiet -p User=mail-auth-proxy -p Group=mail-auth-proxy \
             /usr/bin/mail-auth-proxy --check-config "$conf"
     else
         echo "mail-auth-proxy: warning: no systemd-run, config checked as root (file permissions not checked)" >&2
