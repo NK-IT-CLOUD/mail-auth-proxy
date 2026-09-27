@@ -1,0 +1,11 @@
+parsers:
+  - crowdsecurity/syslog-logs
+  - crowdsecurity/dateparse-enrich
+  - ./parsers/s01-parse/mail-auth-proxy/mail-auth-proxy-logs.yaml
+scenarios:
+  - ""
+postoverflows:
+  - ""
+log_file: mail-auth-proxy-logs.log
+log_type: syslog
+ignore_parsers: false

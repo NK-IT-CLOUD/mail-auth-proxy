@@ -1,0 +1,350 @@
+//! The SMTP backend: login dialog (STARTTLS, optional XCLIENT, AUTH) and
+//! reply reader.
+
+use crate::auth::{BackendCredential, BackendError, BackendLogin};
+use crate::server::BackendConn;
+use crate::wire::line::{read_line, verb_is};
+use crate::wire::{connect, Tuning};
+use anyhow::{anyhow, Result};
+use std::net::SocketAddr;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio_rustls::client::TlsStream;
+
+/// The SMTP backend login of one client session.
+pub(super) struct SmtpLogin<'a> {
+    pub backend: &'a BackendConn,
+    pub tuning: &'a Tuning,
+    /// Our name in EHLO.
+    pub name: &'a str,
+    /// Announce the client address with XCLIENT when the backend offers it.
+    pub xclient: bool,
+    /// The client's address.
+    pub peer: SocketAddr,
+}
+
+impl BackendLogin for SmtpLogin<'_> {
+    type Conn = TlsStream<TcpStream>;
+
+    async fn login(&self, credential: BackendCredential<'_>) -> Result<Self::Conn, BackendError> {
+        let password = matches!(credential, BackendCredential::Password { .. });
+        let (be, code) = self.dialog(credential).await?;
+        match auth_verdict(code, password) {
+            AuthVerdict::Ok => Ok(be),
+            // The backend refused the credential (bad password, unknown user,
+            // sender-login mismatch).
+            AuthVerdict::Rejected => Err(BackendError::Rejected(code.to_string())),
+            AuthVerdict::Unavailable => {
+                Err(anyhow!("backend AUTH failed without a verdict: {code}").into())
+            }
+        }
+    }
+}
+
+/// What the final reply to the backend AUTH exchange means.
+#[derive(Debug, PartialEq, Eq)]
+enum AuthVerdict {
+    Ok,
+    /// A verdict on the credential.
+    Rejected,
+    /// No verdict: an outage or a protocol failure.
+    Unavailable,
+}
+
+/// Classify the reply to the sent credential response (after `334`) of a
+/// token (`password` false) or password login. A reply to the bare AUTH
+/// line never gets here: it is an outage (`dialog`).
+///
+/// - `235`: logged in.
+/// - `4xx` (e.g. 454 when Postfix's SASL backend is down): temporary, an outage.
+/// - `50x` (500–509, the syntax class of RFC 5321 §4.2.1: "command too long",
+///   a malformed response, an unknown mechanism): for a token, the backend
+///   did not understand the exchange and never judged the credential; counting
+///   it as a rejection would feed CrowdSec bans against legitimate users. For
+///   a password it is a rejection: the client chose the credential bytes, and
+///   a crafted password must not turn a gate-passing account into an instant
+///   retry-later (an enumeration oracle next to the delayed refusals). The
+///   size cap (`auth::MAX_PASSWORD`) keeps valid passwords far from Postfix's
+///   limits, so this is defence in depth.
+/// - Any other `5xx` (535, 534, 554, …): a rejection.
+/// - Anything else (a stray `334`, `2xx`): a protocol failure, an outage.
+fn auth_verdict(code: u16, password: bool) -> AuthVerdict {
+    match code {
+        235 => AuthVerdict::Ok,
+        500..=509 if password => AuthVerdict::Rejected,
+        500..=509 => AuthVerdict::Unavailable,
+        510..=599 => AuthVerdict::Rejected,
+        _ => AuthVerdict::Unavailable,
+    }
+}
+
+impl SmtpLogin<'_> {
+    /// Connect, STARTTLS, EHLO, optional XCLIENT, then AUTH with the client's
+    /// own credential (never a master password). Returns the final AUTH reply
+    /// code.
+    async fn dialog(
+        &self,
+        credential: BackendCredential<'_>,
+    ) -> Result<(TlsStream<TcpStream>, u16)> {
+        // No PROXY header: the configuration rejects one for the submission
+        // backend, which learns the client address via XCLIENT instead.
+        let mut tcp_be = connect::connect(
+            self.backend,
+            None,
+            self.tuning.connect,
+            "submission backend",
+        )
+        .await?;
+
+        // Step B1: expect 220 greeting
+        let (code, _) = read_smtp_reply(&mut tcp_be, self.tuning.idle).await?;
+        if code != 220 {
+            return Err(anyhow!("backend greeting code {code}"));
+        }
+
+        // Step B2: EHLO, expect 250 with STARTTLS advertised
+        tcp_be
+            .write_all(format!("EHLO {}\r\n", self.name).as_bytes())
+            .await?;
+        let (code, lines) = read_smtp_reply(&mut tcp_be, self.tuning.idle).await?;
+        if code != 250 {
+            return Err(anyhow!("backend EHLO code {code}"));
+        }
+        if !lines.iter().any(|l| verb_is(l, "STARTTLS")) {
+            return Err(anyhow!("backend did not advertise STARTTLS"));
+        }
+
+        // Step B3: STARTTLS
+        tcp_be.write_all(b"STARTTLS\r\n").await?;
+        let (code, _) = read_smtp_reply(&mut tcp_be, self.tuning.idle).await?;
+        if code != 220 {
+            return Err(anyhow!("backend STARTTLS code {code}"));
+        }
+
+        let mut be = connect::tls(
+            self.backend,
+            tcp_be,
+            self.tuning.connect,
+            "submission backend",
+        )
+        .await?;
+
+        // Step B4: EHLO over TLS
+        be.write_all(format!("EHLO {}\r\n", self.name).as_bytes())
+            .await?;
+        let (code, ehlo_lines) = read_smtp_reply(&mut be, self.tuning.idle).await?;
+        if code != 250 {
+            return Err(anyhow!("backend post-TLS EHLO code {code}"));
+        }
+
+        // Step B4b (optional): announce the real client IP to Postfix via XCLIENT so
+        // it logs `client=<real ip>` and stamps it into the Received header, instead
+        // of attributing every submission to the proxy's own address. Gated on the
+        // config flag AND on the backend actually advertising XCLIENT; a backend
+        // that does not authorize this proxy simply never advertises it, so we skip
+        // silently rather than risk a rejected session.
+        //
+        // A backend that offers XCLIENT to a proxy configured without it is a
+        // misconfiguration the proxy must not relay into: Postfix accepts
+        // XCLIENT from an authorized host until ADDR is sent, so after the
+        // splice the client could send its own `XCLIENT LOGIN=<other> ADDR=…`
+        // on the proxy's authorization and act as another user. Fail closed,
+        // before any credential is sent: an outage.
+        let offers_xclient = ehlo_lines.iter().any(|l| verb_is(l, "XCLIENT"));
+        if !self.xclient && offers_xclient {
+            return Err(anyhow!(
+                "backend advertises XCLIENT to this proxy but submission.xclient = false: \
+                 an authenticated client could send its own XCLIENT; set submission.xclient = true \
+                 or remove the proxy from Postfix smtpd_authorized_xclient_hosts"
+            ));
+        }
+        if self.xclient && offers_xclient {
+            // IPv4-mapped (::ffff:a.b.c.d) is announced as the IPv4 address it is.
+            let addr = match self.peer.ip().to_canonical() {
+                std::net::IpAddr::V4(v4) => format!("ADDR={v4}"),
+                std::net::IpAddr::V6(v6) => format!("ADDR=IPV6:{v6}"),
+            };
+            // NAME must be sent explicitly: attributes the command omits keep the
+            // value the session already had, so an ADDR-only XCLIENT would pin the
+            // proxy's own hostname onto the real client's IP in `client=` and in the
+            // Received header. The proxy does no reverse lookup, so the honest
+            // value is the spec's placeholder for "not available".
+            be.write_all(format!("XCLIENT NAME=[UNAVAILABLE] {addr}\r\n").as_bytes())
+                .await?;
+            // Postfix answers XCLIENT with a fresh 220 greeting and resets the
+            // session state, so the SMTP conversation must restart with EHLO.
+            let (code, _) = read_smtp_reply(&mut be, self.tuning.idle).await?;
+            if code != 220 {
+                return Err(anyhow!("backend XCLIENT code {code}"));
+            }
+            be.write_all(format!("EHLO {}\r\n", self.name).as_bytes())
+                .await?;
+            let (code, lines) = read_smtp_reply(&mut be, self.tuning.idle).await?;
+            if code != 250 {
+                return Err(anyhow!("backend post-XCLIENT EHLO code {code}"));
+            }
+            // Postfix re-evaluates smtpd_authorized_xclient_hosts against the
+            // announced ADDR. A client whose own address is authorized would
+            // keep the right to send XCLIENT after the splice: the same
+            // impersonation as above, so fail closed the same way.
+            if lines.iter().any(|l| verb_is(l, "XCLIENT")) {
+                return Err(anyhow!(
+                    "backend still advertises XCLIENT after XCLIENT ADDR=<client>: the client's \
+                     address is authorized for XCLIENT, so it could send its own; remove it from \
+                     Postfix smtpd_authorized_xclient_hosts"
+                ));
+            }
+        }
+
+        // Step B5: forward the client's OWN credential (token or password) — never a master password.
+        let (mech, response) = match credential {
+            BackendCredential::Token { identity, token } => {
+                ("XOAUTH2", crate::auth::sasl::build_xoauth2(identity, token))
+            }
+            BackendCredential::Password { user, pass } => {
+                ("PLAIN", crate::auth::sasl::build_plain(user, pass))
+            }
+        };
+        // The response goes after the `334` challenge, never on the AUTH line:
+        // RFC 4954 §4 forbids an initial response that pushes the command past
+        // the server's line limit (512 octets in RFC 5321, 2048 in Postfix's
+        // default `line_length_limit`), and a bearer token easily does. Postfix
+        // accepts 12288 octets for a SASL response.
+        be.write_all(format!("AUTH {mech}\r\n").as_bytes()).await?;
+        let (code, _) = read_smtp_reply(&mut be, self.tuning.idle).await?;
+        if code != 334 {
+            // No credential was sent yet: 503 (AUTH not enabled), 504
+            // (unknown mechanism) or any other reply here is the backend's
+            // configuration, never a verdict, on both paths.
+            return Err(anyhow!(
+                "backend refused AUTH {mech} before the credential: {code}"
+            ));
+        }
+        be.write_all(format!("{response}\r\n").as_bytes()).await?;
+        let (mut code, _) = read_smtp_reply(&mut be, self.tuning.idle).await?;
+        if code == 334 && mech == "XOAUTH2" {
+            // XOAUTH2 error challenge (`334 <base64 JSON>`): the client
+            // answers with an empty response and the server then sends its
+            // final failure reply (Google "XOAUTH2 mechanism", RFC 7628 §3.2.3).
+            be.write_all(b"\r\n").await?;
+            code = read_smtp_reply(&mut be, self.tuning.idle).await?.0;
+        }
+        Ok((be, code))
+    }
+}
+
+/// Most lines accepted in one SMTP reply. Postfix's EHLO reply has about
+/// fifteen; a backend that never ends a reply must not grow it without bound.
+const MAX_REPLY_LINES: usize = 64;
+
+/// Reads an SMTP reply that may span multiple `NNN-...` lines ending with
+/// `NNN ...`; more than `MAX_REPLY_LINES` lines are an error.
+async fn read_smtp_reply<S: AsyncRead + Unpin>(
+    s: &mut S,
+    idle: Duration,
+) -> Result<(u16, Vec<String>)> {
+    let mut lines = Vec::new();
+    let mut code: u16;
+    loop {
+        if lines.len() == MAX_REPLY_LINES {
+            return Err(anyhow!("backend reply longer than {MAX_REPLY_LINES} lines"));
+        }
+        let l = read_line(s, idle).await?;
+        // Byte-safe: never slice a String on a non-char-boundary (would panic).
+        let b = l.as_bytes();
+        if b.len() < 4 {
+            return Err(anyhow!("short smtp reply: {l}"));
+        }
+        code = std::str::from_utf8(&b[..3])
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| anyhow!("bad smtp code: {l}"))?;
+        let cont = b[3] == b'-';
+        lines.push(l.get(4..).unwrap_or("").to_string());
+        if !cont {
+            break;
+        }
+    }
+    Ok((code, lines))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[tokio::test]
+    async fn multiline_smtp_reply() {
+        let mut c = Cursor::new(b"250-mail hi\r\n250-PIPELINING\r\n250 AUTH XOAUTH2\r\n".to_vec());
+        let (code, lines) = read_smtp_reply(&mut c, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(code, 250);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2], "AUTH XOAUTH2");
+    }
+
+    /// A reply that never ends is an error after MAX_REPLY_LINES lines.
+    #[tokio::test]
+    async fn smtp_reply_is_bounded() {
+        let reply = |n: usize| "250-x\r\n".repeat(n - 1) + "250 y\r\n";
+        let mut ok = Cursor::new(reply(MAX_REPLY_LINES).into_bytes());
+        let (_, lines) = read_smtp_reply(&mut ok, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(lines.len(), MAX_REPLY_LINES);
+        let mut long = Cursor::new(reply(MAX_REPLY_LINES + 1).into_bytes());
+        assert!(read_smtp_reply(&mut long, Duration::from_secs(30))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn non_ascii_smtp_reply_rejected_not_panic() {
+        // A multi-byte char straddling byte index 3 must NOT panic; reject cleanly.
+        let mut c = Cursor::new("25é OK\r\n".as_bytes().to_vec());
+        assert!(read_smtp_reply(&mut c, Duration::from_secs(30))
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn auth_reply_classification() {
+        for password in [false, true] {
+            assert_eq!(auth_verdict(235, password), AuthVerdict::Ok);
+            for code in [535, 534, 554, 530] {
+                assert_eq!(
+                    auth_verdict(code, password),
+                    AuthVerdict::Rejected,
+                    "{code}"
+                );
+            }
+            for code in [454, 421, 334, 250] {
+                assert_eq!(
+                    auth_verdict(code, password),
+                    AuthVerdict::Unavailable,
+                    "{code}"
+                );
+            }
+        }
+        for code in [500, 501, 504] {
+            assert_eq!(
+                auth_verdict(code, false),
+                AuthVerdict::Unavailable,
+                "{code}"
+            );
+            assert_eq!(auth_verdict(code, true), AuthVerdict::Rejected, "{code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn single_smtp_reply() {
+        let mut c = Cursor::new(b"235 2.7.0 OK\r\n".to_vec());
+        let (code, lines) = read_smtp_reply(&mut c, Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(code, 235);
+        assert_eq!(lines, vec!["2.7.0 OK".to_string()]);
+    }
+}

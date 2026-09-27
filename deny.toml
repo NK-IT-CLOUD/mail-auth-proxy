@@ -1,0 +1,41 @@
+# cargo-deny 0.20 (`cargo deny check`). CI runs it on every push with a pinned,
+# checksum-verified release binary.
+
+[graph]
+# The package is Linux-only; Windows, macOS, Android and wasm crates in
+# Cargo.lock never reach the binary.
+targets = ["x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl"]
+all-features = false
+
+[advisories]
+# Every RUSTSEC advisory (vulnerable, unmaintained, unsound, yanked) fails.
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Permissive licenses only, matching the dependency tree; the binary is MIT.
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.93
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    # aws-lc-rs is the single crypto library (decision 2026-09-13).
+    { crate = "ring", reason = "aws-lc-rs is the only crypto provider" },
+    { crate = "openssl-sys", reason = "rustls on aws-lc-rs, no system OpenSSL" },
+    { crate = "rsa", reason = "RUSTSEC-2023-0071, not constant-time" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

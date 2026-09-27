@@ -1,0 +1,27 @@
+# Instant ban for a failed password login from an external IP with a role or
+# test account name (postmaster@, admin@, test@, ...). Bots walk such wordlists
+# with one or two attempts per IP to stay below per-IP thresholds.
+#
+# Adjust the list: remove any name that is a real login on your server (names
+# such as mail, test or user often are), or the first mistyped password of that
+# account from an external IP gets that IP banned. The ban length comes from the
+# CrowdSec profile; blackhole below only keeps the scenario silent for that IP.
+type: trigger
+name: mail-auth-proxy/honeypot-users
+description: "mail-auth-proxy: password login with a role or test account name from an external IP"
+filter: |
+  evt.Meta.log_type == 'mail_auth_proxy_auth'
+  && evt.Meta.auth_scope == 'external'
+  && evt.Meta.log_subtype in ['blocked_endpoint', 'unknown_domain', 'unknown_account', 'throttled', 'oversize', 'backend_reject']
+  && evt.Meta.username matches '(?i)^(postmaster|hostmaster|webmaster|admin|administrator|root|test|testing|teste|user|mail|sysadmin|helpdesk|scanner|copier|fax|monitor|nonexistent_user(_[0-9]+)?)(@|$)'
+groupby: evt.Meta.source_ip
+blackhole: 24h
+labels:
+  service: mail-auth-proxy
+  confidence: 3
+  spoofable: 0
+  classification:
+    - attack.T1110
+  label: "Mail login with honeypot account name"
+  behavior: "pop3/imap:bruteforce"
+  remediation: true

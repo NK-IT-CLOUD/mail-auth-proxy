@@ -1,0 +1,123 @@
+# One manifest for .deb and .rpm, run from the repository root:
+#   VERSION=X.Y.Z[-rc.N] SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
+#     nfpm package -f packaging/nfpm.yaml -p deb -t dist/
+# The binary and THIRD-PARTY-NOTICES.html are expected in dist/ (packaging/build.sh).
+# VERSION is never hardcoded; SOURCE_DATE_EPOCH makes the output deterministic.
+# RPM_SIGNING_KEY_FILE (armored secret signing subkey, passphrase in
+# NFPM_RPM_PASSPHRASE) signs the rpm header; unset or empty gives an unsigned rpm
+# (CI, RC). Only the publish workflow sets it.
+# All contents stay in this list, scoped with `packager:` — overrides.<fmt>.contents
+# would replace the list instead of extending it.
+name: mail-auth-proxy
+arch: amd64
+platform: linux
+version: ${VERSION}
+version_schema: semver
+# No `release`: deb gets X.Y.Z, rpm gets nfpm's default release 1 (X.Y.Z-1).
+section: mail
+priority: optional
+maintainer: "Norbert Krucky <developers@nk-it.cloud>"
+homepage: https://github.com/NK-IT-CLOUD/mail-auth-proxy
+license: MIT
+description: |
+  Authentication proxy for IMAP, SMTP submission and ManageSieve
+  Local OAuth2 token validation and an optional password gate in front of any
+  standards-compliant mail server. Static binary, no runtime dependencies.
+# JWKS/OIDC over HTTPS use the system trust store.
+# preinstall needs systemd-sysusers or groupadd (shadow-utils / passwd). nfpm 2.47
+# can express Requires(post) only (rpm.requires.post), not Requires(pre), so this
+# is not declared; both tools are part of every supported base system.
+depends:
+  - ca-certificates
+contents:
+  - src: ./dist/mail-auth-proxy
+    dst: /usr/bin/mail-auth-proxy
+    file_info:
+      mode: 0755
+  - dst: /etc/mail-auth-proxy
+    type: dir
+    file_info:
+      mode: 0750
+      owner: root
+      group: mail-auth-proxy
+  - src: ./examples/config.example.toml
+    dst: /etc/mail-auth-proxy/config.toml
+    type: config|noreplace
+    file_info:
+      mode: 0640
+      owner: root
+      group: mail-auth-proxy
+  - src: ./packaging/mail-auth-proxy.service
+    dst: /usr/lib/systemd/system/mail-auth-proxy.service
+    file_info:
+      mode: 0644
+  - src: ./packaging/sysusers.d/mail-auth-proxy.conf
+    dst: /usr/lib/sysusers.d/mail-auth-proxy.conf
+    file_info:
+      mode: 0644
+  - src: ./README.md
+    dst: /usr/share/doc/mail-auth-proxy/README.md
+    file_info:
+      mode: 0644
+  - src: ./CHANGELOG.md
+    dst: /usr/share/doc/mail-auth-proxy/CHANGELOG.md
+    file_info:
+      mode: 0644
+  - src: ./dist/THIRD-PARTY-NOTICES.html
+    dst: /usr/share/doc/mail-auth-proxy/THIRD-PARTY-NOTICES.html
+    file_info:
+      mode: 0644
+  # CrowdSec parser and scenarios as examples (not activated); the README explains the install.
+  # No `type: doc`: nfpm leaves such entries out of the .deb.
+  - src: ./contrib/crowdsec/README.md
+    dst: /usr/share/doc/mail-auth-proxy/crowdsec/README.md
+    file_info:
+      mode: 0644
+  - src: ./contrib/crowdsec/acquis/mail-auth-proxy.yaml
+    dst: /usr/share/doc/mail-auth-proxy/crowdsec/acquis/mail-auth-proxy.yaml
+    file_info:
+      mode: 0644
+  - src: ./contrib/crowdsec/parsers/s01-parse/mail-auth-proxy-logs.yaml
+    dst: /usr/share/doc/mail-auth-proxy/crowdsec/parsers/s01-parse/mail-auth-proxy-logs.yaml
+    file_info:
+      mode: 0644
+  - src: ./contrib/crowdsec/scenarios/mail-auth-proxy-bf.yaml
+    dst: /usr/share/doc/mail-auth-proxy/crowdsec/scenarios/mail-auth-proxy-bf.yaml
+    file_info:
+      mode: 0644
+  - src: ./contrib/crowdsec/scenarios/mail-auth-proxy-honeypot-users.yaml
+    dst: /usr/share/doc/mail-auth-proxy/crowdsec/scenarios/mail-auth-proxy-honeypot-users.yaml
+    file_info:
+      mode: 0644
+  - src: ./contrib/crowdsec/scenarios/mail-auth-proxy-password-probe.yaml
+    dst: /usr/share/doc/mail-auth-proxy/crowdsec/scenarios/mail-auth-proxy-password-probe.yaml
+    file_info:
+      mode: 0644
+  - src: ./contrib/crowdsec/scenarios/mail-auth-proxy-slow-bf.yaml
+    dst: /usr/share/doc/mail-auth-proxy/crowdsec/scenarios/mail-auth-proxy-slow-bf.yaml
+    file_info:
+      mode: 0644
+  - src: ./contrib/crowdsec/scenarios/mail-auth-proxy-user-enum.yaml
+    dst: /usr/share/doc/mail-auth-proxy/crowdsec/scenarios/mail-auth-proxy-user-enum.yaml
+    file_info:
+      mode: 0644
+  - src: ./LICENSE
+    dst: /usr/share/doc/mail-auth-proxy/copyright
+    packager: deb
+    file_info:
+      mode: 0644
+  - src: ./LICENSE
+    dst: /usr/share/licenses/mail-auth-proxy/LICENSE
+    packager: rpm
+    type: license
+    file_info:
+      mode: 0644
+rpm:
+  signature:
+    # Empty when the variable is unset: nfpm then skips signing.
+    key_file: ${RPM_SIGNING_KEY_FILE}
+scripts:
+  preinstall: ./packaging/scripts/preinstall.sh
+  postinstall: ./packaging/scripts/postinstall.sh
+  preremove: ./packaging/scripts/preremove.sh
+  postremove: ./packaging/scripts/postremove.sh

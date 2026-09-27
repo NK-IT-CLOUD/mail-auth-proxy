@@ -1,0 +1,27 @@
+# Parses the `authresult` line of mail-auth-proxy (docs/operations.md, "The authresult line").
+# `pwfp` and `rule` are the last fields of the line; the pattern treats them as
+# optional.
+onsuccess: next_stage
+name: mail-auth-proxy/logs
+description: "Parse mail-auth-proxy authentication results"
+filter: "evt.Parsed.program == 'mail-auth-proxy' && evt.Parsed.message contains 'authresult result='"
+grok:
+  pattern: 'authresult result="%{WORD:auth_result}" proto="%{WORD:proto}" scope="%{WORD:auth_scope}" mech=%{NOTSPACE:mech} user=%{DATA:username} peer=%{IP:source_ip} reason="%{WORD:reason}"( pwfp="%{DATA:pwfp}")?( rule="%{DATA:rule}")?'
+  apply_on: message
+statics:
+  - meta: service
+    value: mail-auth-proxy
+  - meta: log_type
+    value: mail_auth_proxy_auth
+  - meta: log_subtype
+    expression: evt.Parsed.reason
+  - meta: source_ip
+    expression: evt.Parsed.source_ip
+  - meta: username
+    expression: evt.Parsed.username
+  - meta: auth_result
+    expression: evt.Parsed.auth_result
+  - meta: auth_scope
+    expression: evt.Parsed.auth_scope
+  - meta: proto
+    expression: evt.Parsed.proto

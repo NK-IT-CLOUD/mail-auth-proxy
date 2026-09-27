@@ -1,0 +1,22 @@
+# Slow or distributed brute force: a few failed password logins per source IP,
+# spread over hours, stay below the fast buckets. Only external sources count, so
+# an internal client with an outdated password is not banned by this bucket.
+type: leaky
+name: mail-auth-proxy/slow-bf
+description: "mail-auth-proxy: slow password brute force from an external IP"
+filter: "evt.Meta.log_type == 'mail_auth_proxy_auth' && evt.Meta.auth_scope == 'external' && evt.Meta.log_subtype in ['blocked_endpoint', 'unknown_domain', 'unknown_account', 'throttled', 'oversize', 'backend_reject']"
+groupby: evt.Meta.source_ip
+# holds 2 failures and leaks one per hour: a third failure within the hour overflows;
+# slower attempts leak away (the fast bucket mail-auth-proxy/bf covers bursts)
+capacity: 2
+leakspeed: 1h
+blackhole: 2h
+labels:
+  service: mail-auth-proxy
+  confidence: 2
+  spoofable: 0
+  classification:
+    - attack.T1110
+  label: "Mail slow password brute force"
+  behavior: "pop3/imap:bruteforce"
+  remediation: true

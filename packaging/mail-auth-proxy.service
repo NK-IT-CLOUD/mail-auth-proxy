@@ -1,0 +1,52 @@
+[Unit]
+Description=mail-auth-proxy (IMAP, SMTP submission and ManageSieve authentication proxy)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# The proxy sends READY=1 once the JWKS are loaded and every listener is bound,
+# and STOPPING=1 on shutdown (from the main process: NotifyAccess=main).
+Type=notify
+ExecStart=/usr/bin/mail-auth-proxy /etc/mail-auth-proxy/config.toml
+# SIGHUP: reload the TLS certificate and refresh the JWKS (not the config file)
+ExecReload=/bin/kill -HUP $MAINPID
+Environment=RUST_LOG=info
+# Run as an ephemeral unprivileged user (not root)
+DynamicUser=yes
+# Group of the config and TLS key (root:mail-auth-proxy 0640), from sysusers.d
+SupplementaryGroups=mail-auth-proxy
+# Only capability needed: bind privileged ports 993/587/4190
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+# Sandbox
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateDevices=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+# A blocked syscall fails with EPERM instead of killing the edge.
+SystemCallErrorNumber=EPERM
+UMask=0077
+Restart=on-failure
+RestartSec=2
+# Each session holds two sockets; max_connections (default 2048) must fit.
+LimitNOFILE=16384
+
+[Install]
+WantedBy=multi-user.target

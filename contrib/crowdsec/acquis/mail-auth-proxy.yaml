@@ -1,0 +1,7 @@
+# Read the service's journal. The syslog-logs parser takes the program name
+# from the journal entry, which the parser above matches.
+source: journalctl
+journalctl_filter:
+  - "_SYSTEMD_UNIT=mail-auth-proxy.service"
+labels:
+  type: syslog

@@ -1,0 +1,50 @@
+name: Bug report
+description: Something does not work as documented.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security problems: please do not file them here, see SECURITY.md.
+        Remove passwords, tokens, client secrets and HMAC keys from everything you paste.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `mail-auth-proxy --version`
+      placeholder: mail-auth-proxy 0.1.0 (commit 0123456789ab)
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: Distribution and version, and how you installed it (deb, rpm, tarball, source).
+      placeholder: Debian 12, deb package
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration (redacted)
+      description: The relevant parts of config.toml with secrets, host names and addresses replaced.
+      render: toml
+  - type: textarea
+    id: authresult
+    attributes:
+      label: Relevant log lines
+      description: The `authresult` lines (and any errors) around the problem, redacted.
+      render: text
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: What happened instead, and the steps to reproduce it.
+    validations:
+      required: true

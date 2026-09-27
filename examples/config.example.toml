@@ -1,0 +1,127 @@
+# Example configuration (format version 2).
+#
+# Check a file without starting the service:   mail-auth-proxy --check-config /etc/mail-auth-proxy/config.toml
+# Show the effective configuration:            mail-auth-proxy --print-config /etc/mail-auth-proxy/config.toml
+#
+# Unknown keys are an error, so a typo can never silently fall back to a default.
+
+config_version = 2
+
+[server]
+# Name in the IMAP/SMTP/ManageSieve greetings and in the EHLO sent to the backend.
+hostname = "mail.example.org"
+
+[tls]
+# Certificate chain and key served to clients (all SNI names).
+cert = "/path/to/fullchain.pem"               # readable by group mail-auth-proxy
+key = "/path/to/privkey.pem"                  # readable by group mail-auth-proxy
+
+# ── Protocols ────────────────────────────────────────────────────────────────
+# Every backend connection is TLS-verified: against `verify_name` (default: the
+# host part of `address`) with the system trust store, or only the CAs in
+# `ca_file`.
+
+[imap]
+listen = "0.0.0.0:993"                     # implicit TLS
+backend = { address = "192.0.2.10:10993", verify_name = "imap.example.org", proxy_protocol = true }
+# proxy_protocol: send a PROXY v2 header with the client address. The Dovecot
+# listener must have `haproxy = yes` (use a dedicated port for it).
+
+[submission]                               # optional: omit to disable
+listen = "0.0.0.0:587"                     # STARTTLS
+backend = { address = "192.0.2.10:587", verify_name = "smtp.example.org" }
+xclient = true                             # Postfix: smtpd_authorized_xclient_hosts
+# Advertised after STARTTLS besides AUTH; must match what the backend offers.
+ehlo_extensions = ["PIPELINING", "ENHANCEDSTATUSCODES", "8BITMIME", "DSN", "SMTPUTF8", "CHUNKING"]
+
+[sieve]                                    # optional: omit to disable
+listen = "0.0.0.0:4190"                    # STARTTLS
+backend = { address = "192.0.2.10:14190", verify_name = "imap.example.org", proxy_protocol = true }
+capability_cache_secs = 600
+
+# ── OAuth2 ───────────────────────────────────────────────────────────────────
+# Tokens are validated locally against each issuer's JWKS, then the same token
+# is replayed to the backend (which must validate it too). Each key is only
+# accepted for the issuer that published it.
+
+[oauth]
+refresh_secs = 300                         # periodic JWKS refresh; unknown key ids trigger one sooner
+leeway_secs = 60                           # clock skew on exp/nbf
+
+[[oauth.issuers]]
+# Keycloak: access tokens carry the claim typ = "Bearer".
+issuer = "https://sso.example.org/realms/mail"
+jwks_url = "https://sso.example.org/realms/mail/protocol/openid-connect/certs"
+audiences = ["mail"]                       # add an audience mapper to each mail client
+token_type = "keycloak"
+identity_claim = "email"                   # the mailbox login forwarded to the backend
+# require_email_verified defaults to true when identity_claim = "email"
+# allowed_clients = ["thunderbird", "webmail"]   # optional azp allowlist
+# infer_key_algorithm = true               # keys without "alg": ES256/ES384 by curve, RS256 for RSA (default true)
+
+# [[oauth.issuers]]
+# # IdPs that issue RFC 9068 access tokens (header typ = "at+jwt").
+# issuer = "https://idp.example.org"
+# jwks_url = "https://idp.example.org/jwks"
+# audiences = ["mail"]
+# token_type = "rfc9068"
+# identity_claim = "preferred_username"
+# require_email_verified = false
+# allowed_algorithms = ["RS256", "ES256"]
+# client_claim = "client_id"
+
+# ── Legacy passwords (optional) ──────────────────────────────────────────────
+# OAuth mail (above) is gated by the token check. Legacy mail (PLAIN/LOGIN) has no
+# SSO and no token: the backend checks the password, and the proxy passes it on only
+# if (1) a rule matches, (2) the login's domain is allowed, (3) the account exists and
+# (4) the account is not throttled — each only as far as configured. Without any
+# [[legacy.rules]] every endpoint is OAuth-only (the default here).
+# Unknown domain, unknown account, throttled and wrong password look the same to the
+# client (same reply, answered after failure_delay_ms); the log tells them apart.
+# The proxy must see real client addresses (DNAT is fine; behind a load balancer or
+# SNAT every client would match the rules' networks).
+
+[scope]
+internal_networks = ["10.0.0.0/8", "192.168.0.0/16"]   # log/metric label only
+
+# [legacy]
+# allowed_domains  = ["example.org"]
+# domains_file     = "/path/to/legacy-domains"         # one per line; re-read on change
+# account_check    = "doveadm"                          # none | doveadm
+# doveadm_url      = "https://imap.example.org:8080/doveadm/v1"
+# doveadm_key_file = "/path/to/doveadm.key"            # doveadm_api_key
+# doveadm_ca_file  = "/path/to/doveadm-ca.pem"
+# throttle         = { failures = 5, window_secs = 300 } # per account
+# failure_delay_ms = 2000                               # ~ the backend's auth_failure_delay (keep it on)
+#
+# [[legacy.rules]]
+# name     = "internal"                                 # logged as rule="internal"
+# networks = ["10.0.0.0/8", "192.168.0.0/16"]           # required: the real boundary
+# sni      = ["mail-internal.example.org"]              # optional, client-chosen
+#
+# [[legacy.rules]]
+# name      = "partner-mailflow"                        # one partner, one account
+# networks  = ["198.51.100.7/32"]
+# users     = ["mailflow@example.org"]                  # or "*@example.org"
+# protocols = ["imap", "submission"]                    # imap | submission | sieve
+#
+# [[legacy.rules]]
+# name       = "public-legacy"                          # deliberately public, opt-in users
+# networks   = ["0.0.0.0/0", "::/0"]
+# users_file = "/path/to/legacy-users"
+# mechanisms = ["PLAIN"]                                # PLAIN | LOGIN
+# # public = true   <- required for public networks WITHOUT users/users_file
+
+[limits]
+max_connections = 2048                     # all protocols; at most half unauthenticated
+max_preauth_per_ip = 32                    # unauthenticated connections per source IP
+max_preauth_commands = 8
+
+[timeouts]
+preauth_secs = 60                          # accept to credential, in total
+idle_secs = 30                             # silence on any single read
+connect_secs = 10                          # backend connect / TLS / PROXY header
+
+[metrics]                                  # optional feature, off by default
+enabled = false
+# listen = "127.0.0.1:9102"                # required when enabled; no authentication

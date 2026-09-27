@@ -1,0 +1,20 @@
+# Repeated failed logins from one external source IP: bad tokens, rejected or
+# refused passwords. Connections that end before a credential (`protocol`) do not
+# count. Internal sources (scope.internal_networks) do not count.
+type: leaky
+name: mail-auth-proxy/bf
+description: "mail-auth-proxy: repeated failed logins from one external IP"
+filter: "evt.Meta.log_type == 'mail_auth_proxy_auth' && evt.Meta.auth_scope == 'external' && evt.Meta.auth_result == 'fail' && evt.Meta.log_subtype != 'protocol'"
+groupby: evt.Meta.source_ip
+capacity: 10
+leakspeed: 20s
+blackhole: 5m
+labels:
+  service: mail-auth-proxy
+  confidence: 2
+  spoofable: 0
+  classification:
+    - attack.T1110
+  label: "Mail login brute force"
+  behavior: "pop3/imap:bruteforce"
+  remediation: true

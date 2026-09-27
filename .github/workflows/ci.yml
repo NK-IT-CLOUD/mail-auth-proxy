@@ -1,0 +1,97 @@
+# Pull request and push checks for the public repository. No secrets, read-only
+# token: safe for pull requests from forks. Release builds, package install tests
+# and the leak gate run in .gitea/workflows/ci.yaml on the maintainer's runner.
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Superseded pull-request runs are cancelled; every push to main runs to the end.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  # rustup is preinstalled on ubuntu-latest; it installs the toolchain pinned in
+  # rust-toolchain.toml (with rustfmt and clippy).
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          rustup toolchain install
+          cargo --version
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+  # Licenses, bans, sources and RUSTSEC advisories (deny.toml). Same pinned,
+  # checksum-verified release as the maintainer's CI.
+  deny:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          rustup toolchain install
+          cargo --version
+
+      - name: cargo-deny
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          f=cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
+          curl -fsSLO "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/$f"
+          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  $f" | sha256sum -c
+          tar -xzf "$f"
+          cd "$GITHUB_WORKSPACE"
+          "$RUNNER_TEMP/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny" check
+
+  # rust-version in Cargo.toml.
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: cargo +1.88.0 check
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          cargo +1.88.0 check --locked --all-targets
+
+  # Self-test of the leak gate and the public tree builder (throwaway
+  # repositories, no patterns from secrets needed).
+  leak-gate-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Self-test
+        run: packaging/leak-gate-test.sh

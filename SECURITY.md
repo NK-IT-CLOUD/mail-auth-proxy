@@ -1,0 +1,201 @@
+# Security Policy
+
+## Supported versions
+
+Only the latest release receives security fixes.
+
+| Version | Supported |
+|---------|-----------|
+| Latest release | Yes |
+| Older releases | No, please upgrade |
+
+## Security model
+
+The proxy sits on a public edge in front of an IMAP, ManageSieve and SMTP submission
+backend (for example Dovecot and Postfix). It terminates client TLS, decides how a client may authenticate, logs in to
+the backend with the client's **own** credential and then relays bytes. It never holds a
+master password or any other credential of its own.
+
+### Trust boundaries
+
+```
+ mail client ──(1)──▶ mail-auth-proxy ──(2)──▶ backend (Dovecot, Postfix)
+                          │
+                          └──(3)──▶ identity provider (JWKS over HTTPS)
+```
+
+1. **Client ↔ proxy: untrusted.** Everything a client sends before authentication is
+   attacker-controlled: TLS ClientHello and SNI, commands, SASL data, tokens, passwords,
+   and the timing of all of it. The source address is trusted only as far as the network
+   in front of the proxy preserves it (no SNAT, no load balancer that hides it).
+2. **Proxy ↔ backend: trusted, authenticated by TLS.** The backend is verified against its
+   configured name and trust anchors. It is trusted to validate the forwarded token or
+   password itself and to answer truthfully; its replies are still parsed defensively.
+   The PROXY v2 header and XCLIENT make the backend trust the client address the proxy
+   reports, which is why the backend accepts them only from the proxy's address.
+3. **Proxy ↔ identity provider: trusted for keys.** The JWKS is fetched over HTTPS,
+   verified against the system trust store, and defines which tokens are valid for its
+   issuer. Whoever can change a JWKS (or the trust store) can mint tokens for that issuer.
+4. **Operator: trusted.** The configuration file, the certificate and key, the key and
+   list files and the host are trusted. A misconfiguration is out of scope, but the
+   configuration check refuses the combinations that silently weaken the model.
+
+### Threat model
+
+| Threat | Mitigation |
+|---|---|
+| Forged or foreign tokens (`alg=none`, HS*, key confusion, a key of one realm signing for another, ID tokens, expired tokens) | local validation: algorithm from the key, key bound to its issuer, required `iss`/`aud`/`exp`, access-token marker, `email_verified` |
+| A valid token used for another mailbox | the backend login is the token's identity claim; a different SASL user name is refused |
+| Password guessing and spraying from the internet | no password mechanism unless a legacy rule matches the source network; per-account throttle; `authresult` lines with keyed password fingerprints for log-based blocking |
+| Account and domain enumeration | refusals and wrong passwords get the same reply and similar timing (below) |
+| Resource exhaustion before login | connection caps, per-IP cap on unauthenticated connections, one pre-authentication time budget, command, line, literal, token and password size limits |
+| STARTTLS command injection | nothing read ahead of the TLS switch |
+| Log injection | client text escaped or reduced to a fixed character set in every log field |
+| A rogue or intercepted backend | backend TLS always verified; no option to disable it |
+| An authenticated SMTP client sending its own `XCLIENT` to impersonate another user | the proxy never relays into a session in which the backend still offers `XCLIENT`: with `submission.xclient = false` a backend that advertises it, and with `submission.xclient = true` a backend that still advertises it after the proxy's own `XCLIENT` (the client's address is itself authorized), is treated as misconfigured and the login is an outage |
+| Bans of legitimate users during an outage | outages are answered with retry-later and never logged as failed logins |
+| One issuer asserting identities that belong to another | **not mitigated:** all configured issuers share one identity namespace, so an account name valid at issuer A can be asserted by issuer B. Configure only issuers you trust for all your domains ([docs/standards.md](docs/standards.md#known-deviations), D-JWT-3) |
+
+### Invariants
+
+1. **OAuth mail and legacy mail are separate paths.** OAuth (XOAUTH2/OAUTHBEARER) is
+   gated by local token validation (2.). Legacy mail (PLAIN/LOGIN) has no SSO: the backend
+   checks the password, and the proxy forwards it only through the legacy gate, fail-closed
+   and before any backend contact: a `[[legacy.rules]]` entry must match the source network
+   (required), the SNI (if set), protocol, mechanism and user; the login's domain must be
+   allowed; the account must exist (doveadm lookup); the account must not be throttled.
+   Without rules every endpoint is OAuth-only. SNI is chosen by the client and can be
+   forged; the source address is the real boundary. A password refused anywhere is parsed
+   only to log the attempt (with a keyed fingerprint, never in clear) and is never
+   forwarded. Refusals and wrong passwords get the same reply; refusals are answered as late as
+   recent backend rejections (at least `failure_delay_ms`), both with random jitter, so the
+   proxy does not reveal which accounts or domains exist. A users or domains file that
+   becomes missing or invalid fails closed (its rule or the domain gate matches nothing). An
+   unavailable account check is an outage (retry later), never a refusal.
+2. **OAuth tokens are validated before anything reaches the backend.** Locally, against
+   each issuer's JWKS:
+   - the signature algorithm comes from the JWKS key, never from the token header
+     (`alg=none` and HS* are rejected; a key without `alg` is used only with the
+     one algorithm its type implies (RS256 for RSA, ES256/ES384 for P-256/P-384), within
+     `allowed_algorithms`);
+   - each key is accepted only for the issuer that published it, so several realms on
+     one endpoint cannot vouch for each other;
+   - `iss`, `aud` and `exp` are required, `nbf` is checked, and the issuer's rules for
+     access tokens (`token_type`), `email_verified`, allowed clients and the identity
+     claim are applied.
+   The same token is then replayed to the backend, which must validate it too.
+3. **Every backend hop is TLS-verified** against the backend's `verify_name` and trust
+   anchors (system store or `ca_file`). There is no option to disable verification.
+
+### Hardening
+
+- Pre-authentication limits: a global connection cap (at most half unauthenticated), a
+  per-source-IP cap on unauthenticated connections, one total time budget from accept to
+  credential, a command limit, line and literal size limits.
+- STARTTLS: nothing is read ahead of the TLS switch, so plaintext pipelined after
+  `STARTTLS` cannot be injected into the encrypted session.
+- Client-controlled text never reaches error texts or log fields unescaped; the
+  `authresult` line (target `authlog`) has a fixed format intended for log-based blocking
+  (e.g. CrowdSec, Wazuh).
+- A backend outage is answered with a retry-later reply and is never logged as a failed
+  login, so an outage cannot turn into bans of legitimate users.
+- Size caps: a password over 1024 bytes and a token over 16384 bytes are refused without
+  further processing (`oversize`, `bad_token`); a JWKS response over 256 KiB fails the
+  fetch; a line is at most 16384 bytes, a ManageSieve literal at most 64 KiB.
+- Refusal timing: a refusal by the legacy gate is answered after the larger of
+  `failure_delay_ms` and the median of the last 32 backend rejections of that protocol
+  (at most 10 s); a backend rejection no earlier than `failure_delay_ms`; both with the
+  same random jitter; a password-path outage (retry-later) no earlier than a refusal.
+  OAuth failures are not delayed.
+- JWKS trust: JWKS URLs must be `https://` (plain `http` only to localhost) and are
+  verified against the system trust store; a redirect or non-2xx status fails the
+  fetch; a failed refresh keeps the previous keys. An unknown `kid` triggers at most one
+  refresh per 30 s; it is an outage (retry-later) only if the last such refresh failed
+  for the issuer the token claims (unverified `iss`, used for nothing else), otherwise a
+  `bad_token`.
+- Strict configuration: unknown keys, an incomplete password gate or legacy rule, a rule
+  open to public networks for every user without `public = true`, non-https JWKS or
+  doveadm URLs, or zero limits abort startup.
+
+### Operator responsibilities
+
+- **Real client addresses.** The legacy rules rely on the source address. Behind a load
+  balancer or SNAT every client looks like the balancer and a rule for its network would
+  open for the whole internet. Run the proxy where it sees real client addresses (routing
+  or DNAT), or configure no legacy rules.
+- **doveadm HTTP API.** Dovecot warns never to expose it to untrusted networks. Give the
+  proxy a dedicated `doveadm_api_key`, reach it over TLS (`doveadm_ca_file` for an
+  internal CA), and restrict the listener to the proxy's address at the network level.
+  Keep the key file readable only by the service.
+- **Failure delay.** Keep the backend's own failure delay on behind the proxy (Dovecot
+  `auth_failure_delay`, default 2 s) and set `legacy.failure_delay_ms` close to it. The
+  proxy pads refusals to the median of recent backend rejections, but right after a start,
+  before it has seen any, it uses `failure_delay_ms` alone.
+- **Identity-preserving logins.** The legacy gate checks the login the client sent. The
+  backend must use that same login as the account name (no `auth_username_format` that
+  strips the domain or folds several logins onto one account), otherwise domain gate, user
+  lists and throttle judge a different name than the backend authenticates. The throttle
+  folds logins to lower case, so differently-cased logins share one counter.
+- **Backend validation.** The backend (e.g. Dovecot `oauth2` passdb) must validate tokens
+  itself; the proxy's check is a filter in front of it, not a replacement.
+- **Audiences.** Give the mail audience only to mail clients. Any token with an accepted
+  audience, issuer and identity opens that mailbox.
+- **`token_type = "any"`** also accepts ID tokens that carry an accepted audience; use it
+  only for IdPs that mark access tokens neither way.
+- **Metrics** have no authentication; bind them to loopback or a management network.
+- **Session lifetime.** After a successful login the proxy relays bytes with no idle
+  limit, no keepalive and no per-user session limit. Session lifetime is up to the client
+  and the backend (for example Dovecot's autologout); a revoked token does not end an open
+  session.
+- **Trust store.** JWKS fetches trust the system CA store (backends use it too unless
+  `ca_file` is set). Keep it limited to CAs you trust to vouch for your identity
+  provider.
+- **Certificates.** The proxy reads its certificate at start and again on `SIGHUP`; send it
+  `SIGHUP` after a renewal. A certificate that fails to load is logged and the old one stays
+  in use, so check the log after a reload.
+
+### Offering legacy passwords to the internet
+
+A rule with public networks turns the proxy into a password target. If you need it:
+
+- **Opt-in users.** Prefer `users` / `users_file` (or a per-user opt-in in the backend,
+  e.g. a Dovecot passdb filter on a directory group) over `public = true` for everyone.
+- **Separate passwords.** Give legacy clients application-specific passwords that differ
+  from the SSO password, so a guessed or phished legacy password does not open the SSO
+  account, and can be revoked on its own.
+- **Log-based blocking.** Feed the `authresult` lines (`reason`, `rule`, `pwfp`) to
+  CrowdSec or a similar tool; `pwfp` shows the same password sprayed from many addresses.
+- **Throttle.** `throttle` stops guessing against one account without asking the backend.
+  It also lets anyone lock that account's legacy logins for `window_secs` by failing on
+  purpose (OAuth logins are not affected); choose the window with that in mind.
+- **Restrict** such rules to `mechanisms = ["PLAIN"]` and the protocols that are needed.
+
+### Out of scope
+
+- A compromised identity provider or backend.
+- Denial of service by volume beyond the built-in connection limits.
+- Password strength, and brute-force blocking beyond the per-account throttle (use the
+  `authresult` log with a blocking tool).
+
+## Reporting a vulnerability
+
+Please report security vulnerabilities privately, either through GitHub's private
+vulnerability reporting ("Report a vulnerability" on the repository's Security tab) or by
+email to security@nk-it.cloud.
+
+Include the version (`mail-auth-proxy --version`), the relevant configuration without
+secrets, and steps or a test that shows the problem.
+
+Do NOT open public GitHub issues for security vulnerabilities.
+
+We acknowledge a report within 7 days and aim to publish a fix within 90 days,
+coordinating the disclosure date with the reporter.
+
+## Release signing key
+
+Releases are signed with `0B58 3E99 144D CD9B 5A34  D96B E52C 6D1E FB67 927B`
+(`packaging/release-signing-key.asc`). A signature from any other key is not ours.
+
+The signatures are made with its signing subkey
+`0D72 6F06 8A40 BCFA 0969  4354 3CC7 3E4D 1408 EDCA`, which expires on 2028-09-26; the
+primary key expires on 2029-09-26.

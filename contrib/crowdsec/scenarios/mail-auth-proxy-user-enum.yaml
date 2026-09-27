@@ -1,0 +1,22 @@
+# Many different logins tried from one external source IP: password spraying or
+# account enumeration against the legacy password gate. Internal sources
+# (scope.internal_networks) do not count.
+type: leaky
+name: mail-auth-proxy/user-enum
+description: "mail-auth-proxy: many different accounts tried from one external IP"
+filter: "evt.Meta.log_type == 'mail_auth_proxy_auth' && evt.Meta.auth_scope == 'external' && evt.Meta.auth_result == 'fail' && evt.Meta.log_subtype in ['blocked_endpoint', 'unknown_domain', 'unknown_account', 'throttled', 'oversize', 'backend_reject'] && evt.Meta.username != ''"
+groupby: evt.Meta.source_ip
+distinct: evt.Meta.username
+capacity: 5
+leakspeed: 1m
+blackhole: 10m
+labels:
+  service: mail-auth-proxy
+  confidence: 3
+  spoofable: 0
+  classification:
+    - attack.T1110
+    - attack.T1589
+  label: "Mail password spraying"
+  behavior: "pop3/imap:bruteforce"
+  remediation: true

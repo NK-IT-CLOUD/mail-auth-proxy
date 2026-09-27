@@ -1,0 +1,29 @@
+# Paths in the public root commit (one per line, directories recursive).
+# docs/ is listed per file: docs/internal/ must never be public.
+# Everything else stays in the private ops repository.
+.gitignore
+.gitea/workflows/ci.yaml
+.github/
+Cargo.toml
+Cargo.lock
+rust-toolchain.toml
+deny.toml
+src/
+tests/
+examples/
+contrib/
+packaging/
+docs/README.md
+docs/architecture.md
+docs/backend-dovecot-postfix.md
+docs/configuration.md
+docs/idp-keycloak.md
+docs/operations.md
+docs/protocols.md
+docs/standards.md
+README.md
+INSTALL.md
+CHANGELOG.md
+SECURITY.md
+CONTRIBUTING.md
+LICENSE
