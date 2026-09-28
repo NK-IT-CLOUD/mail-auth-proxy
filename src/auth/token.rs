@@ -249,6 +249,7 @@ impl Validator {
             check_jwks_url(&i.jwks_url)?;
             policies.push(Arc::new(Policy::from_config(i)?));
         }
+        crate::obs::metrics::register_issuers(policies.iter().map(|p| p.issuer.as_str()));
         let v = Validator {
             keys: RwLock::default(),
             policies,
@@ -301,6 +302,7 @@ impl Validator {
                             failed.push(issuer.clone());
                         }
                         Ok(()) => {
+                            crate::obs::metrics::record_jwks_fetch(issuer, true);
                             for (kid, entries) in staged {
                                 keys.entry(kid).or_default().extend(entries);
                             }
@@ -315,6 +317,10 @@ impl Validator {
                     tracing::warn!(target: crate::obs::target::TOKEN, %issuer, url = %policy.jwks_url, error = %e, "fetching JWKS");
                     failed.push(issuer.clone());
                 }
+            }
+            // Any of the three failures above pushed this issuer.
+            if failed.last() == Some(issuer) {
+                crate::obs::metrics::record_jwks_fetch(issuer, false);
             }
         }
         (keys, failed)

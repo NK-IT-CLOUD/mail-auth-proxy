@@ -205,7 +205,7 @@ Limits are checked at `accept()`, before TLS:
 | JWKS fetch (fixed) | 10 s | per URL |
 | `oauth.refresh_secs` | 300 s | periodic JWKS refresh, all URLs one after another |
 | `sieve.capability_cache_secs` | 600 s | backend post-TLS capabilities |
-| metrics scrape (fixed) | 10 s | read and write each |
+| metrics scrape (fixed) | 10 s, 4 at a time | the whole request head, and the response, each; a fifth connection is closed at accept |
 | backend auth reply (fixed) | at most 32 lines | IMAP `P1` reply; each line within the idle timeout |
 | shutdown drain (fixed) | 10 s | after SIGTERM/SIGINT, how long open sessions may continue ([operations: signals](operations.md#signals-and-service-manager)) |
 

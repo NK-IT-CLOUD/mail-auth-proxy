@@ -240,6 +240,7 @@ pub async fn run(cfg: config::Config) -> Result<()> {
     let mut hangup = signal(SignalKind::hangup())?;
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
+    metrics::mark_process_start();
     let Local {
         acceptor,
         certs,

@@ -16,16 +16,30 @@ async fn proxy_starts_and_relays_each_protocol() {
     let m = h.proxy.metrics().await;
     assert_eq!(
         m[&format!(
-            "mail_auth_proxy_build_info{{version=\"{}\"}}",
-            env!("CARGO_PKG_VERSION")
+            "mail_auth_proxy_build_info{{version=\"{}\",commit=\"{}\"}}",
+            env!("CARGO_PKG_VERSION"),
+            option_env!("MAIL_AUTH_PROXY_COMMIT").unwrap_or("unknown")
         )],
         1
     );
+    // Timestamps: the process start, the JWKS load, the certificate expiry.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let started = m["process_start_time_seconds"];
+    assert!(started <= now && now - started < 60, "{started} vs {now}");
+    let timestamps = [
+        "process_start_time_seconds",
+        "mail_auth_proxy_jwks_last_success_timestamp_seconds",
+        "mail_auth_proxy_tls_cert_expiry_timestamp_seconds",
+    ];
     assert!(
         m.iter()
             .filter(|(k, _)| !k.starts_with("mail_auth_proxy_build_info"))
+            .filter(|(k, _)| !timestamps.iter().any(|t| k.starts_with(t)))
             .all(|(_, v)| *v == 0),
-        "fresh process, all series at 0: {m:?}"
+        "fresh process, all counters and gauges at 0: {m:?}"
     );
 
     let token = h.idp.token(EMAIL);
@@ -55,6 +69,18 @@ async fn proxy_starts_and_relays_each_protocol() {
         );
         assert_eq!(
             m[&format!("mail_auth_proxy_active_connections{{proto=\"{p}\"}}")],
+            1
+        );
+        // The one backend login is in the latency histogram, well below
+        // the top bucket (local mock backend).
+        assert_eq!(
+            m[&format!("mail_auth_proxy_backend_login_duration_seconds_count{{proto=\"{p}\"}}")],
+            1
+        );
+        assert_eq!(
+            m[&format!(
+                "mail_auth_proxy_backend_login_duration_seconds_bucket{{proto=\"{p}\",le=\"2.5\"}}"
+            )],
             1
         );
     }

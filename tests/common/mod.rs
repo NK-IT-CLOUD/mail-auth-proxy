@@ -61,6 +61,11 @@ pub const SMTP_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 11);
 pub const SIEVE_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 12);
 pub const METRICS_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 
+/// `notAfter` of `Pki::renewed_cert` (2049-12-31T00:00:00Z), Unix seconds.
+pub const RENEWED_NOT_AFTER: u64 = 2_524_521_600;
+/// `notAfter` of `Pki::proxy_cert`: rcgen's default, 4096-01-01T00:00:00Z.
+pub const PROXY_NOT_AFTER: u64 = 67_090_118_400;
+
 /// Longest wait for any single expected event on the wire or in the log.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -117,7 +122,8 @@ pub struct Pki {
     pub proxy_cert: PathBuf,
     pub proxy_key: PathBuf,
     /// A second proxy certificate from the same CA (same names), as files
-    /// and DER, for certificate reload tests.
+    /// and DER, for certificate reload tests. It expires at
+    /// `RENEWED_NOT_AFTER`, the first one at rcgen's default (4096-01-01).
     pub renewed_cert: PathBuf,
     pub renewed_key: PathBuf,
     pub renewed_der: Vec<u8>,
@@ -165,14 +171,21 @@ impl Pki {
             SMTP_IP.to_string(),
             SIEVE_IP.to_string(),
         ]);
-        let (renewed_cert, renewed_key) = leaf(vec![
-            INTERNAL_SNI.into(),
-            PUBLIC_SNI.into(),
-            "127.0.0.1".into(),
-            IMAP_IP.to_string(),
-            SMTP_IP.to_string(),
-            SIEVE_IP.to_string(),
-        ]);
+        let (renewed_cert, renewed_key) = {
+            let key = KeyPair::generate().unwrap();
+            let mut p = CertificateParams::new(vec![
+                INTERNAL_SNI.to_string(),
+                PUBLIC_SNI.into(),
+                "127.0.0.1".into(),
+                IMAP_IP.to_string(),
+                SMTP_IP.to_string(),
+                SIEVE_IP.to_string(),
+            ])
+            .unwrap();
+            p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+            p.not_after = rcgen::date_time_ymd(2049, 12, 31); // RENEWED_NOT_AFTER
+            (p.signed_by(&key, &ca).unwrap(), key)
+        };
         let (backend_cert, backend_key) = leaf(vec![BACKEND_NAME.into()]);
 
         let write = |name: &str, body: &str| {
@@ -347,6 +360,16 @@ impl Idp {
             &jsonwebtoken::EncodingKey::from_ec_der(&self.pkcs8),
         )
         .unwrap()
+    }
+}
+
+impl Idp {
+    /// Take the JWKS endpoint down: its port refuses connections from now on.
+    pub async fn stop(&self) {
+        self.task.abort();
+        while !self.task.is_finished() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
 

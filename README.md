@@ -223,9 +223,12 @@ authentication, so keep it on loopback or a management network.
 | `mail_auth_proxy_active_connections` | admitted connections currently open |
 | `mail_auth_proxy_backend_errors_total` | backend or account-check outages while a client waited |
 | `mail_auth_proxy_upstream_forward_total` | sessions spliced to a backend |
+| `mail_auth_proxy_backend_login_duration_seconds` | histogram of successful backend logins |
+| `mail_auth_proxy_jwks_last_success_timestamp_seconds` | last JWKS fetch with usable keys, per issuer |
+| `mail_auth_proxy_tls_cert_expiry_timestamp_seconds` | expiry of the certificate in use |
 
-The complete list with labels, including `mail_auth_proxy_build_info` and
-`mail_auth_proxy_legacy_list_errors_total`, is in
+The complete list with labels, including `mail_auth_proxy_build_info`,
+`process_start_time_seconds`, the JWKS refresh failures and the legacy-gate counters, is in
 [docs/operations.md](docs/operations.md#prometheus-metrics).
 
 </details>

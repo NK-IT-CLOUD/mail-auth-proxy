@@ -246,8 +246,10 @@ pub async fn authorize<B: BackendLogin>(
                 identity: &identity,
                 token,
             };
+            let login_started = tokio::time::Instant::now();
             match backend.login(login).await {
                 Ok(conn) => {
+                    metrics::record_backend_login(s.proto, login_started.elapsed());
                     event(&identity, Reason::Ok, "", "");
                     metrics::record_upstream_forward(s.proto);
                     Outcome::Ok { conn, identity }
@@ -295,11 +297,13 @@ pub async fn authorize<B: BackendLogin>(
                     return Outcome::Unavailable(e.context("legacy account check"));
                 }
             };
+            let login_started = tokio::time::Instant::now();
             match backend
                 .login(BackendCredential::Password { user, pass })
                 .await
             {
                 Ok(conn) => {
+                    metrics::record_backend_login(s.proto, login_started.elapsed());
                     gate.backend_accepted(user);
                     drop(turn);
                     event(user, Reason::Ok, "", rule);

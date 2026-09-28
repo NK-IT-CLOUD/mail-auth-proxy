@@ -360,6 +360,7 @@ impl Throttle {
                     .map(|(k, _)| k.clone())
                 {
                     seen.remove(&k);
+                    crate::obs::metrics::record_throttle_eviction();
                 }
             }
         }
@@ -1055,11 +1056,21 @@ mod tests {
             seen: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
         };
+        let evictions = || {
+            crate::obs::metrics::render_for_tests()
+                .lines()
+                .find_map(|l| l.strip_prefix("mail_auth_proxy_legacy_throttle_evictions_total "))
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap()
+        };
+        let e0 = evictions();
         for i in 0..THROTTLE_CAPACITY + 10 {
             t.failure(&format!("u{i}@x"));
         }
         assert!(t.seen.lock().unwrap().len() <= THROTTLE_CAPACITY);
         assert!(t.is_throttled(&format!("u{}@x", THROTTLE_CAPACITY + 9)));
+        // Each live window pushed out is counted.
+        assert_eq!(evictions() - e0, 10);
     }
 
     /// A list file that becomes missing or invalid fails closed: the rule

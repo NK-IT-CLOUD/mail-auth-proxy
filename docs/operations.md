@@ -75,21 +75,27 @@ When a `protocol` record is written:
 
 ## Prometheus metrics
 
-Metrics are off by default. They are on with `metrics.enabled = true` or when only `metrics.listen` is set. `metrics.listen` then serves a minimal HTTP/1.1 responder without authentication: after the first read it answers any method and path with the exposition text. All series are always present, starting at 0.
+Metrics are off by default. They are on with `metrics.enabled = true` or when only `metrics.listen` is set. `metrics.listen` then serves a minimal HTTP/1.1 responder without authentication, so keep it on loopback or a management network (`--check-config` warns about any other address). Only `GET /metrics` gets the exposition text (`Content-Type: text/plain; version=0.0.4`); another path is answered 404, another method 405, a request line that is not HTTP/1.x 400, a request head over 4 KiB 431, each with `Connection: close`. At most 4 scrapes are served at a time, further connections are closed at accept; the request head and the response each have 10 s. The endpoint logs neither requests nor refusals. Every series is present from the start, so `rate()` and `increase()` work from the first scrape: counters and gauges at 0, the timestamps (`process_start_time_seconds`, the JWKS success time, the certificate expiry) set during startup. No label carries a user, an address or other client input; `issuer` comes from the configuration.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `mail_auth_proxy_build_info` | gauge | `version` | always 1 |
+| `mail_auth_proxy_build_info` | gauge | `version`, `commit` (12 hex digits, `unknown` for a plain `cargo build`) | always 1 |
+| `process_start_time_seconds` | gauge | | start time of the process, Unix seconds |
 | `mail_auth_proxy_auth_attempts_total` | counter | `proto` (imap, smtp, sieve), `scope` (internal, external), `mechanism` (xoauth2, oauthbearer, plain, login, other), `result` (ok, fail) | a credential was evaluated. `fail` counts every refused credential, one per `authresult` line with reason `bad_token`, `authzid_mismatch`, `blocked_endpoint`, `unknown_domain`, `unknown_account`, `throttled`, `oversize` or `backend_reject`. Backend and account-check outages (no `authresult` line) and `protocol` (counted in `mail_auth_proxy_preauth_aborts_total`) are not counted. |
 | `mail_auth_proxy_auth_refusals_total` | counter | `proto`, `reason` (`blocked_endpoint`, `bad_token`, `authzid_mismatch`, `backend_reject`, `unknown_domain`, `unknown_account`, `throttled`, `oversize`) | a refused credential, by the `reason` of its `authresult` line ([above](#the-authresult-line)). The sum over `reason` equals the `fail` side of `mail_auth_proxy_auth_attempts_total`. |
-| `mail_auth_proxy_preauth_aborts_total` | counter | `proto`, `scope` | the connection ended before a credential was presented. Sieve capability-probe failures are not counted. |
+| `mail_auth_proxy_preauth_aborts_total` | counter | `proto`, `scope` | the connection ended before a credential was presented. Not counted: a clean `LOGOUT`/`QUIT`, an IMAP client that disconnects right after the greeting (a health check), Sieve capability-probe failures. |
 | `mail_auth_proxy_token_validate_total` | counter | `result` (ok, fail) | local JWT validations |
 | `mail_auth_proxy_connections_total` | counter | `proto` | connections admitted past the limits |
 | `mail_auth_proxy_connections_rejected_total` | counter | `proto` | connections closed at accept by a limit |
 | `mail_auth_proxy_backend_errors_total` | counter | `proto` | backend or legacy account check (doveadm) unreachable or failing while a client waited for its verdict (outage, not a failed login) |
 | `mail_auth_proxy_legacy_list_errors_total` | counter | `list` (users_file, domains_file) | failed re-reads of a legacy list file; while it fails, the list matches nothing |
+| `mail_auth_proxy_legacy_throttle_evictions_total` | counter | | accounts dropped from the full throttle table (65,536 accounts) while their failure window was still running; their count starts over. Rising means failed passwords for that many distinct accounts within one window, a spraying volume that dilutes the per-account throttle. |
 | `mail_auth_proxy_active_connections` | gauge | `proto` | admitted connections currently open |
+| `mail_auth_proxy_tls_cert_expiry_timestamp_seconds` | gauge | | `notAfter` of the client-facing certificate in use, Unix seconds; follows a `SIGHUP` reload, stays when a reload is refused; 0 if it cannot be read. Alert on `… - time() < 14 * 86400`: a renewed file that was never reloaded still shows the old date. |
+| `mail_auth_proxy_jwks_last_success_timestamp_seconds` | gauge | `issuer` (each `oauth.issuers` entry) | Unix time of the last JWKS fetch of the issuer that produced usable keys: at startup, periodic, on `SIGHUP`, or for an unknown `kid`. Alert when it is older than a few `oauth.refresh_secs`: the proxy still validates with the previous keys, but misses a key rotation. |
+| `mail_auth_proxy_jwks_refresh_failures_total` | counter | `issuer` | JWKS fetches of the issuer that failed (unreachable, HTTP error, oversized, not parsable) or had no usable signing key |
 | `mail_auth_proxy_upstream_forward_total` | counter | `proto` | sessions spliced to a backend |
+| `mail_auth_proxy_backend_login_duration_seconds` | histogram | `proto`, `le` (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, +Inf) | time of each successful backend login, from the start of the backend connection (TCP, TLS, PROXY header or XCLIENT) to the backend's OK. Rejected logins are not included: their time includes the backend's own failure delay. |
 
 ## Signals and service manager
 
