@@ -843,7 +843,11 @@ async fn password_outages_are_padded_like_refusals() {
 // ── Configuration ───────────────────────────────────────────────────────────
 
 fn check_config(pki: &Pki, extra: &str) -> (bool, String) {
-    let cfg = format!(
+    run_check_config(pki, &check_config_text(pki, extra))
+}
+
+fn check_config_text(pki: &Pki, extra: &str) -> String {
+    format!(
         r#"config_version = 2
 [tls]
 cert = "{}"
@@ -861,7 +865,11 @@ token_type = "keycloak"
         pki.proxy_cert.display(),
         pki.proxy_key.display(),
         pki.ca_file.display()
-    );
+    )
+}
+
+/// `--check-config` on `cfg`: success and the combined output.
+fn run_check_config(pki: &Pki, cfg: &str) -> (bool, String) {
     let path = pki.dir.path().join("check.toml");
     std::fs::write(&path, cfg).unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_mail-auth-proxy"))
@@ -933,6 +941,49 @@ fn empty_list_file_path_is_reported_once() {
     );
     assert_eq!(out.matches("domains_file").count(), 1, "{out}");
     assert_eq!(out.matches("users_file").count(), 1, "{out}");
+}
+
+/// Every other empty file path is one problem too: validation reports it,
+/// the file checks skip it.
+#[test]
+fn empty_file_paths_are_reported_once() {
+    let pki = Pki::new();
+    let key = pki.dir.path().join("doveadm.key");
+    std::fs::write(&key, "secret\n").unwrap();
+    let base = check_config_text(&pki, "");
+    let emptied = |path: &std::path::Path| base.replace(&format!("\"{}\"", path.display()), "\"\"");
+    let backend = |proto: &str, port: u16| {
+        format!("{base}[{proto}]\nlisten = \"127.0.0.10:{port}\"\nbackend = {{ address = \"127.0.0.1:1\", verify_name = \"{BACKEND_NAME}\", ca_file = \"\" }}\n")
+    };
+    let doveadm = format!(
+        "{base}[legacy]\naccount_check = \"doveadm\"\ndoveadm_url = \"https://127.0.0.1:1/doveadm/v1\"\n"
+    );
+    let mut wrong = Vec::new();
+    for (cfg, name) in [
+        (emptied(&pki.proxy_cert), "tls.cert"),
+        (emptied(&pki.proxy_key), "tls.key"),
+        (emptied(&pki.ca_file), "imap.backend.ca_file"),
+        (backend("submission", 1), "submission.backend.ca_file"),
+        (backend("sieve", 2), "sieve.backend.ca_file"),
+        (
+            format!("{doveadm}doveadm_key_file = \"\"\n"),
+            "legacy.doveadm_key_file",
+        ),
+        (
+            format!(
+                "{doveadm}doveadm_key_file = \"{}\"\ndoveadm_ca_file = \"\"\n",
+                key.display()
+            ),
+            "legacy.doveadm_ca_file",
+        ),
+    ] {
+        let (ok, out) = run_check_config(&pki, &cfg);
+        // Exactly one problem, and it is this one.
+        if ok || !out.contains(&format!("{name} is empty")) || out.matches("\n  - ").count() != 1 {
+            wrong.push(format!("{name}:\n{out}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// `[password_gate]` stays the short form of one rule and combines with

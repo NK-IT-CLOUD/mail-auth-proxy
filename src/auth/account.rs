@@ -190,18 +190,19 @@ fn read_ca(path: &str) -> Result<Vec<reqwest::Certificate>> {
 }
 
 /// File problems of the account check (key and CA file), for
-/// `--check-config`.
+/// `--check-config`. An empty path is a configuration error, reported by
+/// validation, and skipped here.
 pub fn file_problems(cfg: &config::Legacy) -> Vec<String> {
     let mut out = Vec::new();
     if cfg.account_check != config::AccountCheck::Doveadm {
         return out;
     }
-    if let Some(k) = &cfg.doveadm_key_file {
+    if let Some(k) = cfg.doveadm_key_file.as_deref().filter(|p| !p.is_empty()) {
         if let Err(e) = read_key(k) {
             out.push(format!("legacy.doveadm_key_file: {e:#}"));
         }
     }
-    if let Some(ca) = &cfg.doveadm_ca_file {
+    if let Some(ca) = cfg.doveadm_ca_file.as_deref().filter(|p| !p.is_empty()) {
         if let Err(e) = read_ca(ca) {
             out.push(format!("legacy.doveadm_ca_file: {e:#}"));
         }

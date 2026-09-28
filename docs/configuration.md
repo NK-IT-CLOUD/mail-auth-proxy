@@ -34,6 +34,9 @@ The file is strict. Startup fails, and `--check-config` reports, when:
 - a key is unknown or misspelled, or `config_version = 2` is missing;
 - a required value is missing or empty, a listener is not `ip:port`, a backend is not
   `host:port` or its certificate name is invalid;
+- a file path is set to `""`: `tls.cert`, `tls.key`, a backend `ca_file`, `users_file`,
+  `domains_file`, `doveadm_key_file` or `doveadm_ca_file` (`<key> is empty`;
+  `--check-config` reports it once, without a file error on top);
 - two listeners (the metrics endpoint included, when enabled) take the same port on the
   same address, or one of them on a wildcard address that covers the other: `0.0.0.0`
   covers every IPv4 address, `[::]` every address because Linux binds it dual-stack

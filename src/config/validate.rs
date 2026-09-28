@@ -30,8 +30,12 @@ impl Config {
         if let Err(e) = check_hostname(&self.server.hostname) {
             err(format!("server.hostname = {:?} {e}", self.server.hostname));
         }
-        if self.tls.cert.is_empty() || self.tls.key.is_empty() {
-            err("tls.cert and tls.key are required".into());
+        // Empty file paths are reported here only; `server::file_problems`
+        // skips them.
+        for (name, path) in [("tls.cert", &self.tls.cert), ("tls.key", &self.tls.key)] {
+            if path.is_empty() {
+                err(format!("{name} is empty"));
+            }
         }
 
         let mut listens = vec![("imap.listen", &self.imap.listen)];
@@ -88,6 +92,9 @@ impl Config {
             }
         }
         for (name, b) in &backends {
+            if b.ca_file.as_deref() == Some("") {
+                err(format!("{name}.ca_file is empty"));
+            }
             let address_ok = b
                 .address
                 .rsplit_once(':')
@@ -417,11 +424,16 @@ impl Legacy {
                         }
                     }
                 }
-                if self.doveadm_key_file.as_deref().is_none_or(str::is_empty) {
-                    err(
+                match self.doveadm_key_file.as_deref() {
+                    None => err(
                         "legacy.doveadm_key_file is required with account_check = \"doveadm\""
                             .into(),
-                    );
+                    ),
+                    Some("") => err("legacy.doveadm_key_file is empty".into()),
+                    Some(_) => {}
+                }
+                if self.doveadm_ca_file.as_deref() == Some("") {
+                    err("legacy.doveadm_ca_file is empty".into());
                 }
             }
             AccountCheck::None => {
@@ -1099,6 +1111,47 @@ mod tests {
             e.contains("must be host:port") && e.contains("certificate name"),
             "{e}"
         );
+    }
+
+    /// Every file path is checked for the empty string, with one message per
+    /// key; `--check-config` then skips the path (tests/legacy_gate.rs).
+    #[test]
+    fn empty_file_paths_are_errors() {
+        let doveadm = "[legacy]\naccount_check = \"doveadm\"\ndoveadm_url = \"https://127.0.0.1/doveadm/v1\"\n";
+        let backend = |proto: &str, port: u16| {
+            format!("[{proto}]\nlisten = \"0.0.0.0:{port}\"\nbackend = {{ address = \"192.0.2.10:{port}\", ca_file = \"\" }}\n")
+        };
+        let mut wrong = Vec::new();
+        for (text, key) in [
+            (V2.replace("\"/c.pem\"", "\"\""), "tls.cert"),
+            (V2.replace("\"/k.pem\"", "\"\""), "tls.key"),
+            (
+                V2.replace("verify_name = ", "ca_file = \"\", verify_name = "),
+                "imap.backend.ca_file",
+            ),
+            (
+                format!("{V2}{}", backend("submission", 587)),
+                "submission.backend.ca_file",
+            ),
+            (
+                format!("{V2}{}", backend("sieve", 4190)),
+                "sieve.backend.ca_file",
+            ),
+            (
+                format!("{V2}{doveadm}doveadm_key_file = \"\"\n"),
+                "legacy.doveadm_key_file",
+            ),
+            (
+                format!("{V2}{doveadm}doveadm_key_file = \"/k\"\ndoveadm_ca_file = \"\"\n"),
+                "legacy.doveadm_ca_file",
+            ),
+        ] {
+            let errors = crate::config::parse(&text).unwrap().errors;
+            if errors != [format!("{key} is empty")] {
+                wrong.push(format!("{key}: {errors:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// A disabled gate still validates its networks (they label the scope).

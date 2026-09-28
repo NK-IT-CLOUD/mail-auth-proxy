@@ -58,6 +58,12 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     endpoint on a mail listener's port.
 - `--check-config` reports an empty `users_file` or `domains_file` and a backend
   `address` without host once, without a follow-up file or certificate-name error.
+- Every file path is checked the same way: an empty `tls.cert`, `tls.key`, backend
+  `ca_file`, `legacy.doveadm_key_file` or `legacy.doveadm_ca_file` is now a validation
+  error `<key> is empty`, reported once. Before, an empty backend `ca_file` or
+  `doveadm_ca_file` passed validation and failed only as a file error at start, and the
+  other three were reported twice (validation and file error); `tls.cert and tls.key are
+  required` is now one message per key.
 
 ### Security
 - `oauth.leeway_secs` had no upper bound, so a large value kept expired tokens valid.

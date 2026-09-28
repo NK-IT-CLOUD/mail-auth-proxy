@@ -162,13 +162,16 @@ fn build_local(cfg: &config::Config) -> Result<Local> {
 }
 
 /// Problems with the files the configuration names (certificate, key, CA
-/// files), each reported on its own.
+/// files), each reported on its own. Empty paths are skipped: they are
+/// configuration errors, reported by validation.
 pub fn file_problems(cfg: &config::Config) -> Vec<String> {
     let mut out = Vec::new();
     // Each file on its own first, so a missing cert does not hide a missing key.
     let mut readable = true;
     for (name, path) in [("tls.cert", &cfg.tls.cert), ("tls.key", &cfg.tls.key)] {
-        if let Err(e) = std::fs::metadata(path).and_then(|_| std::fs::File::open(path)) {
+        if path.is_empty() {
+            readable = false;
+        } else if let Err(e) = std::fs::metadata(path).and_then(|_| std::fs::File::open(path)) {
             out.push(format!("{name}: {path}: {e}"));
             readable = false;
         }
@@ -186,7 +189,7 @@ pub fn file_problems(cfg: &config::Config) -> Vec<String> {
         backends.push(("sieve.backend", &s.backend));
     }
     for (name, b) in backends {
-        if let Some(ca) = &b.ca_file {
+        if let Some(ca) = b.ca_file.as_deref().filter(|p| !p.is_empty()) {
             if let Err(e) = tls::backend_connector(Some(ca)) {
                 out.push(format!("{name}.ca_file: {e:#}"));
             }
