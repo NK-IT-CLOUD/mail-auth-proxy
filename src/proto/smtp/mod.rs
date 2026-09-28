@@ -5,6 +5,7 @@
 mod backend;
 mod preauth;
 
+use crate::auth::discovery::{self, Answer};
 use crate::auth::{self, refused};
 use crate::limits::ConnPermit;
 use crate::obs::metrics::Proto;
@@ -270,7 +271,26 @@ pub async fn handle(
                 "password auth blocked on OAuth-only endpoint (scope={scope})"
             )),
         ),
-        auth::Outcome::BadToken(e) => (INVALID, refused(format!("token rejected: {e}"))),
+        // RFC 7628 section 3.2.2: the error result as a `334` challenge,
+        // then the failure once the client has answered it (section 3.2.3).
+        // An abort (`*`) or undecodable answer is a 501 (RFC 4954 section
+        // 4); anything else, and a client that does not answer, gets 535.
+        auth::Outcome::BadToken(e) => {
+            let prompt = format!("334 {}", ctx.error_challenge.base64());
+            let answer =
+                discovery::complete_line(&mut client_tls, &prompt, &mech, preauth_until, tuning)
+                    .await;
+            let reply = match answer {
+                Ok(Answer::Cancelled | Answer::Undecodable) => {
+                    "501 5.5.2 Invalid or cancelled authentication response"
+                }
+                _ => INVALID,
+            };
+            (
+                reply,
+                refused(format!("token rejected: {e}{}", Answer::note(&answer))),
+            )
+        }
         auth::Outcome::WrongAuthzid => (
             INVALID,
             refused("authorization identity differs from the token's identity"),

@@ -19,8 +19,20 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `SIGHUP` can be alerted on.
 - Metric `mail_auth_proxy_legacy_throttle_evictions_total`: accounts the full throttle
   table dropped while their failure window was running.
+- Issuer keys `openid_configuration_url` and `scope`: the IdP's discovery document and
+  the scope a client needs, sent in the RFC 7628 error result for a rejected token so
+  that clients without a preset IdP can find one. At most one issuer sets them.
 
 ### Changed
+- A token that fails validation (`bad_token`) is no longer refused at once, also
+  without the new keys. The client first gets the JSON error result as a SASL
+  challenge (IMAP `+`, SMTP `334`, ManageSieve string; RFC 7628 §3.2.2) and must answer
+  it with `%x01` (OAUTHBEARER) or an empty response (XOAUTH2), after which the usual
+  failure follows (§3.2.3). An abort (`*`) or undecodable answer gets IMAP `BAD` or
+  SMTP `501`. The result is `{"status":"invalid_token"}` plus the configured keys, the
+  same for every rejected token. The round trip counts against the pre-auth budget;
+  the `authresult` line is unchanged. Clients or scripts that expect the failure reply
+  right after `AUTHENTICATE`/`AUTH` must answer the challenge first.
 - `mail_auth_proxy_build_info` has a second label, `commit` (the value of
   `mail-auth-proxy --version`). Queries selecting on `version` keep working; recording
   rules or alerts that list the exact label set of the series need `commit` added.

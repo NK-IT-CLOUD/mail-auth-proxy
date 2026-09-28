@@ -216,6 +216,22 @@ pub struct Issuer {
     /// Claim naming the OAuth client (`azp` for Keycloak/OIDC, `client_id`, `appid`).
     #[serde(default = "default_client_claim")]
     pub client_claim: String,
+    /// https URL of the issuer's OpenID Provider configuration, sent as
+    /// `openid-configuration` to a client whose token failed validation
+    /// (RFC 7628 section 3.2.2). At most one issuer sets it or `scope`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openid_configuration_url: Option<String>,
+    /// OAuth scope a client needs for mail, sent as `scope` with the
+    /// failure (RFC 7628 section 3.2.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+impl Issuer {
+    /// Whether the failure result names this issuer.
+    pub fn has_discovery(&self) -> bool {
+        self.openid_configuration_url.is_some() || self.scope.is_some()
+    }
 }
 
 impl Issuer {

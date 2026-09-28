@@ -4,6 +4,7 @@
 mod backend;
 mod preauth;
 
+use crate::auth::discovery::{self, Answer};
 use crate::auth::{self, refused, sasl};
 use crate::limits;
 use crate::obs::{authlog, metrics};
@@ -133,11 +134,27 @@ pub async fn handle(
                 "password auth blocked on OAuth-only endpoint (scope={scope})"
             )),
         ),
-        // Fixed text: the reason stays in the journal, not on the wire.
-        auth::Outcome::BadToken(e) => (
-            format!("{tag} NO [AUTHENTICATIONFAILED] Authentication failed"),
-            refused(format!("token rejected: {e}")),
-        ),
+        // RFC 7628 section 3.2.2: the error result as a continuation, then
+        // the failure once the client has answered it (section 3.2.3). Fixed
+        // texts: the reason stays in the journal, not on the wire. An abort
+        // (`*`) or undecodable answer is a tagged BAD (RFC 9051 section
+        // 6.2.2); anything else, and a client that does not answer, gets NO.
+        auth::Outcome::BadToken(e) => {
+            let prompt = format!("+ {}", ctx.error_challenge.base64());
+            let answer =
+                discovery::complete_line(&mut client, &prompt, &auth.mech, preauth_until, tuning)
+                    .await;
+            let reply = match answer {
+                Ok(Answer::Cancelled | Answer::Undecodable) => {
+                    format!("{tag} BAD AUTHENTICATE failed: invalid or cancelled response")
+                }
+                _ => format!("{tag} NO [AUTHENTICATIONFAILED] Authentication failed"),
+            };
+            (
+                reply,
+                refused(format!("token rejected: {e}{}", Answer::note(&answer))),
+            )
+        }
         // RFC 5530: the credential is fine, the requested authorisation
         // identity is not.
         auth::Outcome::WrongAuthzid => (

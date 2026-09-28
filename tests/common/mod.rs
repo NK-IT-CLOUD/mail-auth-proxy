@@ -1065,6 +1065,9 @@ pub struct Opts {
     pub notify_socket: Option<PathBuf>,
     /// `submission.xclient` (the mock backend always advertises XCLIENT).
     pub smtp_xclient: bool,
+    /// TOML lines added to the harness issuer (`openid_configuration_url`,
+    /// `scope`).
+    pub issuer_extra: &'static str,
 }
 
 impl Default for Opts {
@@ -1078,6 +1081,7 @@ impl Default for Opts {
             rust_log: "info",
             notify_socket: None,
             smtp_xclient: true,
+            issuer_extra: "",
         }
     }
 }
@@ -1175,6 +1179,7 @@ issuer = "{ISSUER}"
 jwks_url = "{jwks}"
 audiences = ["{AUDIENCE}"]
 token_type = "keycloak"
+{issuer_extra}
 
 {legacy}
 [limits]
@@ -1194,6 +1199,7 @@ connect_secs = 3
             xclient = opts.smtp_xclient,
             sieve_be = backend(sieve, true),
             jwks = idp.jwks_url(),
+            issuer_extra = opts.issuer_extra,
             per_ip = opts.max_preauth_per_ip,
             preauth = opts.preauth_secs,
             idle = opts.idle_secs,
@@ -1556,6 +1562,25 @@ impl Harness {
         (c, reply)
     }
 
+    /// Present a token the proxy rejects: the proxy must answer with its
+    /// error challenge (RFC 7628 section 3.2.2), which the client completes
+    /// with the dummy response of `mech` (section 3.2.3). Returns the client,
+    /// the decoded error result and the final reply.
+    pub async fn auth_rejected(
+        &self,
+        kind: Kind,
+        src: Src,
+        sni: Sni,
+        mech: &str,
+        ir: &str,
+    ) -> (Client, serde_json::Value, String) {
+        let (mut c, challenge) = self.auth(kind, src, sni, mech, ir).await;
+        let result = error_result(kind, &challenge);
+        c.send(&sasl_response(kind, dummy_response(mech))).await;
+        let reply = c.line().await;
+        (c, result, reply)
+    }
+
     /// A session of `kind` at the point where the client sends its credential.
     pub async fn ready(&self, kind: Kind, src: Src, sni: Sni) -> Client {
         match kind {
@@ -1599,6 +1624,43 @@ pub fn auth_command(kind: Kind, mech: &str, ir: &str) -> String {
         Kind::Imap => format!("a AUTHENTICATE {mech} {ir}"),
         Kind::Smtp => format!("AUTH {mech} {ir}"),
         Kind::Sieve => format!("AUTHENTICATE \"{mech}\" \"{ir}\""),
+    }
+}
+
+/// The base64 data of an error challenge line of `kind` (`+ <b64>`,
+/// `334 <b64>`, `"<b64>"`); panics on any other line.
+pub fn challenge_data(kind: Kind, line: &str) -> &str {
+    match kind {
+        Kind::Imap => line.strip_prefix("+ "),
+        Kind::Smtp => line.strip_prefix("334 "),
+        Kind::Sieve => line.strip_prefix('"').and_then(|l| l.strip_suffix('"')),
+    }
+    .unwrap_or_else(|| panic!("{kind:?}: not an error challenge: {line:?}"))
+}
+
+/// The JSON error result an error challenge line of `kind` carries.
+pub fn error_result(kind: Kind, line: &str) -> serde_json::Value {
+    let raw = unb64(challenge_data(kind, line));
+    serde_json::from_slice(&raw)
+        .unwrap_or_else(|e| panic!("not JSON {:?}: {e}", String::from_utf8_lossy(&raw)))
+}
+
+/// The dummy response (base64) that completes a failed exchange of `mech`:
+/// `%x01` for OAUTHBEARER (RFC 7628 section 3.2.3), empty for XOAUTH2.
+pub fn dummy_response(mech: &str) -> &'static str {
+    if mech.eq_ignore_ascii_case("OAUTHBEARER") {
+        "AQ=="
+    } else {
+        ""
+    }
+}
+
+/// A SASL client response line of `kind` carrying `data`: as it is for IMAP
+/// and SMTP, a quoted string for ManageSieve.
+pub fn sasl_response(kind: Kind, data: &str) -> String {
+    match kind {
+        Kind::Imap | Kind::Smtp => data.to_string(),
+        Kind::Sieve => format!("\"{data}\""),
     }
 }
 

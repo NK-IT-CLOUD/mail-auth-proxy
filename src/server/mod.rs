@@ -53,6 +53,8 @@ impl BackendConn {
 /// What every listener shares, read-only.
 pub struct Shared {
     pub validator: Arc<crate::auth::token::Validator>,
+    /// The error result a rejected token is answered with (RFC 7628).
+    pub error_challenge: crate::auth::discovery::ErrorChallenge,
     pub acceptor: TlsAcceptor,
     /// `scope.internal_networks`, parsed once: the internal/external label
     /// of every connection. A label only; it allows nothing.
@@ -272,6 +274,7 @@ pub async fn run(cfg: config::Config) -> Result<()> {
     validator.clone().spawn_refresher();
     let shared = Arc::new(Shared {
         validator,
+        error_challenge: crate::auth::discovery::ErrorChallenge::from_config(&cfg.oauth),
         acceptor,
         nets,
         legacy,

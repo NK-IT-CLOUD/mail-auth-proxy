@@ -3,6 +3,7 @@
 //! presented credential to a logged-in backend connection.
 
 pub mod account;
+pub mod discovery;
 pub mod legacy;
 pub mod policy;
 pub mod sasl;

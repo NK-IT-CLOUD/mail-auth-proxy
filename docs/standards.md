@@ -133,7 +133,8 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 | LOGIN not advertised where PLAIN and a plaintext login command are prohibited | MUST NOT | draft-murchison-sasl-login §1, §3 | Yes | SMTP offers LOGIN only together with PLAIN. IMAP offers SASL LOGIN only where the LOGIN command is allowed (one setting, `LOGIN`). ManageSieve never offers LOGIN. |
 | OAUTHBEARER GS2 header, `auth=` key/value pairs; unknown keys ignored | MUST | RFC 7628 §3.1 | Partial | The GS2 header's channel-binding flag is not checked. D-SASL-4. |
 | `host`/`port` checked against known values | MUST | RFC 7628 §3.2 | No | Ignored. Tokens are bound by audience instead. D-SASL-4. |
-| JSON error challenge on failure, then dummy response | | RFC 7628 §3.2.2-3.2.3; XOAUTH2 "Error response" | No | Fails at once with the protocol's failure reply. D-SASL-4. |
+| JSON error result on failure (`status`, optional `scope` and `openid-configuration`), then the dummy response `%x01` (XOAUTH2: empty) or an abort | | RFC 7628 §3.2.2-3.2.3; XOAUTH2 "Error response" | Partial | For a token that fails validation. `status` is always `invalid_token`, also for XOAUTH2 (Google sends `"401"`). An `authzid_mismatch` or backend rejection fails at once. An empty `auth=` (the discovery query of §4.3) is a malformed response. D-SASL-4. |
+| Abort after the error result: `*` → tagged BAD / `501` / `NO` | MUST | RFC 9051 §6.2.2, RFC 4954 §4, RFC 5804 §2.1 | Yes | An undecodable answer gets the same reply; any other answer the final failure |
 | Authorisation identity (`a=`, `user=`) | | RFC 4422 §3.4.1, §3.6 | Yes | Must be empty, the token's identity or its local part. D-SASL-1. |
 | Bearer scheme name case-insensitive | | RFC 7628 §4, RFC 9110 §11.1 | Yes | |
 | TLS required for OAUTHBEARER | MUST | RFC 7628 §3 | Yes | Neither offered nor accepted before TLS |
@@ -233,7 +234,9 @@ The LOGIN mechanism is server-first, so RFC 4954 §4 and RFC 4959 §3 require th
 
 ### D-SASL-4: RFC 7628 and XOAUTH2 error flows
 
-- A failed token is answered at once with the protocol's failure reply (NO, 535 or NO). There is no JSON error challenge.
+- A token that fails validation gets the JSON error result as a challenge, and the failure reply after the client's answer ([protocols.md](protocols.md#oauth-error-result)). The result is the same for every such token and names the IdP from the configuration, never from the token.
+- A valid token with a foreign authorisation identity (`authzid_mismatch`) and a token the backend rejects fail at once, without the error result. RFC 7628 §3.2 leaves the decision whether the authenticated identity may access the resource to the application, not the mechanism, and `status` has no code for a valid token that is refused.
+- An empty `auth=` value, which RFC 7628 §4.3 shows as a way to ask for the needed scope, is a malformed response (BAD or 501), not a failed token.
 - The `host` and `port` keys and the GS2 channel-binding flag (RFC 5801 §4) are not checked. Tokens are bound to the service by their audience.
 
 ### D-TLS-1: SNI and ALPN
@@ -328,7 +331,8 @@ At startup the proxy then refuses to start; on refresh the issuer keeps its prev
 - RFC 7515 JWS: https://www.rfc-editor.org/rfc/rfc7515.html#section-4.1.11
 - RFC 7517 JWK: https://www.rfc-editor.org/rfc/rfc7517.html#section-5
 - RFC 7519 JWT: https://www.rfc-editor.org/rfc/rfc7519.html#section-4.1
-- RFC 7628 SASL OAuth (OAUTHBEARER): https://www.rfc-editor.org/rfc/rfc7628.html#section-3
+- RFC 6749 OAuth 2.0 (scope syntax): https://www.rfc-editor.org/rfc/rfc6749.html#section-3.3
+- RFC 7628 SASL OAuth (OAUTHBEARER): https://www.rfc-editor.org/rfc/rfc7628.html#section-3 , #section-3.2.2 , #section-3.2.3 , #section-4.3
 - RFC 8314 Cleartext Considered Obsolete: https://www.rfc-editor.org/rfc/rfc8314.html#section-3
 - RFC 8446 TLS 1.3: https://www.rfc-editor.org/rfc/rfc8446.html
 - RFC 8725 JWT BCP: https://www.rfc-editor.org/rfc/rfc8725.html#section-3
@@ -341,5 +345,6 @@ At startup the proxy then refuses to start; on refresh the issuer keeps its prev
 - PROXY protocol: https://www.haproxy.org/download/3.2/doc/proxy-protocol.txt
 - Postfix XCLIENT: https://www.postfix.org/XCLIENT_README.html
 - OpenID Connect Core 1.0: https://openid.net/specs/openid-connect-core-1_0.html#StandardClaims , #ClaimStability
+- OpenID Connect Discovery 1.0: https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderConfig
 - IANA ALPN IDs: https://www.iana.org/assignments/tls-extensiontype-values/tls-extensiontype-values.xhtml#alpn-protocol-ids
 - Prometheus metric naming: https://prometheus.io/docs/practices/naming/

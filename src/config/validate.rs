@@ -165,6 +165,39 @@ impl Config {
             if iss.identity_claim != "email" && iss.requires_email_verified() {
                 warnings.push(format!("{at}: require_email_verified checks the email_verified claim although identity_claim is {:?}", iss.identity_claim));
             }
+            if let Some(url) = &iss.openid_configuration_url {
+                match check_openid_configuration_url(url) {
+                    Err(e) => err(format!("{at}.openid_configuration_url: {e}")),
+                    // OpenID Connect Discovery 1.0 section 4: the document is
+                    // at the issuer plus this path.
+                    Ok(())
+                        if *url
+                            != format!(
+                                "{}/.well-known/openid-configuration",
+                                iss.issuer.trim_end_matches('/')
+                            ) =>
+                    {
+                        warnings.push(format!("{at}.openid_configuration_url is not the issuer followed by /.well-known/openid-configuration"));
+                    }
+                    Ok(()) => {}
+                }
+            }
+            if let Some(scope) = &iss.scope {
+                match check_scope(scope) {
+                    Err(e) => err(format!("{at}.scope: {e}")),
+                    Ok(()) if scope.contains(' ') => warnings.push(format!(
+                        "{at}.scope lists several scopes; RFC 7628 section 3.2.2 recommends one, as some clients do not handle a list"
+                    )),
+                    Ok(()) => {}
+                }
+            }
+            if iss.has_discovery() && self.oauth.issuers[..i].iter().any(|o| o.has_discovery()) {
+                // The result goes to a client whose token was not trusted,
+                // so nothing in it can pick the issuer: one for everyone.
+                err(format!(
+                    "{at}: only one issuer may set openid_configuration_url or scope"
+                ));
+            }
         }
 
         if let Some(g) = &self.password_gate {
@@ -532,6 +565,40 @@ pub fn check_service_url(url: &str) -> Result<(), String> {
     }
 }
 
+/// The OpenID Provider configuration URL a client is pointed to: https
+/// only, also for the local host, since the client fetches it (RFC 7628
+/// section 3.2.2, OpenID Connect Discovery 1.0 section 4). No credentials
+/// and no fragment.
+fn check_openid_configuration_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("bad url {url:?}: {e}"))?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        return Err(format!("{url:?} must be an https URL"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("must not contain user:password@".into());
+    }
+    if parsed.fragment().is_some() {
+        return Err("must not contain a #fragment".into());
+    }
+    Ok(())
+}
+
+/// An OAuth scope: scope tokens separated by single spaces (RFC 6749
+/// section 3.3). The syntax also keeps it free of quotes and backslashes.
+fn check_scope(scope: &str) -> Result<(), String> {
+    let token_char = |c: char| matches!(c, '\x21' | '\x23'..='\x5b' | '\x5d'..='\x7e');
+    if scope
+        .split(' ')
+        .all(|t| !t.is_empty() && t.chars().all(token_char))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "{scope:?} is not a scope (RFC 6749 section 3.3: tokens of printable ASCII without '\"' and '\\', separated by single spaces)"
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::config::tests::{parse, V2};
@@ -719,6 +786,84 @@ mod tests {
         assert!(errors_with("[legacy]\naccount_check = \"doveadm\"\ndoveadm_url = \"https://doveadm:secret@mail.example.org/doveadm/v1\"\ndoveadm_key_file = \"/k\"\n").contains("must not contain user:password@"));
         // http is fine for the local host (tests, a sidecar).
         assert!(errors_with("[legacy]\naccount_check = \"doveadm\"\ndoveadm_url = \"http://127.0.0.1:8080/doveadm/v1\"\ndoveadm_key_file = \"/k\"\n").is_empty());
+    }
+
+    /// `openid_configuration_url` and `scope`: https only, RFC 6749 scope
+    /// syntax, one issuer at most; the usual URL and several scopes pass with
+    /// a warning.
+    #[test]
+    fn discovery_fields() {
+        const WELL_KNOWN: &str = "https://idp.example/realms/mail/.well-known/openid-configuration";
+        let with = |fields: &str| {
+            crate::config::parse(&V2.replace(
+                "token_type = \"keycloak\"\n",
+                &format!("token_type = \"keycloak\"\n{fields}\n"),
+            ))
+            .unwrap()
+        };
+        let l = with(&format!(
+            "openid_configuration_url = \"{WELL_KNOWN}\"\nscope = \"openid\""
+        ));
+        assert!(
+            l.errors.is_empty() && l.warnings.is_empty(),
+            "{:?} {:?}",
+            l.errors,
+            l.warnings
+        );
+        let printed = toml::to_string(&l.config).unwrap();
+        assert!(
+            printed.contains(WELL_KNOWN) && printed.contains("scope = \"openid\""),
+            "{printed}"
+        );
+
+        for (fields, needle) in [
+            (
+                "openid_configuration_url = \"http://idp.example/x\"",
+                "must be an https URL",
+            ),
+            // No local exception: the client fetches the document.
+            (
+                "openid_configuration_url = \"http://127.0.0.1/x\"",
+                "must be an https URL",
+            ),
+            ("openid_configuration_url = \"nonsense\"", "bad url"),
+            (
+                "openid_configuration_url = \"https://u:p@idp.example/x\"",
+                "user:password@",
+            ),
+            (
+                "openid_configuration_url = \"https://idp.example/x#f\"",
+                "fragment",
+            ),
+            ("scope = \"\"", "is not a scope"),
+            ("scope = \"a  b\"", "is not a scope"),
+            ("scope = \"a\\\"b\"", "is not a scope"),
+            ("scope = \"ümlaut\"", "is not a scope"),
+        ] {
+            let e = with(fields).errors.join("\n");
+            assert!(e.contains(needle), "{fields}\n→ {e}");
+        }
+
+        let w = with("openid_configuration_url = \"https://idp.example/other\"").warnings;
+        assert!(w.iter().any(|w| w.contains(".well-known")), "{w:?}");
+        let w = with("scope = \"openid email\"").warnings;
+        assert!(w.iter().any(|w| w.contains("several scopes")), "{w:?}");
+
+        let second = "[[oauth.issuers]]\nissuer = \"https://idp2.example\"\njwks_url = \"https://idp2.example/certs\"\naudiences = [\"dovecot\"]\ntoken_type = \"rfc9068\"\n";
+        let e = crate::config::parse(&format!(
+            "{}{second}scope = \"mail\"\n",
+            V2.replace(
+                "token_type = \"keycloak\"\n",
+                "token_type = \"keycloak\"\nscope = \"mail\"\n",
+            )
+        ))
+        .unwrap()
+        .errors
+        .join("\n");
+        assert!(e.contains("oauth.issuers[1]: only one issuer"), "{e}");
+        // One issuer with the fields and one without is fine.
+        let l = crate::config::parse(&format!("{V2}{second}scope = \"mail\"\n")).unwrap();
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
     }
 
     /// `[password_gate]` short form: one rule plus the scope label; `[scope]`

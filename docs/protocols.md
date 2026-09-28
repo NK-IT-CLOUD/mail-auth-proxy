@@ -48,7 +48,7 @@ A client that reads the greeting and disconnects before its first command (a hea
 | password with a mechanism the connection does not offer | `t NO password authentication not available on this endpoint` | `blocked_endpoint` (with `pwfp`) |
 | password refused by the legacy gate (user not allowed, unknown domain or account, throttled, password over 1024 bytes) | `t NO [AUTHENTICATIONFAILED] backend rejected credentials`, after `failure_delay_ms` (see below) | `blocked_endpoint`, `unknown_domain`, `unknown_account`, `throttled`, `oversize` (with `pwfp`) |
 | account check unavailable | `t NO [UNAVAILABLE] Backend temporarily unavailable` | none (counted in `mail_auth_proxy_backend_errors_total`) |
-| OAuth token fails validation | `t NO [AUTHENTICATIONFAILED] Authentication failed` | `bad_token` |
+| OAuth token fails validation | `+ <error result>`; after the client's answer `t NO [AUTHENTICATIONFAILED] Authentication failed`, or `t BAD AUTHENTICATE failed: invalid or cancelled response` for `*` and undecodable answers ([OAuth error result](#oauth-error-result)) | `bad_token` |
 | OAuth token valid, but `user=` / `a=` names another identity | `t NO [AUTHORIZATIONFAILED] Authorization failed` | `authzid_mismatch` |
 | OAuth valid, backend answers `NO` (after its XOAUTH2 error challenge) | `t NO [AUTHENTICATIONFAILED] backend rejected token` | `backend_reject` |
 | password, backend answers `NO` | `t NO [AUTHENTICATIONFAILED] backend rejected credentials`, after `failure_delay_ms` | `backend_reject` (with `pwfp`) |
@@ -95,7 +95,9 @@ sequenceDiagram
     end
     P->>I: validate JWT (kid → key, alg pinned, iss/aud/exp/nbf, email_verified, typ=Bearer)
     alt invalid
-        P-->>C: b NO [AUTHENTICATIONFAILED] Authentication failed (close)
+        P-->>C: + base64(error result)
+        C->>P: AQ== (OAUTHBEARER) / empty line (XOAUTH2) / *
+        P-->>C: b NO [AUTHENTICATIONFAILED] Authentication failed (b BAD for *) (close)
     else valid → email
         P->>B: TCP + [PROXY v2] + TLS (verify backend verify_name)
         B-->>P: * OK …
@@ -152,7 +154,7 @@ The EHLO extension list is static: it does not come from the backend, and `SIZE`
 | password with a mechanism the connection does not offer | `504 5.5.4 password authentication not available on this endpoint` | `blocked_endpoint` |
 | password refused by the legacy gate (including a password over 1024 bytes) | `535 5.7.8 Authentication credentials invalid`, after `failure_delay_ms` (see below) | `blocked_endpoint`, `unknown_domain`, `unknown_account`, `throttled`, `oversize` |
 | account check unavailable | `454 4.7.0 Temporary authentication failure` | none (counted in `mail_auth_proxy_backend_errors_total`) |
-| token invalid | `535 5.7.8 Authentication credentials invalid` | `bad_token` |
+| token invalid | `334 <error result>`; after the client's answer `535 5.7.8 Authentication credentials invalid`, or `501 5.5.2 Invalid or cancelled authentication response` for `*` and undecodable answers ([OAuth error result](#oauth-error-result)) | `bad_token` |
 | token valid, but `user=` / `a=` names another identity | `535 5.7.8 Authentication credentials invalid` | `authzid_mismatch` |
 | backend connect, greeting, EHLO, STARTTLS, TLS or XCLIENT fails | `454 4.7.0 Temporary authentication failure` | none (counted in `mail_auth_proxy_backend_errors_total`) |
 | backend advertises `XCLIENT` but `submission.xclient = false`, or still advertises it after the proxy's `XCLIENT` (misconfiguration, no credential is sent) | `454 4.7.0 Temporary authentication failure` | none (counted in `mail_auth_proxy_backend_errors_total`) |
@@ -193,6 +195,11 @@ sequenceDiagram
     P-->>C: 250-… static list … 250 AUTH XOAUTH2 OAUTHBEARER (+PLAIN LOGIN)
     C->>P: AUTH XOAUTH2 <ir>
     P->>P: validate JWT → email
+    opt invalid
+        P-->>C: 334 base64(error result)
+        C->>P: empty line (XOAUTH2) / AQ== (OAUTHBEARER) / *
+        P-->>C: 535 5.7.8 Authentication credentials invalid (501 for *) (close)
+    end
     P->>B: TCP connect
     B-->>P: 220
     P->>B: EHLO / STARTTLS / TLS / EHLO
@@ -263,7 +270,7 @@ Before `AUTHENTICATE`, `CAPABILITY` (the capability list again, then `OK "Capabi
 
 | Situation | Client sees | authlog `reason` |
 |---|---|---|
-| token invalid | `NO "Authentication failed"` | `bad_token` |
+| token invalid | `"<error result>"`; after the client's answer `NO "Authentication failed"` ([OAuth error result](#oauth-error-result)) | `bad_token` |
 | token valid, but `user=` / `a=` names another identity | `NO "Authorization failed"` | `authzid_mismatch` |
 | PLAIN and the connection does not offer it | `NO "password authentication not available on this endpoint"` | `blocked_endpoint` |
 | PLAIN refused by the legacy gate (including a password over 1024 bytes) | `NO "Authentication failed"`, after `failure_delay_ms` (see below) | `blocked_endpoint`, `unknown_domain`, `unknown_account`, `throttled`, `oversize` |
@@ -295,6 +302,11 @@ sequenceDiagram
     P-->>C: backend caps (no STARTTLS, SASL rewritten by the legacy rules) + OK "TLS negotiation successful."
     C->>P: AUTHENTICATE "XOAUTH2" "<ir>"  (or {n+} literal)
     P->>P: validate JWT → email
+    opt invalid
+        P-->>C: "base64(error result)"
+        C->>P: "AQ==" (OAUTHBEARER) / "" (XOAUTH2) / "*"
+        P-->>C: NO "Authentication failed" (close)
+    end
     P->>B: TCP + [PROXY v2] + greeting + STARTTLS + TLS + caps
     P->>B: AUTHENTICATE "XOAUTH2" "base64(user=email ^A auth=Bearer jwt ^A^A)"
     alt OK
@@ -306,6 +318,45 @@ sequenceDiagram
     end
 ```
 
+## OAuth error result
+
+A token that fails validation (`bad_token`) is not refused at once. As RFC 7628 §3.2.2
+and §3.2.3 describe, the proxy sends a JSON error result as a SASL challenge, the client
+answers it, and only then comes the failure. XOAUTH2 follows the same pattern (Google's
+XOAUTH2 protocol description), with an empty answer instead of `%x01`.
+
+The error result is built once at startup and is the same for every rejected token,
+whatever the cause and whatever issuer the token claims:
+
+```
+{"status":"invalid_token","scope":"<scope>","openid-configuration":"<url>"}
+```
+
+`scope` and `openid-configuration` come from the one issuer that sets `scope` or
+`openid_configuration_url` ([configuration.md](configuration.md#keys)); without them
+the result is `{"status":"invalid_token"}`.
+
+| Protocol | Challenge | Dummy answer (OAUTHBEARER / XOAUTH2) | Final reply | Abort `*`, undecodable answer |
+|---|---|---|---|---|
+| IMAP (RFC 9051 §6.2.2) | `+ <base64>` | `AQ==` / empty line | `t NO [AUTHENTICATIONFAILED] Authentication failed` | `t BAD AUTHENTICATE failed: invalid or cancelled response` |
+| SMTP (RFC 4954 §4) | `334 <base64>` | `AQ==` / empty line | `535 5.7.8 Authentication credentials invalid` | `501 5.5.2 Invalid or cancelled authentication response` |
+| ManageSieve (RFC 5804 §2.1) | `"<base64>"`, a literal `{n}` beyond 1024 octets | `"AQ=="` or `{4+}` literal / `""` | `NO "Authentication failed"` | `NO "Authentication failed"` |
+
+- An answer that decodes but is not the mechanism's dummy (the other mechanism's dummy,
+  a new credential) gets the final reply. A ManageSieve answer may be quoted, a literal
+  or bare.
+- A client that does not answer is cut off by the pre-auth budget
+  (`timeouts.preauth_secs`, counted from the accept) or the idle timeout, whichever ends
+  first. It gets the final reply, and the connection closes. A client that closes the
+  connection just ends the session. An answer longer than 16384 bytes is treated like no
+  answer.
+- The `authresult` line (`bad_token`) is written once, before the challenge; the answer
+  changes neither it nor the metrics. The journal's session-end detail (DEBUG) notes an
+  answer that was not the dummy.
+- A valid token, a valid token with another `user=` / `a=` (`authzid_mismatch`), a
+  backend rejection (`backend_reject`) and keys that could not be refreshed (retry-later)
+  get their reply at once, without a challenge.
+
 ## Surprising and client-incompatible behaviour
 
 1. **One authentication attempt per connection.** Any failed or unsupported AUTH/AUTHENTICATE, and any unknown pre-auth command, closes the connection. Python `smtplib.login()` falls back from PLAIN to LOGIN on the same connection after a 535, so it raises `SMTPServerDisconnected` instead of `SMTPAuthenticationError`.
@@ -313,9 +364,9 @@ sequenceDiagram
 3. **A legacy rule with `sni` needs SNI.** Clients connecting by IP (no SNI) or with a different hostname or alias only get OAuth from such a rule, even from its networks.
 4. **IMAP:** `IMAP4rev2` is always advertised before authentication whatever the backend supports (after login the backend's real list is relayed). `STARTTLS` on the implicit-TLS port closes the connection. IMAP literals in `LOGIN` are not supported. `AUTHENTICATE PLAIN =` (RFC 4959 empty response) is rejected.
 5. **SMTP:** the EHLO list is static (no `SIZE`; `CHUNKING`, `DSN` and `SMTPUTF8` are claimed whatever the backend supports). `AUTH PLAIN =` gets `501`.
-6. **ManageSieve:** after STARTTLS only `CAPABILITY`, `NOOP`, `LOGOUT` and `AUTHENTICATE` are accepted, and `CAPABILITY` is refused before TLS. A continuation response must be bare base64 (RFC-conformant quoted or literal strings fail). There is no `LOGIN`. The plaintext greeting lists no mechanism (`"SASL" ""`); the mechanisms appear only after TLS.
+6. **ManageSieve:** after STARTTLS only `CAPABILITY`, `NOOP`, `LOGOUT` and `AUTHENTICATE` are accepted, and `CAPABILITY` is refused before TLS. The response to the empty challenge must be bare base64 (RFC-conformant quoted or literal strings fail); only the answer to the OAuth error result is read as a string. There is no `LOGIN`. The plaintext greeting lists no mechanism (`"SASL" ""`); the mechanisms appear only after TLS.
 7. **Token rules are per issuer.** A wrong `token_type` either rejects every token (`keycloak` for an IdP without the `typ` claim) or lets ID tokens with an accepted audience in (`any`); `email_verified` must be a real boolean when required.
-8. **Connection-limit and timeout closes are silent:** no `421`/`BYE`.
+8. **Connection-limit and timeout closes are silent:** no `421`/`BYE`. The one exception is a client that does not answer the [OAuth error result](#oauth-error-result): it still gets the failure reply.
 9. **No keepalive and no idle limit after authentication.**
 10. **Refused passwords are answered slowly.** Every failed legacy login is answered at least `legacy.failure_delay_ms` (default 2 s) after the credential, except a password sent with a mechanism the connection does not offer (`blocked_endpoint` at step 0), which is refused at once. Refusals by the gate wait for the larger of `failure_delay_ms` and the median time of recent backend rejections, plus random jitter; backend rejections get the same jitter. A retry-later on the password path (account check or backend unavailable) is answered no earlier than a refusal. OAuth failures are not delayed. Details in [architecture.md](architecture.md#legacy-gate).
 11. **A token with an unknown `kid` can get retry-later.** It is a `bad_token` when the last on-demand JWKS refresh succeeded for the issuer the token claims (also while further refreshes are held back for 30 s). If that refresh failed for the issuer, the client gets retry-later ([architecture.md](architecture.md#oauth-token-validation)).

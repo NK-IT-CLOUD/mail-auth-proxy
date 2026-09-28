@@ -58,6 +58,10 @@ identity_claim = "email"                   # the mailbox login forwarded to the 
 # require_email_verified defaults to true when identity_claim = "email"
 # allowed_clients = ["thunderbird", "webmail"]   # optional azp allowlist
 # infer_key_algorithm = true               # keys without "alg": ES256/ES384 by curve, RS256 for RSA (default true)
+# Named in the error result a client gets for a rejected token (RFC 7628), so it
+# can find the IdP. Only one issuer may set these two keys.
+# openid_configuration_url = "https://sso.example.org/realms/mail/.well-known/openid-configuration"
+# scope = "mail"                           # the scope clients must request; unset: none
 
 # [[oauth.issuers]]
 # # IdPs that issue RFC 9068 access tokens (header typ = "at+jwt").

@@ -56,36 +56,71 @@ where
         Zeroizing::new(s)
     } else if after_mech.starts_with('{') {
         // Literal form: {n+} — the n bytes follow on the NEXT read
-        let close = after_mech
-            .find('}')
-            .ok_or_else(|| anyhow!("AUTHENTICATE: malformed literal"))?;
-        let count_str = &after_mech[1..close];
-        // Strip trailing '+' (non-synchronising literal)
-        let count_str = count_str.trim_end_matches('+');
-        let n: usize = count_str
-            .parse()
-            .map_err(|_| anyhow!("AUTHENTICATE: bad literal count"))?;
-        if n > 65536 {
-            return Err(anyhow!("AUTHENTICATE: literal too large ({n})"));
-        }
-        // RFC 5804 §4: server sends continuation "OK ..." for non-synchronising literals,
-        // but for synchronising ones it must wait.  We send nothing for non-sync (+).
-        // Read exactly n bytes.
-        use tokio::io::AsyncReadExt;
-        let mut buf = Zeroizing::new(vec![0u8; n]);
-        stream.read_exact(&mut buf).await?;
-        // Consume the CRLF terminating the literal octets so it does NOT leak
-        // into the post-auth byte relay (otherwise the backend sees a stray
-        // empty line → "Unknown command" and all responses shift by one).
-        // EOF-tolerant: a client that closes right after the literal is fine.
-        let _ = read_client_line(stream, idle).await;
-        let text = std::str::from_utf8(&buf).map_err(|e| anyhow!("literal utf8: {e}"))?;
-        Zeroizing::new(text.to_owned())
+        read_literal(stream, after_mech, idle).await?
     } else {
         return Err(anyhow!("AUTHENTICATE: unrecognised IR form"));
     };
 
     Ok((mech, ir))
+}
+
+/// Read the octets of the literal whose `{n+}` (or `{n}`) header starts
+/// `header`; they follow on the next read. They can carry the credential
+/// and are zeroized on drop.
+async fn read_literal<S>(stream: &mut S, header: &str, idle: Duration) -> Result<Zeroizing<String>>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let close = header
+        .find('}')
+        .ok_or_else(|| anyhow!("AUTHENTICATE: malformed literal"))?;
+    let count_str = &header[1..close];
+    // Strip trailing '+' (non-synchronising literal)
+    let count_str = count_str.trim_end_matches('+');
+    let n: usize = count_str
+        .parse()
+        .map_err(|_| anyhow!("AUTHENTICATE: bad literal count"))?;
+    if n > 65536 {
+        return Err(anyhow!("AUTHENTICATE: literal too large ({n})"));
+    }
+    // RFC 5804 §4: server sends continuation "OK ..." for non-synchronising literals,
+    // but for synchronising ones it must wait.  We send nothing for non-sync (+).
+    // Read exactly n bytes.
+    use tokio::io::AsyncReadExt;
+    let mut buf = Zeroizing::new(vec![0u8; n]);
+    stream.read_exact(&mut buf).await?;
+    // Consume the CRLF terminating the literal octets so it does NOT leak
+    // into the post-auth byte relay (otherwise the backend sees a stray
+    // empty line → "Unknown command" and all responses shift by one).
+    // EOF-tolerant: a client that closes right after the literal is fine.
+    let _ = read_client_line(stream, idle).await;
+    let text = std::str::from_utf8(&buf).map_err(|e| anyhow!("literal utf8: {e}"))?;
+    Ok(Zeroizing::new(text.to_owned()))
+}
+
+/// Read a SASL client response: one string on its own line, quoted or a
+/// literal (RFC 5804 section 2.1). A bare line is taken as it is. The
+/// response can carry a credential and is zeroized on drop.
+pub(super) async fn read_sasl_string<S>(stream: &mut S, idle: Duration) -> Result<Zeroizing<String>>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let line = read_client_line(stream, idle).await?;
+    let line = line.trim();
+    if line.starts_with('"') {
+        match unquote_string(line) {
+            Some((s, rest)) if rest.trim().is_empty() => Ok(Zeroizing::new(s)),
+            Some((s, _)) => {
+                drop(Zeroizing::new(s));
+                Err(anyhow!("malformed quoted string"))
+            }
+            None => Err(anyhow!("malformed quoted string")),
+        }
+    } else if line.starts_with('{') {
+        read_literal(stream, line, idle).await
+    } else {
+        Ok(Zeroizing::new(line.to_owned()))
+    }
 }
 
 /// Unquote the leading `"..."` from `s`.  Returns (content, remainder_after_closing_quote).
@@ -215,6 +250,31 @@ mod tests {
             msg.contains("too large"),
             "expected 'too large' in error: {msg}"
         );
+    }
+
+    /// A SASL response in each string form; a malformed quoted string fails.
+    #[tokio::test]
+    async fn sasl_response_string_forms() {
+        use std::io::Cursor;
+        for (wire, want) in [
+            (&b"\"AQ==\"\r\n"[..], Some("AQ==")),
+            (b"\"\"\r\n", Some("")),
+            (b"\"*\"\r\n", Some("*")),
+            (b"{4+}\r\nAQ==\r\n", Some("AQ==")),
+            (b"{0+}\r\n\r\n", Some("")),
+            (b"AQ==\r\n", Some("AQ==")),
+            (b"\"AQ==\r\n", None),
+            (b"\"AQ==\" x\r\n", None),
+            (b"{99999999+}\r\n", None),
+        ] {
+            let got = read_sasl_string(&mut Cursor::new(wire.to_vec()), IDLE).await;
+            assert_eq!(
+                got.ok().as_deref().map(String::as_str),
+                want,
+                "{:?}",
+                String::from_utf8_lossy(wire)
+            );
+        }
     }
 
     /// unquote_string handles basic and escaped characters.

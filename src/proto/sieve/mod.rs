@@ -7,6 +7,7 @@ mod preauth;
 
 pub use backend::CapsCache;
 
+use crate::auth::discovery::{self, Answer};
 use crate::auth::{self, refused};
 use crate::limits::ConnPermit;
 use crate::obs::metrics::Proto;
@@ -15,7 +16,7 @@ use crate::wire::deadline_at;
 use crate::wire::line::{read_client_line, verb_is};
 use anyhow::{anyhow, Result};
 use backend::{backend_caps, SieveLogin};
-use preauth::parse_authenticate_line;
+use preauth::{parse_authenticate_line, read_sasl_string};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -31,6 +32,17 @@ use tokio::time::Instant;
 fn caps_plain(name: &str, sieve: Option<&str>) -> String {
     let sieve = sieve.map(|l| format!("{l}\r\n")).unwrap_or_default();
     format!("\"IMPLEMENTATION\" \"{name}\"\r\n\"SASL\" \"\"\r\n{sieve}\"STARTTLS\"\r\n\"VERSION\" \"1.0\"\r\nOK \"ready\"\r\n")
+}
+
+/// A SASL challenge line (RFC 5804 section 2.1): a quoted string, or a
+/// literal when the base64 data exceeds the 1024 octets a quoted string may
+/// hold (section 4). Base64 needs no escaping.
+fn sieve_challenge(b64: &str) -> String {
+    if b64.len() <= 1024 {
+        format!("\"{b64}\"\r\n")
+    } else {
+        format!("{{{}}}\r\n{b64}\r\n", b64.len())
+    }
 }
 
 // Post-TLS SASL line advertised to the client, chosen by the legacy gate
@@ -330,7 +342,25 @@ pub async fn handle(
                 "password auth blocked on OAuth-only endpoint (scope={scope})"
             )),
         ),
-        auth::Outcome::BadToken(e) => (FAILED, refused(format!("token rejected: {e}"))),
+        // RFC 7628 section 3.2.2: the error result as a challenge string,
+        // then the failure once the client has answered it (section 3.2.3).
+        // Every ending, an abort (`"*"`, RFC 5804 section 2.1) included,
+        // is a NO.
+        auth::Outcome::BadToken(e) => {
+            let answer = deadline_at(preauth_until, tuning.preauth, "error challenge", async {
+                client_tls
+                    .write_all(sieve_challenge(ctx.error_challenge.base64()).as_bytes())
+                    .await?;
+                client_tls.flush().await?;
+                read_sasl_string(&mut client_tls, tuning.idle).await
+            })
+            .await
+            .map(|s| discovery::classify(&mech, &s));
+            (
+                FAILED,
+                refused(format!("token rejected: {e}{}", Answer::note(&answer))),
+            )
+        }
         auth::Outcome::WrongAuthzid => (
             "NO \"Authorization failed\"",
             refused("authorization identity differs from the token's identity"),
@@ -367,6 +397,16 @@ mod tests {
         assert!(!g.contains("\"SIEVE\""), "{g}");
         let g = caps_plain("proxy.test", Some("\"SIEVE\" \"fileinto\""));
         assert!(g.contains("\"SIEVE\" \"fileinto\"\r\n"), "{g}");
+    }
+
+    /// Quoted up to the 1024-octet limit of a quoted string, a literal beyond.
+    #[test]
+    fn challenge_is_quoted_or_literal() {
+        assert_eq!(sieve_challenge("eyJ9"), "\"eyJ9\"\r\n");
+        let at_limit = "A".repeat(1024);
+        assert_eq!(sieve_challenge(&at_limit), format!("\"{at_limit}\"\r\n"));
+        let long = "A".repeat(1025);
+        assert_eq!(sieve_challenge(&long), format!("{{1025}}\r\n{long}\r\n"));
     }
 
     /// The password-gated SASL line advertises PLAIN when allowed, never LOGIN

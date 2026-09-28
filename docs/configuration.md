@@ -52,6 +52,10 @@ The file is strict. Startup fails, and `--check-config` reports, when:
 - `submission.backend.proxy_protocol` is set, or a `submission.ehlo_extensions` entry is
   not an EHLO line, repeats a keyword or is `AUTH` or `STARTTLS`;
 - an issuer is listed twice, has no audience, or lists an unsupported algorithm;
+- `openid_configuration_url` is not `https://` or contains `user:password@` or a
+  fragment, `scope` is not an RFC 6749 scope, or more than one issuer sets
+  `openid_configuration_url` or `scope` (the error result goes to a client whose token
+  was not trusted, so it names one IdP for everyone);
 - `doveadm_*` keys are set without `account_check = "doveadm"`, or are missing with it.
 
 Startup also fails when a JWKS is unreachable or has no usable key, or a listener cannot
@@ -115,6 +119,8 @@ backend `.…` keys below, written inline (`backend = { address = "…" }`) or a
 | `oauth.issuers[].infer_key_algorithm` | bool | `true` | a JWKS key without `alg` is used with the one algorithm its type implies (ES256 for P-256, ES384 for P-384, RS256 for RSA); off: such keys are skipped |
 | `oauth.issuers[].allowed_clients` | array | empty (any) | accepted values of `client_claim` |
 | `oauth.issuers[].client_claim` | string | `azp` | claim naming the OAuth client |
+| `oauth.issuers[].openid_configuration_url` | URL | unset | https only (also for `localhost`), no `user:password@`, no fragment. Sent as `openid-configuration` in the error result a client gets for a rejected token (RFC 7628 §3.2.2), so it can find the IdP. Warning when it is not `<issuer>/.well-known/openid-configuration` |
+| `oauth.issuers[].scope` | string | unset | sent as `scope` in the same error result: the scope a client must request for mail. RFC 6749 scope tokens separated by single spaces; several scopes give a warning (RFC 7628 recommends one) |
 | `scope.internal_networks` | array of CIDR | empty (default: the `[password_gate]` networks) | label `scope=internal` in logs and metrics; allows nothing |
 | `legacy.rules[].name` | string | required | unique, 1-64 of `A-Z a-z 0-9 . _ -`; logged as `rule=` |
 | `legacy.rules[].networks` | array of CIDR | required | client source networks; the rule's security boundary |

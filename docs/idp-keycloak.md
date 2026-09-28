@@ -93,6 +93,7 @@ allowed_algorithms = ["ES256", "ES384", "RS256", "RS384", "RS512"]
 infer_key_algorithm = false         # Keycloak publishes "alg" on its keys
 allowed_clients = ["thunderbird", "webmail"]   # optional: only these azp values
 client_claim = "azp"                # default
+openid_configuration_url = "https://sso.example.org/realms/mail/.well-known/openid-configuration"
 ```
 
 - `token_type = "keycloak"` is required for Keycloak: it keeps ID tokens (which can carry
@@ -106,6 +107,12 @@ client_claim = "azp"                # default
   sign tokens for another.
 - The mail client's user name must be empty, the token's `email`, or its local part;
   anything else is refused as `authzid_mismatch`.
+- `openid_configuration_url` is the realm's discovery document,
+  `/realms/<realm>/.well-known/openid-configuration` under the Keycloak base URL. A client
+  whose token is rejected gets it in the RFC 7628 error result
+  ([protocols.md](protocols.md#oauth-error-result)). `scope` can stay unset: the `mail`
+  audience comes from a default client scope, which Keycloak adds without being asked.
+  Only one issuer may set these keys.
 
 Dovecot needs the same issuers in its `oauth2 { issuers = … }` list
 ([backend guide](backend-dovecot-postfix.md)).

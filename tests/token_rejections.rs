@@ -1,6 +1,7 @@
-//! Tokens that fail local validation: every protocol answers with its fixed
-//! failure text, logs `bad_token` with the client's own SASL user, and never
-//! opens a backend session. The precise reason goes only to the journal.
+//! Tokens that fail local validation: every protocol answers with the
+//! RFC 7628 error challenge and then its fixed failure text, logs `bad_token`
+//! with the client's own SASL user, and never opens a backend session. The
+//! precise reason goes only to the journal.
 
 mod common;
 use common::*;
@@ -78,8 +79,8 @@ async fn rejections(kind: Kind) {
             .proxy
             .metric("mail_auth_proxy_token_validate_total{result=\"fail\"}")
             .await;
-        let (mut c, reply) = h
-            .auth(
+        let (mut c, result, reply) = h
+            .auth_rejected(
                 kind,
                 Src::External,
                 Sni::Public,
@@ -87,6 +88,12 @@ async fn rejections(kind: Kind) {
                 &xoauth2(CLIENT_USER, &token),
             )
             .await;
+        // Without discovery settings the error result is the status alone.
+        assert_eq!(
+            result,
+            json!({"status": "invalid_token"}),
+            "{proto}: {case}"
+        );
         assert_eq!(reply, rejection(kind), "{proto}: {case}");
         c.expect_closed().await;
 
@@ -130,8 +137,8 @@ async fn rejections(kind: Kind) {
     // refresh succeeded, so it is still a bad_token (a flood of random kids
     // stays visible to CrowdSec and is no backend error).
     let token = h.idp.mint_with_kid("another-key", json!({}));
-    let (mut c, reply) = h
-        .auth(
+    let (mut c, _, reply) = h
+        .auth_rejected(
             kind,
             Src::External,
             Sni::Public,
@@ -198,6 +205,8 @@ async fn oversize_token_is_bad_token() {
     let (mut c, _, _) = h.sieve(Src::External, Sni::Public).await;
     c.send_raw(format!("AUTHENTICATE \"XOAUTH2\" {{{}+}}\r\n{ir}\r\n", ir.len()).as_bytes())
         .await;
+    error_result(Kind::Sieve, &c.line().await);
+    c.send("\"\"").await;
     assert_eq!(c.line().await, "NO \"Authentication failed\"");
     let ar = &h.proxy.wait_authresults(1).await[0];
     assert_eq!((ar.reason.as_str(), ar.user.as_str()), ("bad_token", EMAIL));
