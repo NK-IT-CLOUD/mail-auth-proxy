@@ -34,7 +34,7 @@ A single crate with a library (`src/lib.rs`) and a thin binary (`src/main.rs`).
 | Path | What |
 |---|---|
 | `src/main.rs` | command line, logging setup, `--check-config` / `--print-config` |
-| `src/config.rs` | configuration format 2: schema, validation, warnings, normalisation |
+| `src/config/` | configuration format 2: loading (`mod.rs`), schema and defaults (`schema.rs`), validation, warnings and normalisation (`validate.rs`) |
 | `src/server/` | startup, listeners and accept loop, TLS material, signals, systemd notification |
 | `src/limits.rs` | connection limits at accept |
 | `src/proto/imap/`, `smtp/`, `sieve/` | per protocol: pre-auth dialog (`preauth.rs`), session handler (`mod.rs`), backend login (`backend.rs`) |
