@@ -92,7 +92,7 @@ mod tests {
     #[test]
     fn ipv4_header_matches_wire_format() {
         let src = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 51344));
-        let dst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(10, 9, 3, 31), 993));
+        let dst = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 31), 993));
         let h = v2_header(src, dst).unwrap();
 
         // 12 sig + 1 ver/cmd + 1 fam + 2 len + 12 addr = 28 bytes.
@@ -102,7 +102,7 @@ mod tests {
         assert_eq!(h[13], 0x11); // TCP over IPv4
         assert_eq!(&h[14..16], &12u16.to_be_bytes());
         assert_eq!(&h[16..20], &[203, 0, 113, 7]); // src ip
-        assert_eq!(&h[20..24], &[10, 9, 3, 31]); // dst ip
+        assert_eq!(&h[20..24], &[192, 0, 2, 31]); // dst ip
         assert_eq!(&h[24..26], &51344u16.to_be_bytes()); // src port
         assert_eq!(&h[26..28], &993u16.to_be_bytes()); // dst port
     }
