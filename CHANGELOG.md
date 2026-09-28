@@ -56,6 +56,15 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   written rule with `public = true`.
 - `submission.ehlo_extensions` entries with a leading space (`" AUTH"`) passed the
   check for `AUTH` and `STARTTLS`. Entries must now be EHLO lines (see Changed).
+- Passwords, bearer tokens and the lines and SASL responses carrying them are
+  overwritten in memory when dropped (`zeroize`), including the buffers a line outgrew
+  while being read and a half-decoded base64 response. The credential is dropped right
+  after the backend login instead of living until the session ends. Copies inside
+  rustls, `jsonwebtoken`, the kernel and swap are not covered; see
+  [architecture: credentials in memory](docs/architecture.md#credentials-in-memory).
+- Base64 decoding errors of a SASL response no longer name the offending character:
+  the text reached the journal and could show one character of the encoded
+  credential.
 
 ## [0.1.1] - 2026-09-28
 

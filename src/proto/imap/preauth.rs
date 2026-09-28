@@ -2,11 +2,12 @@
 //! credential of a LOGIN or AUTHENTICATE command.
 
 use crate::auth::legacy::MechSet;
-use crate::wire::line::{read_line, read_sasl_response, sasl_login_step};
+use crate::wire::line::{read_client_line, read_sasl_response, sasl_login_step};
 use crate::wire::Tuning;
 use anyhow::{anyhow, Result};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use zeroize::Zeroizing;
 
 /// The pre-auth capabilities. OAuth mechanisms always; PLAIN/LOGIN only as
 /// far as the legacy gate offers them on this connection. LOGINDISABLED
@@ -59,7 +60,7 @@ pub async fn read_client_auth<S: AsyncRead + AsyncWrite + Unpin>(
         .write_all(format!("* OK [CAPABILITY {caps}] {name} ready\r\n").as_bytes())
         .await?;
     for n in 0..tuning.max_preauth_commands {
-        let line = match read_line(stream, tuning.idle).await {
+        let line = match read_client_line(stream, tuning.idle).await {
             Ok(l) => l,
             // Connect, read the greeting, disconnect: a health check or port
             // probe, not a failed login.
@@ -134,7 +135,7 @@ pub async fn read_client_auth<S: AsyncRead + AsyncWrite + Unpin>(
                         .await?;
                     return Err(anyhow!("no mechanism"));
                 };
-                let inline_ir = aparts.next().map(|s| s.to_string());
+                let inline_ir = aparts.next().map(|s| Zeroizing::new(s.to_owned()));
                 let kind = match mech.to_ascii_uppercase().as_str() {
                     "XOAUTH2" | "OAUTHBEARER" | "PLAIN" | "LOGIN" => {
                         match read_sasl_credential(stream, &mech, inline_ir, tuning.idle).await {
@@ -186,7 +187,7 @@ pub async fn read_client_auth<S: AsyncRead + AsyncWrite + Unpin>(
 async fn read_sasl_credential<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     mech: &str,
-    inline_ir: Option<String>,
+    inline_ir: Option<Zeroizing<String>>,
     idle: Duration,
 ) -> Result<crate::auth::sasl::ClientAuthKind> {
     Ok(match mech.to_ascii_uppercase().as_str() {
@@ -201,7 +202,7 @@ async fn read_sasl_credential<S: AsyncRead + AsyncWrite + Unpin>(
             // initial response (`AUTHENTICATE LOGIN <b64user>`); asking for it
             // again would make it answer with the password, which would then
             // be taken — and logged — as the username.
-            let user = match inline_ir.filter(|s| !s.is_empty()) {
+            let mut user = match inline_ir.filter(|s| !s.is_empty()) {
                 Some(ir) => crate::wire::line::decode_login_field(&ir)?,
                 None => sasl_login_step(stream, "+ VXNlcm5hbWU6", idle).await?, // base64("Username:")
             };
@@ -209,7 +210,10 @@ async fn read_sasl_credential<S: AsyncRead + AsyncWrite + Unpin>(
             if user.is_empty() || pass.is_empty() {
                 return Err(anyhow!("LOGIN empty field"));
             }
-            crate::auth::sasl::ClientAuthKind::Password { user, pass }
+            crate::auth::sasl::ClientAuthKind::Password {
+                user: std::mem::take(&mut *user),
+                pass,
+            }
         }
         _ => {
             let ir = read_ir(stream, inline_ir, idle).await?;
@@ -225,10 +229,12 @@ async fn read_sasl_credential<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// Parse the two astring arguments of a LOGIN command: each is either a bare
 /// atom or a quoted string with `\"`/`\\` escapes. IMAP literals (`{n}`) are
-/// not supported.
-fn parse_two_astrings(rest: &str) -> Result<(String, String)> {
+/// not supported. The second argument is the password: both are built in
+/// buffers sized for the whole line (no reallocation leaves a partial copy)
+/// and zeroized on drop, also on a parse error.
+fn parse_two_astrings(rest: &str) -> Result<(String, Zeroizing<String>)> {
     let mut chars = rest.trim().chars().peekable();
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<Zeroizing<String>> = Vec::with_capacity(2);
     while out.len() < 2 {
         while matches!(chars.peek(), Some(' ')) {
             chars.next();
@@ -236,7 +242,7 @@ fn parse_two_astrings(rest: &str) -> Result<(String, String)> {
         match chars.peek() {
             Some('"') => {
                 chars.next();
-                let mut s = String::new();
+                let mut s = Zeroizing::new(String::with_capacity(rest.len()));
                 loop {
                     match chars.next() {
                         Some('\\') => {
@@ -251,7 +257,7 @@ fn parse_two_astrings(rest: &str) -> Result<(String, String)> {
             }
             Some('{') => return Err(anyhow!("IMAP literals not supported")),
             Some(_) => {
-                let mut s = String::new();
+                let mut s = Zeroizing::new(String::with_capacity(rest.len()));
                 while let Some(&c) = chars.peek() {
                     if c == ' ' {
                         break;
@@ -264,15 +270,16 @@ fn parse_two_astrings(rest: &str) -> Result<(String, String)> {
             None => return Err(anyhow!("missing argument")),
         }
     }
-    Ok((out.remove(0), out.remove(0)))
+    let pass = out.remove(1);
+    Ok((std::mem::take(&mut *out[0]), pass))
 }
 
 /// Return the SASL-IR: use the inline value if present, else send `+ \r\n` and read one line.
 async fn read_ir<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
-    inline: Option<String>,
+    inline: Option<Zeroizing<String>>,
     idle: Duration,
-) -> Result<String> {
+) -> Result<Zeroizing<String>> {
     match inline {
         Some(ir) if !ir.is_empty() => Ok(ir),
         _ => {
@@ -328,7 +335,7 @@ mod tests {
         let n = client.read(&mut buf).await.unwrap();
         assert!(std::str::from_utf8(&buf[..n]).unwrap().starts_with("* OK"));
         client
-            .write_all(format!("A1 AUTHENTICATE XOAUTH2 {ir}\r\n").as_bytes())
+            .write_all(format!("A1 AUTHENTICATE XOAUTH2 {}\r\n", ir.as_str()).as_bytes())
             .await
             .unwrap();
         let auth = server_task.await.unwrap().unwrap().unwrap();
@@ -336,7 +343,7 @@ mod tests {
         match auth.kind {
             crate::auth::sasl::ClientAuthKind::OAuth { user, token } => {
                 assert_eq!(user, "alice@example.org");
-                assert_eq!(token, "TKN");
+                assert_eq!(*token, "TKN");
             }
             _ => panic!("expected OAuth"),
         }
@@ -362,7 +369,7 @@ mod tests {
         match auth.kind {
             crate::auth::sasl::ClientAuthKind::Password { user, pass } => {
                 assert_eq!(user, "alice@example.org");
-                assert_eq!(pass, "pw123");
+                assert_eq!(*pass, "pw123");
             }
             _ => panic!("expected Password"),
         }
@@ -412,7 +419,7 @@ mod tests {
         match auth.kind {
             crate::auth::sasl::ClientAuthKind::Password { user, pass } => {
                 assert_eq!(user, "bob@x");
-                assert_eq!(pass, "secret");
+                assert_eq!(*pass, "secret");
             }
             _ => panic!("expected Password"),
         }
@@ -451,7 +458,7 @@ mod tests {
         match auth.kind {
             crate::auth::sasl::ClientAuthKind::Password { user, pass } => {
                 assert_eq!(user, "bob@example.invalid");
-                assert_eq!(pass, "pw");
+                assert_eq!(*pass, "pw");
             }
             _ => panic!("expected Password (parsed for logging)"),
         }
@@ -485,7 +492,7 @@ mod tests {
         match auth.kind {
             crate::auth::sasl::ClientAuthKind::Password { user, pass } => {
                 assert_eq!(user, "mailflow@dev.example.org");
-                assert_eq!(pass, "p\"a ss\\w");
+                assert_eq!(*pass, "p\"a ss\\w");
             }
             _ => panic!("expected Password"),
         }
@@ -509,11 +516,11 @@ mod tests {
     fn parse_two_astrings_variants() {
         assert_eq!(
             parse_two_astrings("user pw").unwrap(),
-            ("user".into(), "pw".into())
+            ("user".into(), String::from("pw").into())
         );
         assert_eq!(
             parse_two_astrings("\"u ser\" \"p w\"").unwrap(),
-            ("u ser".into(), "p w".into())
+            ("u ser".into(), String::from("p w").into())
         );
         assert!(parse_two_astrings("onlyone").is_err());
         assert!(parse_two_astrings("user {5}").is_err());
@@ -608,7 +615,7 @@ mod tests {
         match t.await.unwrap().unwrap().unwrap().kind {
             crate::auth::sasl::ClientAuthKind::Password { user, pass } => {
                 assert_eq!(user, "erin@x");
-                assert_eq!(pass, "pw9");
+                assert_eq!(*pass, "pw9");
             }
             _ => panic!("expected Password"),
         }

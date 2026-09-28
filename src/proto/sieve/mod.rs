@@ -12,7 +12,7 @@ use crate::limits::ConnPermit;
 use crate::obs::metrics::Proto;
 use crate::server::{BackendConn, Ctx};
 use crate::wire::deadline_at;
-use crate::wire::line::{read_line, verb_is};
+use crate::wire::line::{read_client_line, verb_is};
 use anyhow::{anyhow, Result};
 use backend::{backend_caps, SieveLogin};
 use preauth::parse_authenticate_line;
@@ -84,7 +84,7 @@ pub async fn handle(
                     .await?;
                 return Err(anyhow!("sieve: pre-TLS command limit reached"));
             }
-            let line = read_line(&mut tcp, tuning.idle).await?;
+            let line = read_client_line(&mut tcp, tuning.idle).await?;
             if verb_is(&line, "STARTTLS") {
                 tcp.write_all(b"OK \"Begin TLS negotiation now\"\r\n")
                     .await?;
@@ -202,7 +202,7 @@ pub async fn handle(
                         .await?;
                     return Err(anyhow!("sieve: post-TLS command limit reached"));
                 }
-                let line = read_line(&mut client_tls, tuning.idle).await?;
+                let line = read_client_line(&mut client_tls, tuning.idle).await?;
                 if verb_is(&line, "CAPABILITY") {
                     client_tls.write_all(caps.as_bytes()).await?;
                     client_tls
@@ -308,7 +308,11 @@ pub async fn handle(
     // gone must not replace the reason (an outage's cause above all) with a
     // write error.
     const FAILED: &str = "NO \"Authentication failed\"";
-    let (reply, error) = match auth::authorize(&ctx, &session, &mech, &kind, &login).await {
+    let outcome = auth::authorize(&ctx, &session, &mech, &kind, &login).await;
+    // The credential is not needed after the login: dropping it zeroizes it
+    // before the splice, which can last for hours.
+    drop(kind);
+    let (reply, error) = match outcome {
         auth::Outcome::Ok {
             conn: (mut be, be_reply),
             identity,

@@ -107,8 +107,11 @@ pub async fn handle(
     // for the journal. The answer is best effort: a client that is already
     // gone must not replace the reason (an outage's cause above all) with a
     // write error.
-    let (reply, error) = match auth::authorize(&ctx, &session, &auth.mech, &auth.kind, &login).await
-    {
+    let outcome = auth::authorize(&ctx, &session, &auth.mech, &auth.kind, &login).await;
+    // The credential is not needed after the login: dropping it zeroizes it
+    // before the splice, which can last for hours.
+    drop(auth.kind);
+    let (reply, error) = match outcome {
         auth::Outcome::Ok {
             conn: (mut be, logged_in),
             ..

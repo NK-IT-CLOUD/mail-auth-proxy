@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
+use zeroize::Zeroizing;
 
 /// Maximum lines read while waiting for the backend's tagged auth reply. A
 /// backend that never sends a tagged response (or loops on continuations) must
@@ -140,26 +141,23 @@ impl BackendLogin for ImapLogin<'_> {
 
     async fn login(&self, credential: BackendCredential<'_>) -> Result<Self::Conn, BackendError> {
         let xoauth2 = matches!(credential, BackendCredential::Token { .. });
-        let command = match credential {
+        let (mech, response) = match credential {
             // The same token the client presented, for its verified identity.
             BackendCredential::Token { identity, token } => {
                 tracing::info!(target: crate::obs::target::MAIN, peer = %self.peer, user = %sanitize(identity), mech = %self.mech, "oauth validated; proxying to backend");
-                format!(
-                    "XOAUTH2 {}",
-                    crate::auth::sasl::build_xoauth2(identity, token)
-                )
+                ("XOAUTH2", crate::auth::sasl::build_xoauth2(identity, token))
             }
             // The client's own password; the backend validates it (the proxy
             // never holds a master credential). Never log the password.
             BackendCredential::Password { user, pass } => {
                 tracing::info!(target: crate::obs::target::MAIN, peer = %self.peer, user = %sanitize(user), mech = %self.mech, "password auth; forwarding to backend");
-                format!("PLAIN {}", crate::auth::sasl::build_plain(user, pass))
+                ("PLAIN", crate::auth::sasl::build_plain(user, pass))
             }
         };
+        // `concat` sizes the line once; it is zeroized on drop like the response.
+        let command = Zeroizing::new(["P1 AUTHENTICATE ", mech, " ", &response, "\r\n"].concat());
         let mut stream = connect_tls(self.backend, self.peer, self.local, self.tuning).await?;
-        stream
-            .write_all(format!("P1 AUTHENTICATE {command}\r\n").as_bytes())
-            .await?;
+        stream.write_all(command.as_bytes()).await?;
         let ok = await_auth_ok(&mut stream, self.tuning.idle, xoauth2).await?;
         Ok((stream, ok))
     }

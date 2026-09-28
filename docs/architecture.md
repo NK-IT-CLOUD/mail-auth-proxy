@@ -136,6 +136,26 @@ A source IP in `scope.internal_networks` counts as `scope=internal`, whatever th
 
 For OAuth, the login forwarded to the backend is always the token's `identity_claim` (default `email`). The username the client supplies (XOAUTH2 `user=`, OAUTHBEARER `a=`, the SASL authorisation identity) is logged when validation fails. Once the token is valid, that username must be empty, name the same identity, or be its local part without a domain (ASCII case-insensitive). Any other name fails the exchange with `authzid_mismatch` before the backend is contacted (RFC 4422 §3.6).
 
+### Credentials in memory
+
+Passwords, bearer tokens and the SASL responses that carry them are held in buffers that are overwritten with zeros when they are dropped (the [`zeroize`](https://crates.io/crates/zeroize) crate):
+
+- every client line before authentication (an IMAP `LOGIN` line or an `AUTHENTICATE`/`AUTH` line can carry the credential), including the buffers it outgrew while being read;
+- the SASL response lines, their base64-decoded bytes (also when decoding fails half-way), the unquoted ManageSieve response and literal;
+- the parsed password or token;
+- the `XOAUTH2` or `PLAIN` response rebuilt for the backend, in raw and base64 form, and the command line that carries it.
+
+The credential is dropped right after the backend login, before the session is relayed. Types that hold one print `<redacted>` in `Debug`, and error texts name neither the credential nor a byte of its base64 encoding; the log keeps only the keyed password fingerprint (`pwfp`).
+
+This narrows how long a credential stays in the proxy's heap. It does not remove every copy, and some are out of the proxy's reach:
+
+- the TLS libraries: rustls keeps decrypted client data and the plaintext written to the backend in its own buffers, and tokio's TLS stream and the kernel's socket buffers hold them before encryption and after decryption;
+- token validation: `jsonwebtoken` and the crypto library decode the token's parts into their own buffers; the password fingerprint is an HMAC computed inside aws-lc;
+- the operating system: memory can be swapped to disk or end up in a core dump unless swap is encrypted or disabled and core dumps are off for the service;
+- the compiler can keep copies in registers or on the stack, which `zeroize` does not reach.
+
+The user name is not treated as a secret and is not zeroized.
+
 ## OAuth token validation
 
 Validation is local; the proxy makes no introspection or userinfo call. A token over 16384 bytes is a `bad_token` without validation.

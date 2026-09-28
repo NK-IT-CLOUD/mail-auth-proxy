@@ -10,7 +10,7 @@ use crate::limits::ConnPermit;
 use crate::obs::metrics::Proto;
 use crate::server::{BackendConn, Ctx};
 use crate::wire::deadline_at;
-use crate::wire::line::{read_line, verb_is};
+use crate::wire::line::{read_client_line, verb_is};
 use anyhow::{anyhow, Result};
 use backend::SmtpLogin;
 use preauth::read_smtp_auth;
@@ -61,7 +61,7 @@ pub async fn handle(
                     .await?;
                 return Err(anyhow!("submission: pre-TLS command limit reached"));
             }
-            let line = read_line(&mut tcp, tuning.idle).await?;
+            let line = read_client_line(&mut tcp, tuning.idle).await?;
             if verb_is(&line, "EHLO") {
                 // RFC 3207 §4.2: do not advertise AUTH before the session is
                 // encrypted, so a client can never be tempted to send
@@ -165,7 +165,7 @@ pub async fn handle(
                     client_tls.flush().await?;
                     return Err(anyhow!("submission: post-TLS command limit reached"));
                 }
-                let line = read_line(&mut client_tls, tuning.idle).await?;
+                let line = read_client_line(&mut client_tls, tuning.idle).await?;
                 if verb_is(&line, "EHLO") {
                     client_tls.write_all(ehlo_reply.as_bytes()).await?;
                 } else if verb_is(&line, "HELO") {
@@ -246,7 +246,11 @@ pub async fn handle(
     // gone must not replace the reason (an outage's cause above all) with a
     // write error.
     const INVALID: &str = "535 5.7.8 Authentication credentials invalid";
-    let (reply, error) = match auth::authorize(&ctx, &session, &mech, &kind, &login).await {
+    let outcome = auth::authorize(&ctx, &session, &mech, &kind, &login).await;
+    // The credential is not needed after the login: dropping it zeroizes it
+    // before the splice, which can last for hours.
+    drop(kind);
+    let (reply, error) = match outcome {
         auth::Outcome::Ok {
             conn: mut be,
             identity,

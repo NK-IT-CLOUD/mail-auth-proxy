@@ -4,6 +4,7 @@ use crate::wire::line::{read_sasl_response, sasl_login_step};
 use anyhow::{anyhow, Result};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use zeroize::Zeroizing;
 
 /// Parse `AUTH <MECH> [<IR>]` (already-read line) and gather the credential.
 /// Returns the mechanism name and a classified `ClientAuthKind`. Never logs
@@ -32,7 +33,7 @@ where
     let inline = parts
         .next()
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+        .map(|s| Zeroizing::new(s.to_owned()));
     if !matches!(
         mech.to_ascii_uppercase().as_str(),
         "XOAUTH2" | "OAUTHBEARER" | "PLAIN" | "LOGIN"
@@ -63,7 +64,7 @@ where
 async fn read_smtp_credential<S>(
     stream: &mut S,
     mech: &str,
-    inline: Option<String>,
+    inline: Option<Zeroizing<String>>,
     idle: Duration,
 ) -> Result<crate::auth::sasl::ClientAuthKind>
 where
@@ -79,7 +80,7 @@ where
         "LOGIN" => {
             // `AUTH LOGIN <b64user>` carries the username; asking for it again
             // would make the client answer with the password (see proto/imap/preauth.rs).
-            let user = match inline {
+            let mut user = match inline {
                 Some(ir) => crate::wire::line::decode_login_field(&ir)?,
                 None => sasl_login_step(stream, "334 VXNlcm5hbWU6", idle).await?, // base64("Username:")
             };
@@ -87,7 +88,10 @@ where
             if user.is_empty() || pass.is_empty() {
                 return Err(anyhow!("LOGIN empty field"));
             }
-            crate::auth::sasl::ClientAuthKind::Password { user, pass }
+            crate::auth::sasl::ClientAuthKind::Password {
+                user: std::mem::take(&mut *user),
+                pass,
+            }
         }
         _ => {
             let ir = smtp_ir(stream, inline, idle).await?;
@@ -102,7 +106,11 @@ where
 }
 
 /// SASL-IR for SMTP: inline if present, else send `334 \r\n` and read one line.
-async fn smtp_ir<S>(stream: &mut S, inline: Option<String>, idle: Duration) -> Result<String>
+async fn smtp_ir<S>(
+    stream: &mut S,
+    inline: Option<Zeroizing<String>>,
+    idle: Duration,
+) -> Result<Zeroizing<String>>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -135,7 +143,7 @@ mod tests {
         match kind {
             crate::auth::sasl::ClientAuthKind::OAuth { user, token } => {
                 assert_eq!(user, "alice@example.org");
-                assert_eq!(token, "TOKEN");
+                assert_eq!(*token, "TOKEN");
             }
             _ => panic!("expected OAuth"),
         }
@@ -153,7 +161,7 @@ mod tests {
         match kind {
             crate::auth::sasl::ClientAuthKind::Password { user, pass } => {
                 assert_eq!(user, "bob@example.org");
-                assert_eq!(pass, "pw");
+                assert_eq!(*pass, "pw");
             }
             _ => panic!("expected Password"),
         }
@@ -199,7 +207,7 @@ mod tests {
         match kind {
             crate::auth::sasl::ClientAuthKind::Password { user, pass } => {
                 assert_eq!(user, "carol@x");
-                assert_eq!(pass, "hunter2");
+                assert_eq!(*pass, "hunter2");
             }
             _ => panic!("expected Password"),
         }
@@ -219,7 +227,7 @@ mod tests {
         match kind {
             crate::auth::sasl::ClientAuthKind::Password { user, pass } => {
                 assert_eq!(user, "bob@example.invalid");
-                assert_eq!(pass, "pw");
+                assert_eq!(*pass, "pw");
             }
             _ => panic!("expected Password (parsed for logging)"),
         }
@@ -276,7 +284,7 @@ mod tests {
         match t.await.unwrap().unwrap().1 {
             crate::auth::sasl::ClientAuthKind::Password { user, pass } => {
                 assert_eq!(user, "dave@x");
-                assert_eq!(pass, "s3cret");
+                assert_eq!(*pass, "s3cret");
             }
             _ => panic!("expected Password"),
         }

@@ -1,10 +1,11 @@
 //! The ManageSieve `AUTHENTICATE` command: mechanism and initial response in
 //! quoted or literal form.
 
-use crate::wire::line::{read_line, verb_is};
+use crate::wire::line::{read_client_line, verb_is};
 use anyhow::{anyhow, Result};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use zeroize::Zeroizing;
 
 /// Parse `AUTHENTICATE "<MECH>" "<IR>"` or `AUTHENTICATE "<MECH>" {n+}\r\n<bytes>`.
 ///
@@ -13,12 +14,13 @@ use tokio::io::AsyncWriteExt;
 /// - Literal: `AUTHENTICATE "XOAUTH2" {n+}` followed by exactly n bytes on the next read
 ///
 /// The MECH is unquoted from the first quoted-string token.
-/// The IR is unquoted from the second token (quoted or literal).
+/// The IR is unquoted from the second token (quoted or literal); it carries
+/// the credential and is zeroized on drop.
 pub(super) async fn parse_authenticate_line<S>(
     line: &str,
     stream: &mut S,
     idle: Duration,
-) -> Result<(String, String)>
+) -> Result<(String, Zeroizing<String>)>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -42,7 +44,7 @@ where
         // prefix is a *command completion* — sending `OK ""` would tell the
         // client its AUTHENTICATE had already succeeded.
         stream.write_all(b"\"\"\r\n").await?;
-        let ir = read_line(stream, idle).await?;
+        let ir = read_client_line(stream, idle).await?;
         return Ok((mech, ir));
     }
 
@@ -51,7 +53,7 @@ where
         // Quoted form
         let (s, _) = unquote_string(after_mech)
             .ok_or_else(|| anyhow!("AUTHENTICATE: malformed quoted IR"))?;
-        s
+        Zeroizing::new(s)
     } else if after_mech.starts_with('{') {
         // Literal form: {n+} — the n bytes follow on the NEXT read
         let close = after_mech
@@ -70,14 +72,15 @@ where
         // but for synchronising ones it must wait.  We send nothing for non-sync (+).
         // Read exactly n bytes.
         use tokio::io::AsyncReadExt;
-        let mut buf = vec![0u8; n];
+        let mut buf = Zeroizing::new(vec![0u8; n]);
         stream.read_exact(&mut buf).await?;
         // Consume the CRLF terminating the literal octets so it does NOT leak
         // into the post-auth byte relay (otherwise the backend sees a stray
         // empty line → "Unknown command" and all responses shift by one).
         // EOF-tolerant: a client that closes right after the literal is fine.
-        let _ = crate::wire::line::read_line(stream, idle).await;
-        String::from_utf8(buf).map_err(|e| anyhow!("literal utf8: {e}"))?
+        let _ = read_client_line(stream, idle).await;
+        let text = std::str::from_utf8(&buf).map_err(|e| anyhow!("literal utf8: {e}"))?;
+        Zeroizing::new(text.to_owned())
     } else {
         return Err(anyhow!("AUTHENTICATE: unrecognised IR form"));
     };
@@ -86,17 +89,20 @@ where
 }
 
 /// Unquote the leading `"..."` from `s`.  Returns (content, remainder_after_closing_quote).
-/// Handles `\"` escapes inside the string.
+/// Handles `\"` escapes inside the string. The content can be the credential:
+/// `out` is sized for all of `s` so that it never reallocates and leaves a
+/// partial copy behind, and zeroized if the string is unterminated (the
+/// caller zeroizes the result).
 fn unquote_string(s: &str) -> Option<(String, &str)> {
     let s = s.strip_prefix('"')?;
-    let mut out = String::new();
+    let mut out = Zeroizing::new(String::with_capacity(s.len()));
     let mut chars = s.char_indices();
     loop {
         let (i, c) = chars.next()?;
         match c {
             '"' => {
                 let remainder = &s[i + 1..];
-                return Some((out, remainder));
+                return Some((std::mem::take(&mut *out), remainder));
             }
             '\\' => {
                 let (_, escaped) = chars.next()?;
@@ -125,7 +131,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mech, "XOAUTH2");
-        assert_eq!(ir, b64);
+        assert_eq!(*ir, b64);
     }
 
     /// OAUTHBEARER mechanism accepted in quoted form.
@@ -139,7 +145,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mech, "OAUTHBEARER");
-        assert_eq!(ir, b64);
+        assert_eq!(*ir, b64);
     }
 
     /// Literal form {n+}: IR bytes follow immediately after the command line.
@@ -165,7 +171,7 @@ mod tests {
 
         let (mech, ir) = server_task.await.unwrap().unwrap();
         assert_eq!(mech, "XOAUTH2");
-        assert_eq!(ir, b64);
+        assert_eq!(*ir, b64);
     }
 
     /// The CRLF terminating a literal must be consumed so it does not leak into
@@ -188,7 +194,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mech, "XOAUTH2");
-        assert_eq!(ir, b64);
+        assert_eq!(*ir, b64);
         // The trailing CRLF after the literal must have been consumed → the next
         // line read is the real command, not an empty line.
         let next = crate::wire::line::read_line(&mut server_side, IDLE)

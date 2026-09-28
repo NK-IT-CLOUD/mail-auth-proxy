@@ -11,6 +11,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
+use zeroize::Zeroizing;
 
 /// The SMTP backend login of one client session.
 pub(super) struct SmtpLogin<'a> {
@@ -221,7 +222,8 @@ impl SmtpLogin<'_> {
                 "backend refused AUTH {mech} before the credential: {code}"
             ));
         }
-        be.write_all(format!("{response}\r\n").as_bytes()).await?;
+        be.write_all(Zeroizing::new([&response, "\r\n"].concat()).as_bytes())
+            .await?;
         let (mut code, _) = read_smtp_reply(&mut be, self.tuning.idle).await?;
         if code == 334 && mech == "XOAUTH2" {
             // XOAUTH2 error challenge (`334 <base64 JSON>`): the client

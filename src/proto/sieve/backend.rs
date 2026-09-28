@@ -13,6 +13,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::Instant;
 use tokio_rustls::client::TlsStream;
+use zeroize::Zeroizing;
 
 /// The backend's post-STARTTLS capabilities (SIEVE extensions, limits, …),
 /// relayed to clients before they authenticate.
@@ -98,16 +99,17 @@ impl BackendLogin for SieveLogin<'_> {
     type Conn = (TlsStream<TcpStream>, String);
 
     async fn login(&self, credential: BackendCredential<'_>) -> Result<Self::Conn, BackendError> {
-        let auth_line = match credential {
-            BackendCredential::Token { identity, token } => format!(
-                "AUTHENTICATE \"XOAUTH2\" \"{}\"\r\n",
-                crate::auth::sasl::build_xoauth2(identity, token)
-            ),
-            BackendCredential::Password { user, pass } => format!(
-                "AUTHENTICATE \"PLAIN\" \"{}\"\r\n",
-                crate::auth::sasl::build_plain(user, pass)
-            ),
+        let (mech, response) = match credential {
+            BackendCredential::Token { identity, token } => {
+                ("XOAUTH2", crate::auth::sasl::build_xoauth2(identity, token))
+            }
+            BackendCredential::Password { user, pass } => {
+                ("PLAIN", crate::auth::sasl::build_plain(user, pass))
+            }
         };
+        // `concat` sizes the line once; it is zeroized on drop like the response.
+        let auth_line =
+            Zeroizing::new(["AUTHENTICATE \"", mech, "\" \"", &response, "\"\r\n"].concat());
         let (mut be, _caps) = backend_session(self.backend, Some(self.origin), self.tuning).await?;
         be.write_all(auth_line.as_bytes()).await?;
         // The backend's reply; it is forwarded verbatim on OK.
