@@ -917,6 +917,24 @@ fn public_rules_need_public_true() {
     assert!(!ok && out.contains("legacy.doveadm_key_file"), "{out}");
 }
 
+/// An empty list-file path is one problem ("is empty"), not also a failed read.
+#[test]
+fn empty_list_file_path_is_reported_once() {
+    let pki = Pki::new();
+    let (ok, out) = check_config(
+        &pki,
+        "[legacy]\ndomains_file = \"\"\n[[legacy.rules]]\nname = \"internal\"\nnetworks = [\"10.0.0.0/8\"]\nusers_file = \"\"\n",
+    );
+    assert!(!ok, "{out}");
+    assert!(out.contains("legacy.domains_file is empty"), "{out}");
+    assert!(
+        out.contains("legacy.rules[internal].users_file is empty"),
+        "{out}"
+    );
+    assert_eq!(out.matches("domains_file").count(), 1, "{out}");
+    assert_eq!(out.matches("users_file").count(), 1, "{out}");
+}
+
 /// `[password_gate]` stays the short form of one rule and combines with
 /// `[legacy]` settings: here the domain gate applies to it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

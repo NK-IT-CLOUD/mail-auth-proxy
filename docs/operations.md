@@ -60,7 +60,7 @@ When a `protocol` record is written:
   - `shutting down: listeners closed, waiting for open sessions drain_secs=10`, then `all sessions ended; exiting` or `WARN sessions still open after the drain time; closing them`
   - `metrics endpoint up`
 - `WARN`:
-  - `config: …` at startup and with `--check-config`, one line per warning: `token_type = "any"`; `require_email_verified` with an `identity_claim` other than `email`; a `/0` network in `[password_gate]`; `[password_gate]` disabled but `sni` set; a legacy rule that accepts every user from public networks; `[legacy]` settings without any rule; `failure_delay_ms = 0`; `metrics.listen` not on loopback.
+  - `config: …` at startup and with `--check-config`, one line per warning: `token_type = "any"`; `require_email_verified` with an `identity_claim` other than `email`; a public network in `[password_gate]` (one line each); `[password_gate]` disabled but `sni` set; a legacy rule that accepts every user from public networks; `[legacy]` settings without any rule; `failure_delay_ms = 0`; `metrics.listen` not on loopback.
   - `fetching JWKS …`, `parsing JWKS …`, `JWKS has no usable signing keys`, `JWKS refresh failed; keeping previous keys`, `JWKS refresh for unknown kid` (the refresh an unknown `kid` triggered failed)
   - `loading system CA certificates`
   - `metrics accept error`

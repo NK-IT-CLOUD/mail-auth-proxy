@@ -211,6 +211,10 @@ pub fn file_problems(cfg: &config::Config) -> Vec<String> {
             )
         }));
     for (name, path, check) in lists {
+        // An empty path is a configuration error, reported by validation.
+        if path.is_empty() {
+            continue;
+        }
         let r = std::fs::read_to_string(path)
             .map_err(anyhow::Error::from)
             .and_then(|t| crate::auth::legacy::parse_list(&t, check));

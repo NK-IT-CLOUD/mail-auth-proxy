@@ -151,7 +151,7 @@ Bearer tokens are validated locally as signed JWTs (JWS compact serialisation) a
 | Keys bound to the issuer that published them | MUST | RFC 8725 §3.8 | Yes | A key is valid only for its own issuer's `iss` |
 | `iss` a single string that matches exactly | | RFC 7519 §4.1.1, RFC 9068 §4 | Partial | An array-valued `iss` containing the issuer is accepted. D-JWT-2. |
 | `aud` required and must contain a configured audience | MUST | RFC 8725 §3.9, RFC 9068 §4 | Yes | |
-| `exp` required; `nbf` checked when present; small leeway | MUST / MAY | RFC 7519 §4.1.4-4.1.5, RFC 9068 §4 | Yes | Leeway 60 s by default |
+| `exp` required; `nbf` checked when present; small leeway | MUST / MAY | RFC 7519 §4.1.4-4.1.5, RFC 9068 §4 | Yes | Leeway 60 s by default, at most 300 s |
 | `crit` header understood and processed | MUST | RFC 7515 §4.1.11 | No | Ignored. D-JWT-1. |
 | `jku`, `x5u`, `jwk` headers not followed | SHOULD | RFC 8725 §3.10 | Yes | |
 | Explicit typing `typ` = `at+jwt` / `application/at+jwt` | MUST | RFC 9068 §4, RFC 8725 §3.11 | Yes (`token_type = "rfc9068"`) | Other modes: an IdP-specific `typ` claim, or no check (warned) |
@@ -174,7 +174,7 @@ Bearer tokens are validated locally as signed JWTs (JWS compact serialisation) a
 | SMTP client: no initial response if the AUTH line would exceed the command-line limit | MUST | RFC 4954 §4, RFC 5321 §4.5.3.1.4 | Yes | The response is always sent after `334`. A reply 500-509 (syntax class) to the response is a rejection for a password and an outage for a token. |
 | IMAP client: initial response only if the backend advertises SASL-IR | MUST | RFC 4959 §3 | Deviation | Not checked. D-IMAP-4. |
 | XOAUTH2 error challenge answered with an empty response (IMAP and SMTP client) | | Google XOAUTH2 "Error response" | Yes | The following `NO` / `5xx` is a rejection |
-| EHLO domain is a resolvable FQDN or an address literal | MUST | RFC 5321 §2.3.5, §4.1.4 | Depends on configuration | The configured server name is used |
+| EHLO domain is a resolvable FQDN or an address literal | MUST | RFC 5321 §2.3.5, §4.1.4 | Depends on configuration | The configured server name is used. Its syntax is checked (D-SMTP-4); whether it resolves is not |
 
 ## 8. Metrics
 
@@ -268,11 +268,11 @@ XCLIENT carries the client address but not the client's EHLO name or port, so th
 
 ### D-SMTP-3: static EHLO list
 
-The extensions advertised after STARTTLS come from configuration, not from the backend. Clients do not send EHLO again after AUTH, so the list must match what the backend offers (RFC 5321 §4.2.4).
+The extensions advertised after STARTTLS come from configuration, not from the backend. Clients do not send EHLO again after AUTH, so the list must match what the backend offers (RFC 5321 §4.2.4). Each entry must be an `ehlo-line` (RFC 5321 §4.1.1.1) with a keyword that appears once; the proxy cannot check that the backend offers it.
 
 ### D-SMTP-4: server name
 
-The configured server name is used in greetings and in the backend EHLO. It must be a resolvable FQDN (RFC 5321 §4.1.4).
+The configured server name is used in greetings and in the backend EHLO. It must be a resolvable FQDN (RFC 5321 §4.1.4). The configuration accepts only the `Domain` syntax (RFC 5321 §4.1.2): address literals are refused because the proxy also sends the name in its EHLO reply, whose grammar (`ehlo-ok-rsp`, §4.1.1.1) takes a Domain only. The single-label default `mail-auth-proxy` passes the syntax check but is not an FQDN.
 
 ### D-SIEVE-1: SIEVE in the pre-TLS greeting
 

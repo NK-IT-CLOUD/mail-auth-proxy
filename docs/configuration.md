@@ -32,18 +32,25 @@ Warnings (settings that are allowed but weaken something) are logged as `config:
 The file is strict. Startup fails, and `--check-config` reports, when:
 
 - a key is unknown or misspelled, or `config_version = 2` is missing;
-- a required value is missing or empty, a listener is not `ip:port` or used twice, a
-  backend is not `host:port` or its certificate name is invalid;
+- a required value is missing or empty, a listener is not `ip:port`, a backend is not
+  `host:port` or its certificate name is invalid;
+- two listeners (the metrics endpoint included, when enabled) take the same port on the
+  same address, or one of them on a wildcard address that covers the other: `0.0.0.0`
+  covers every IPv4 address, `[::]` every address because Linux binds it dual-stack
+  (`net.ipv6.bindv6only = 0`), so `[::]:993` and `0.0.0.0:993` clash. Port 0 never
+  clashes;
+- `server.hostname` is not a host name (see the key below);
 - a JWKS URL or `doveadm_url` is not `https://` (plain `http://` is allowed only for
   `localhost`, `127.0.0.1` and `::1`), or `doveadm_url` contains `user:password@`;
 - a legacy rule has no `networks`, an empty list, a duplicate or invalid name, or public
   networks without `users`/`users_file` and without `public = true`;
 - `[password_gate]` is enabled without `sni` or networks, or combined with
   `[[legacy.rules]]`;
-- a limit, timeout, `refresh_secs`, `capability_cache_secs` or throttle value is 0, or
-  `failure_delay_ms` is above 10000;
-- `submission.backend.proxy_protocol` is set, or `submission.ehlo_extensions` contains
-  `AUTH` or `STARTTLS`;
+- a limit, timeout, `refresh_secs`, `capability_cache_secs` or throttle value is 0;
+  `leeway_secs` is above 300, `refresh_secs` above 86400, a timeout above 3600 or
+  `failure_delay_ms` above 10000;
+- `submission.backend.proxy_protocol` is set, or a `submission.ehlo_extensions` entry is
+  not an EHLO line, repeats a keyword or is `AUTH` or `STARTTLS`;
 - an issuer is listed twice, has no audience, or lists an unsupported algorithm;
 - `doveadm_*` keys are set without `account_check = "doveadm"`, or are missing with it.
 
@@ -81,14 +88,14 @@ backend `.…` keys below, written inline (`backend = { address = "…" }`) or a
 | Key | Type | Default | Effect |
 |---|---|---|---|
 | `config_version` | integer | required | must be `2`, set at the top before the first `[section]`; a file without it fails with `config_version is missing: the file must set config_version = 2 …` |
-| `server.hostname` | string | `mail-auth-proxy` | name in the IMAP/SMTP/Sieve greetings, EHLO replies and the backend EHLO; one word |
+| `server.hostname` | string | `mail-auth-proxy` | name in the IMAP/SMTP/Sieve greetings, EHLO replies and the backend EHLO. A host name as SMTP defines it (RFC 5321 §4.1.2): labels of letters, digits and hyphens separated by dots, 1-63 characters each without a hyphen at either end, at most 253 in all, no trailing dot. IP addresses and address literals (`[192.0.2.1]`) are refused, because the EHLO reply takes a domain only |
 | `tls.cert`, `tls.key` | path | required | PEM chain and key served for every SNI |
 | `imap.listen` | `ip:port` | required | implicit-TLS listener |
 | `imap.backend` | backend | required | implicit-TLS IMAP backend |
 | `submission.listen` | `ip:port` | section optional | STARTTLS listener; omit the section to disable SMTP |
 | `submission.backend` | backend | required in section | STARTTLS backend (Postfix); `proxy_protocol` is not supported here |
 | `submission.xclient` | bool | `false` | send XCLIENT if the backend advertises it. With `false`, a backend that advertises XCLIENT to the proxy is a misconfiguration: every login is an outage (454) until the key is set or the proxy is removed from `smtpd_authorized_xclient_hosts`, because the client could otherwise send its own XCLIENT after login |
-| `submission.ehlo_extensions` | array | Postfix defaults | advertised after STARTTLS besides AUTH (not `AUTH`/`STARTTLS`); default `PIPELINING`, `ENHANCEDSTATUSCODES`, `8BITMIME`, `DSN`, `SMTPUTF8`, `CHUNKING`. The client keeps this list for the whole session, so it must match what the backend offers. |
+| `submission.ehlo_extensions` | array | Postfix defaults | advertised after STARTTLS besides AUTH (not `AUTH`/`STARTTLS`, in any case). Each entry is an EHLO line (RFC 5321 §4.1.1.1): a keyword of letters, digits and hyphens that does not start with a hyphen, then optional parameters of printable ASCII, all separated by single spaces; each keyword once (case-insensitive); default `PIPELINING`, `ENHANCEDSTATUSCODES`, `8BITMIME`, `DSN`, `SMTPUTF8`, `CHUNKING`. The client keeps this list for the whole session, so it must match what the backend offers. |
 | `sieve.listen` | `ip:port` | section optional | STARTTLS listener; omit the section to disable ManageSieve |
 | `sieve.backend` | backend | required in section | STARTTLS ManageSieve backend |
 | `sieve.capability_cache_secs` | integer | 600 | reuse of the backend capability list; ≥ 1 |
@@ -96,8 +103,8 @@ backend `.…` keys below, written inline (`backend = { address = "…" }`) or a
 | backend `.verify_name` | string | host of `address` | name verified on the backend certificate |
 | backend `.ca_file` | path | system store | PEM CAs the backend certificate must chain to; replaces the system store for this backend |
 | backend `.proxy_protocol` | bool | `false` | PROXY v2 header with the client address (IMAP, Sieve) |
-| `oauth.refresh_secs` | integer | 300 | periodic JWKS refresh; ≥ 1 |
-| `oauth.leeway_secs` | integer | 60 | clock skew on `exp`/`nbf` |
+| `oauth.refresh_secs` | integer | 300 | periodic JWKS refresh; 1-86400. Unknown key ids trigger a refresh sooner, but a key removed from the JWKS is dropped only by this one |
+| `oauth.leeway_secs` | integer | 60 | clock skew on `exp`/`nbf`; 0-300 (RFC 7519 §4.1.4 allows a small leeway, "usually no more than a few minutes") |
 | `oauth.issuers[].issuer` | string | required | exact `iss`; keys from this issuer's JWKS are accepted only with it |
 | `oauth.issuers[].jwks_url` | URL | required | https (http only for localhost) |
 | `oauth.issuers[].audiences` | array | required | the token's `aud` must contain one |
@@ -127,15 +134,15 @@ backend `.…` keys below, written inline (`backend = { address = "…" }`) or a
 | `legacy.failure_delay_ms` | integer | 2000 | minimum time from credential to a failed legacy reply (refusals also follow the median backend-rejection latency; jitter added); ≤ 10000, 0 gives a warning |
 | `password_gate.enabled` | bool | `false` | short form: one rule `password_gate` |
 | `password_gate.sni` | array | required when enabled | the rule's `sni` |
-| `password_gate.internal_networks` | array of CIDR | required when enabled | the rule's `networks` (with `public = true` if one is public), and the scope label when `[scope]` is absent, even with the gate off; `0.0.0.0/0` gives a warning; not combinable with `[[legacy.rules]]` |
+| `password_gate.internal_networks` | array of CIDR | required when enabled | the rule's `networks` (with `public = true` if one is public), and the scope label when `[scope]` is absent, even with the gate off; every public network gives the same warning as a rule with `public = true`; not combinable with `[[legacy.rules]]` |
 | `limits.max_connections` | integer | 2048 | global cap, at most half unauthenticated; ≥ 1 |
 | `limits.max_preauth_per_ip` | integer | 32 | unauthenticated connections per IP; ≥ 1. IPv4 (also IPv4-mapped) counts per address, IPv6 per /64 (one host usually holds a whole /64) |
 | `limits.max_preauth_commands` | integer | 8 | commands before authentication; ≥ 1 |
-| `timeouts.preauth_secs` | integer | 60 | accept to credential, in total; ≥ 1 |
-| `timeouts.idle_secs` | integer | 30 | silence on any single read; ≥ 1 |
-| `timeouts.connect_secs` | integer | 10 | backend connect, TLS handshake, PROXY header; ≥ 1 |
+| `timeouts.preauth_secs` | integer | 60 | accept to credential, in total; 1-3600 |
+| `timeouts.idle_secs` | integer | 30 | silence on any single read; 1-3600 |
+| `timeouts.connect_secs` | integer | 10 | backend connect, TLS handshake, PROXY header; 1-3600 |
 | `metrics.enabled` | bool | `false`; `true` if only `listen` is set | serve the Prometheus endpoint |
-| `metrics.listen` | `ip:port` | required when enabled | Prometheus endpoint, no authentication (warning if not loopback) |
+| `metrics.listen` | `ip:port` | required when enabled | Prometheus endpoint, no authentication (warning if not loopback); must not clash with a mail listener |
 
 Environment: `RUST_LOG` (log filter, default `info`; see [operations.md](operations.md#logging)).
 

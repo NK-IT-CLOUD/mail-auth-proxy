@@ -2,6 +2,24 @@
 //! the short forms into what the rest of the program reads.
 
 use super::{AccountCheck, Config, Legacy, Rule, TokenType, PASSWORD_GATE_RULE};
+use std::net::{IpAddr, SocketAddr};
+
+/// Upper bound of `oauth.leeway_secs`. The leeway is added to `exp` and
+/// subtracted from `nbf` of every token; RFC 7519 sections 4.1.4 and 4.1.5
+/// allow "some small leeway, usually no more than a few minutes". A larger
+/// value keeps expired tokens valid.
+const MAX_LEEWAY_SECS: u64 = 300;
+
+/// Upper bound of `oauth.refresh_secs`. Unknown key ids trigger a refresh on
+/// their own, but a key the issuer removes (rotated out or compromised) is
+/// dropped only by the periodic refresh: a day at most.
+const MAX_REFRESH_SECS: u64 = 86_400;
+
+/// Upper bound of each `timeouts` value. All three bound the phase before
+/// authentication, where an hour is already far more than a client or
+/// backend needs; larger values let idle connections hold the pre-auth
+/// slots, and past 2^63 seconds the deadline overflows the clock.
+const MAX_TIMEOUT_SECS: u64 = 3600;
 
 impl Config {
     /// Every check serde cannot express. Collects all problems instead of
@@ -9,9 +27,8 @@ impl Config {
     pub(super) fn check(&self, errors: &mut Vec<String>, warnings: &mut Vec<String>) {
         let mut err = |m: String| errors.push(m);
 
-        let h = &self.server.hostname;
-        if h.is_empty() || h.chars().any(|c| c.is_whitespace() || c.is_control()) {
-            err("server.hostname must be one word without spaces or control characters".into());
+        if let Err(e) = check_hostname(&self.server.hostname) {
+            err(format!("server.hostname = {:?} {e}", self.server.hostname));
         }
         if self.tls.cert.is_empty() || self.tls.key.is_empty() {
             err("tls.cert and tls.key are required".into());
@@ -25,16 +42,17 @@ impl Config {
             if s.backend.proxy_protocol {
                 err("submission.backend.proxy_protocol is not supported (Postfix gets the client address via xclient)".into());
             }
+            let mut keywords: Vec<&str> = Vec::new();
             for x in &s.ehlo_extensions {
-                let bad = x.is_empty()
-                    || x.chars().any(|c| c.is_control())
-                    || ["AUTH", "STARTTLS"].iter().any(|v| {
-                        x.split(' ')
-                            .next()
-                            .is_some_and(|w| w.eq_ignore_ascii_case(v))
-                    });
-                if bad {
-                    err(format!("submission.ehlo_extensions: {x:?} is not allowed (AUTH and STARTTLS are set by the proxy)"));
+                match ehlo_keyword(x) {
+                    None => err(format!("submission.ehlo_extensions: {x:?} is not an EHLO line (a keyword of letters, digits and hyphens, then parameters, separated by single spaces; RFC 5321 section 4.1.1.1)")),
+                    Some(k) if ["AUTH", "STARTTLS"].iter().any(|v| k.eq_ignore_ascii_case(v)) => {
+                        err(format!("submission.ehlo_extensions: {x:?} is not allowed (AUTH and STARTTLS are set by the proxy)"));
+                    }
+                    Some(k) if keywords.iter().any(|o| o.eq_ignore_ascii_case(k)) => {
+                        err(format!("submission.ehlo_extensions: {k:?} is listed twice"));
+                    }
+                    Some(k) => keywords.push(k),
                 }
             }
         }
@@ -50,26 +68,43 @@ impl Config {
                 err(format!("{name} = {l:?} must be ip:port"));
             }
         }
-        for (i, (a, la)) in listens.iter().enumerate() {
-            if listens[..i].iter().any(|(_, lb)| lb == la) {
-                err(format!("{a} = {la:?} is used twice"));
+        // The metrics endpoint binds in the same process: include it. Its own
+        // `ip:port` check is below.
+        let mut bound = listens.clone();
+        if let (Some(m), true) = (&self.metrics.listen, self.metrics.is_enabled()) {
+            bound.push(("metrics.listen", m));
+        }
+        for (i, (a, la)) in bound.iter().enumerate() {
+            let clash = bound[..i].iter().find(|(_, lb)| {
+                lb == la
+                    || matches!((la.parse(), lb.parse()), (Ok(x), Ok(y)) if listens_clash(x, y))
+            });
+            match clash {
+                Some((_, lb)) if lb == la => err(format!("{a} = {la:?} is used twice")),
+                Some((b, lb)) => err(format!(
+                    "{a} = {la:?} clashes with {b} = {lb:?}: a wildcard address takes the port on every address of its family, [::] on IPv4 too"
+                )),
+                None => {}
             }
         }
         for (name, b) in &backends {
-            if !b
+            let address_ok = b
                 .address
                 .rsplit_once(':')
-                .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok())
-            {
+                .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok());
+            if !address_ok {
                 err(format!(
                     "{name}.address = {:?} must be host:port",
                     b.address
                 ));
             }
-            let vname = b
-                .verify_name
-                .clone()
-                .unwrap_or_else(|| crate::wire::connect::host_of(&b.address).to_string());
+            // Without verify_name the name comes from the address; a bad
+            // address is reported once, above.
+            let vname = match &b.verify_name {
+                Some(n) => n.clone(),
+                None if address_ok => crate::wire::connect::host_of(&b.address).to_string(),
+                None => continue,
+            };
             if rustls::pki_types::ServerName::try_from(vname.clone()).is_err() {
                 err(format!("{name}: {vname:?} is not a valid certificate name"));
             }
@@ -80,6 +115,15 @@ impl Config {
         }
         if self.oauth.refresh_secs == 0 {
             err("oauth.refresh_secs must be at least 1".into());
+        } else if self.oauth.refresh_secs > MAX_REFRESH_SECS {
+            err(format!(
+                "oauth.refresh_secs must be at most {MAX_REFRESH_SECS} (a key removed from the JWKS stays trusted until the next refresh)"
+            ));
+        }
+        if self.oauth.leeway_secs > MAX_LEEWAY_SECS {
+            err(format!(
+                "oauth.leeway_secs must be at most {MAX_LEEWAY_SECS} (it extends every token past exp; RFC 7519 section 4.1.4)"
+            ));
         }
         for (i, iss) in self.oauth.issuers.iter().enumerate() {
             let at = format!("oauth.issuers[{i}]");
@@ -135,9 +179,16 @@ impl Config {
                     err("password_gate.internal_networks must list the networks allowed to use passwords".into());
                 }
                 match crate::auth::policy::parse_internal_nets(&g.internal_networks) {
+                    // The rule this becomes has `public = true` (see
+                    // `normalize`): the same warning as a written rule.
                     Ok(nets) => {
-                        for n in nets.iter().filter(|n| n.prefix_len() == 0) {
-                            warnings.push(format!("password_gate.internal_networks contains {n}: passwords are accepted from anywhere"));
+                        for n in nets.iter().filter(|n| !is_private_net(n)) {
+                            let anywhere = if n.prefix_len() == 0 {
+                                " (from anywhere)"
+                            } else {
+                                ""
+                            };
+                            warnings.push(format!("password_gate accepts passwords of every user from the public network {n}{anywhere}"));
                         }
                     }
                     Err(e) => err(format!("password_gate.internal_networks: {e:#}")),
@@ -173,6 +224,17 @@ impl Config {
         let t = &self.timeouts;
         if t.preauth_secs == 0 || t.idle_secs == 0 || t.connect_secs == 0 {
             err("timeouts must be at least 1 second".into());
+        }
+        for (name, secs) in [
+            ("preauth_secs", t.preauth_secs),
+            ("idle_secs", t.idle_secs),
+            ("connect_secs", t.connect_secs),
+        ] {
+            if secs > MAX_TIMEOUT_SECS {
+                err(format!(
+                    "timeouts.{name} must be at most {MAX_TIMEOUT_SECS} seconds"
+                ));
+            }
         }
         match (&self.metrics.listen, self.metrics.is_enabled()) {
             (None, true) => err("metrics.listen is required when metrics.enabled = true".into()),
@@ -224,6 +286,54 @@ fn is_plain_name(s: &str) -> bool {
         && s.len() <= 64
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+
+/// `server.hostname` goes unchanged into the SMTP greeting and EHLO reply,
+/// the proxy's EHLO to the backend, the IMAP greeting and the ManageSieve
+/// IMPLEMENTATION string. It must be a `Domain` of RFC 5321 section 4.1.2:
+/// dot-separated labels of letters, digits and hyphens, no hyphen at either
+/// end of a label, 1-63 characters each and 253 in all (RFC 1035 section
+/// 2.3.4). An address literal (`[192.0.2.1]`) is not accepted: the EHLO
+/// reply (`ehlo-ok-rsp`) takes a Domain only.
+fn check_hostname(h: &str) -> Result<(), String> {
+    if h.starts_with('[') || h.parse::<IpAddr>().is_ok() {
+        return Err("must be a host name; IP addresses and address literals are not allowed (the SMTP EHLO reply takes a domain only, RFC 5321 section 4.1.1.1)".into());
+    }
+    let label_ok = |l: &str| {
+        (1..=63).contains(&l.len())
+            && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+    };
+    if h.len() > 253 || !h.split('.').all(label_ok) {
+        return Err("must be a host name: labels of 1-63 letters, digits and inner hyphens, separated by dots, at most 253 characters (RFC 5321 section 4.1.2)".into());
+    }
+    Ok(())
+}
+
+/// The keyword of `line` if it is an `ehlo-line` of RFC 5321 section
+/// 4.1.1.1: `ehlo-keyword *( SP ehlo-param )`, the keyword
+/// `(ALPHA / DIGIT) *(ALPHA / DIGIT / "-")`, each parameter one or more
+/// printable ASCII characters except space.
+fn ehlo_keyword(line: &str) -> Option<&str> {
+    let mut words = line.split(' ');
+    let keyword = words.next()?;
+    let keyword_ok = keyword.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && keyword
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-');
+    let params_ok = words.all(|p| !p.is_empty() && p.bytes().all(|b| (b'!'..=b'~').contains(&b)));
+    (keyword_ok && params_ok).then_some(keyword)
+}
+
+/// Two listeners that cannot both bind: the same port and the same address,
+/// or one is a wildcard that covers the other. `[::]` covers IPv4 too,
+/// because Linux binds it dual-stack by default (`net.ipv6.bindv6only = 0`).
+/// Port 0 asks the kernel for a free port and never clashes.
+fn listens_clash(a: SocketAddr, b: SocketAddr) -> bool {
+    let (x, y) = (a.ip().to_canonical(), b.ip().to_canonical());
+    let covers = |w: IpAddr, o: IpAddr| w.is_unspecified() && (w.is_ipv6() || o.is_ipv4());
+    a.port() != 0 && a.port() == b.port() && (x == y || covers(x, y) || covers(y, x))
 }
 
 /// A login or pattern as the rules and files accept it: `user@domain`,
@@ -642,6 +752,208 @@ mod tests {
         .unwrap()
         .warnings;
         assert!(w.iter().any(|w| w.contains("has no rules")), "{w:?}");
+    }
+
+    /// Errors of a whole configuration text, joined.
+    fn errors_of(text: &str) -> String {
+        crate::config::parse(text)
+            .map(|l| l.errors.join("\n"))
+            .unwrap_or_else(|e| format!("parse: {e}"))
+    }
+
+    /// The shipped example is valid and gives no warning.
+    #[test]
+    fn example_config_is_clean() {
+        let l = crate::config::parse(include_str!("../../examples/config.example.toml")).unwrap();
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+    }
+
+    /// The short form warns like the rule it becomes (`public = true`
+    /// without users): once per public network, none for private ones.
+    #[test]
+    fn password_gate_warns_for_public_networks() {
+        let warnings = |nets: &str| {
+            crate::config::parse(&format!(
+                "{V2}[password_gate]\nenabled = true\nsni = [\"mail.example.org\"]\ninternal_networks = [{nets}]\n"
+            ))
+            .unwrap()
+            .warnings
+        };
+        let w = warnings(r#""10.0.0.0/8", "198.51.100.0/24", "2001:db8::/32""#);
+        assert_eq!(w.len(), 2, "{w:?}");
+        for (w, net) in w.iter().zip(["198.51.100.0/24", "2001:db8::/32"]) {
+            assert!(w.contains("every user") && w.contains(net), "{w}");
+        }
+        let w = warnings(r#""0.0.0.0/0""#);
+        assert!(
+            w.len() == 1 && w[0].contains("every user") && w[0].contains("from anywhere"),
+            "{w:?}"
+        );
+        assert!(warnings(r#""10.0.0.0/8", "fd00::/8", "127.0.0.1/32""#).is_empty());
+    }
+
+    /// Leeway, JWKS refresh and timeouts have upper bounds; the bounds
+    /// themselves are allowed.
+    #[test]
+    fn time_values_are_bounded() {
+        let oauth = |kv: &str| errors_of(&V2.replace("[oauth]\n", &format!("[oauth]\n{kv}\n")));
+        assert!(oauth("leeway_secs = 300").is_empty());
+        assert!(oauth("leeway_secs = 0").is_empty());
+        for v in ["301", "4000000000"] {
+            let e = oauth(&format!("leeway_secs = {v}"));
+            assert!(e.contains("leeway_secs must be at most 300"), "{v}: {e}");
+        }
+        assert!(oauth("refresh_secs = 86400").is_empty());
+        let e = oauth("refresh_secs = 86401");
+        assert!(e.contains("refresh_secs must be at most 86400"), "{e}");
+        for key in ["preauth_secs", "idle_secs", "connect_secs"] {
+            assert!(errors_with(&format!("[timeouts]\n{key} = 3600\n")).is_empty());
+            for v in ["3601", "9223372036854775807"] {
+                let e = errors_with(&format!("[timeouts]\n{key} = {v}\n"));
+                assert!(
+                    e.contains(&format!("timeouts.{key} must be at most 3600 seconds")),
+                    "{key} = {v}: {e}"
+                );
+            }
+        }
+    }
+
+    /// `server.hostname` is an RFC 5321 Domain; IP addresses and address
+    /// literals are refused.
+    #[test]
+    fn hostname_is_a_domain() {
+        let with = |h: &str| errors_with(&format!("[server]\nhostname = {h:?}\n"));
+        let long_label = "a".repeat(63);
+        let long_name = format!("{0}.{0}.{0}.{1}", long_label, "a".repeat(61));
+        assert_eq!(long_name.len(), 253);
+        for ok in [
+            "mail-auth-proxy",
+            "mail.example.org",
+            "MX1.Example.ORG",
+            "xn--bcher-kva.example",
+            "0mail.example.org",
+            long_label.as_str(),
+            long_name.as_str(),
+        ] {
+            assert!(with(ok).is_empty(), "{ok}: {}", with(ok));
+        }
+        let too_long = format!("a{long_name}");
+        for bad in [
+            "",
+            "mail example",
+            "-mail.example.org",
+            "mail-.example.org",
+            "mail..example.org",
+            "mail.example.org.",
+            ".example.org",
+            "mail_1.example.org",
+            "mäil.example.org",
+            "mail\"x",
+            "192.0.2.1",
+            "2001:db8::1",
+            "[192.0.2.1]",
+            "[IPv6:2001:db8::1]",
+            &format!("{long_label}a.example"),
+            too_long.as_str(),
+        ] {
+            assert!(with(bad).contains("server.hostname"), "{bad:?} accepted");
+        }
+        assert!(with("192.0.2.1").contains("address literals are not allowed"));
+    }
+
+    /// Each extension is an `ehlo-line`; keywords are unique and never AUTH
+    /// or STARTTLS, in any case.
+    #[test]
+    fn ehlo_extensions_are_ehlo_lines() {
+        let with = |list: &str| {
+            errors_with(&format!(
+                "[submission]\nlisten = \"0.0.0.0:587\"\nbackend = {{ address = \"192.0.2.10:587\", verify_name = \"mail.example.org\" }}\nehlo_extensions = [{list}]\n"
+            ))
+        };
+        assert!(with(r#""SIZE 10240000", "8BITMIME", "X-EXT a=b c", "DSN", "7X""#).is_empty());
+        for bad in [
+            r#""""#,
+            r#"" ""#,
+            r#"" AUTH""#,
+            r#""SIZE ""#,
+            r#""SIZE  1000""#,
+            r#""SIZE\t1000""#,
+            r#""-X""#,
+            r#""X_Y""#,
+            r#""AUTH=PLAIN""#,
+            r#""SIZE 100ä""#,
+        ] {
+            assert!(
+                with(bad).contains("is not an EHLO line"),
+                "{bad}: {}",
+                with(bad)
+            );
+        }
+        for bad in [r#""auth PLAIN""#, r#""StartTLS""#] {
+            assert!(with(bad).contains("is not allowed"), "{bad}");
+        }
+        let e = with(r#""SIZE 1000", "PIPELINING", "size 2000""#);
+        assert!(e.contains("\"size\" is listed twice"), "{e}");
+    }
+
+    /// Listeners are compared as socket addresses, the metrics endpoint
+    /// included: the same port on a covering wildcard clashes.
+    #[test]
+    fn listeners_clash_by_address() {
+        // V2 listens on 0.0.0.0:993.
+        let sieve = |listen: &str| {
+            format!("[sieve]\nlisten = {listen:?}\nbackend = {{ address = \"192.0.2.10:4190\", verify_name = \"mail.example.org\" }}\n")
+        };
+        for l in [
+            "[::]:993",
+            "192.0.2.1:993",
+            "[::ffff:192.0.2.1]:993",
+            "0.0.0.0:993",
+        ] {
+            let e = errors_with(&sieve(l));
+            assert!(e.contains("sieve.listen"), "{l}: {e}");
+        }
+        for l in [
+            "[::]:4190",
+            "[::1]:993",
+            "[2001:db8::1]:993",
+            "0.0.0.0:4190",
+        ] {
+            assert!(errors_with(&sieve(l)).is_empty(), "{l}");
+        }
+        let v6 = V2.replace("0.0.0.0:993", "[::]:993");
+        assert!(errors_of(&format!("{v6}{}", sieve("127.0.0.1:993")))
+            .contains("clashes with imap.listen"));
+        assert!(errors_of(&format!("{v6}{}", sieve("[::1]:993"))).contains("clashes"));
+        // Port 0: a free port each.
+        let any = V2.replace("0.0.0.0:993", "127.0.0.1:0");
+        assert!(errors_of(&format!("{any}{}", sieve("0.0.0.0:0"))).is_empty());
+        let e = errors_with("[metrics]\nlisten = \"127.0.0.1:993\"\n");
+        assert!(
+            e.contains("metrics.listen = \"127.0.0.1:993\" clashes"),
+            "{e}"
+        );
+        assert!(errors_with("[metrics]\nenabled = false\nlisten = \"127.0.0.1:993\"\n").is_empty());
+    }
+
+    /// A bad backend address is one error; the certificate name derived from
+    /// it is not checked on top. An explicit `verify_name` still is.
+    #[test]
+    fn bad_backend_address_is_reported_once() {
+        let sieve = |backend: &str| {
+            errors_with(&format!(
+                "[sieve]\nlisten = \"0.0.0.0:4190\"\nbackend = {backend}\n"
+            ))
+        };
+        let e = sieve(r#"{ address = ":4190" }"#);
+        assert!(e.contains("must be host:port"), "{e}");
+        assert!(!e.contains("certificate name"), "{e}");
+        let e = sieve(r#"{ address = ":4190", verify_name = "bad name" }"#);
+        assert!(
+            e.contains("must be host:port") && e.contains("certificate name"),
+            "{e}"
+        );
     }
 
     /// A disabled gate still validates its networks (they label the scope).

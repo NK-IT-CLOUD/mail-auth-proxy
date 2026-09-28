@@ -30,6 +30,32 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `/metrics`. At most 4 scrapes are served at a time (more connections are closed
   at accept), and the 10 s deadline now covers the whole request head instead of a
   single read.
+- Configurations that were accepted before and are now rejected:
+  - `oauth.leeway_secs` above 300, `oauth.refresh_secs` above 86400 (a key removed
+    from the JWKS stays trusted until the next refresh), or a `timeouts` value above
+    3600 (larger values hold pre-authentication slots, and past 2^63 s the deadline
+    overflows the clock);
+  - `server.hostname` that is not an RFC 5321 host name: underscores, non-ASCII,
+    empty labels, a trailing dot, a hyphen at either end of a label, labels over 63 or
+    names over 253 characters, IP addresses and address literals;
+  - `submission.ehlo_extensions` entries that are not an RFC 5321 `ehlo-line` (empty,
+    leading, trailing or double spaces, a keyword with other characters than letters,
+    digits and hyphens) or repeat a keyword;
+  - listeners that take the same port on overlapping addresses: `[::]:993` with
+    `0.0.0.0:993`, a wildcard with a concrete address of its family, and the metrics
+    endpoint on a mail listener's port.
+- `--check-config` reports an empty `users_file` or `domains_file` and a backend
+  `address` without host once, without a follow-up file or certificate-name error.
+
+### Security
+- `oauth.leeway_secs` had no upper bound, so a large value kept expired tokens valid.
+  It is now limited to 300 s (RFC 7519 §4.1.4: "usually no more than a few minutes").
+- `[password_gate]` with a public network in `internal_networks` accepts passwords of
+  every user from that network (the rule it stands for has `public = true`), but only
+  `0.0.0.0/0` gave a warning. Every public network now gives the same warning as a
+  written rule with `public = true`.
+- `submission.ehlo_extensions` entries with a leading space (`" AUTH"`) passed the
+  check for `AUTH` and `STARTTLS`. Entries must now be EHLO lines (see Changed).
 
 ## [0.1.1] - 2026-09-28
 
