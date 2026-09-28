@@ -86,6 +86,8 @@ accepts a password only where a rule allows it.
   and JWKS without dropping connections.
 - Connection caps, per-IP pre-auth cap, a pre-auth time budget and size limits on lines,
   literals, tokens and passwords.
+- Built-in blocking of source addresses after too many failed logins (tokens and passwords,
+  any account), on by default; outages never count.
 
 **Distribution**
 - One static `x86_64-unknown-linux-musl` binary; `.deb` (APT repository), `.rpm` and
@@ -220,6 +222,8 @@ authentication, so keep it on loopback or a management network.
 | `mail_auth_proxy_token_validate_total` | local JWT validations by result |
 | `mail_auth_proxy_connections_total` | connections admitted past the limits |
 | `mail_auth_proxy_connections_rejected_total` | connections closed at accept by a limit |
+| `mail_auth_proxy_ratelimit_blocks_total` | connections closed at accept because the source is blocked after failed logins |
+| `mail_auth_proxy_ratelimit_active_blocks` | sources blocked now |
 | `mail_auth_proxy_active_connections` | admitted connections currently open |
 | `mail_auth_proxy_backend_errors_total` | backend or account-check outages while a client waited |
 | `mail_auth_proxy_upstream_forward_total` | sessions spliced to a backend |
@@ -228,7 +232,8 @@ authentication, so keep it on loopback or a management network.
 | `mail_auth_proxy_tls_cert_expiry_timestamp_seconds` | expiry of the certificate in use |
 
 The complete list with labels, including `mail_auth_proxy_build_info`,
-`process_start_time_seconds`, the JWKS refresh failures and the legacy-gate counters, is in
+`process_start_time_seconds`, the JWKS refresh failures, the legacy-gate and the other
+rate-limit counters, is in
 [docs/operations.md](docs/operations.md#prometheus-metrics).
 
 </details>
@@ -255,7 +260,9 @@ The full index is [docs/README.md](docs/README.md).
 - IMAP `LOGIN` with literals and ManageSieve `LOGIN` are not supported.
 - The SMTP `EHLO` list is static (`submission.ehlo_extensions`); `SIZE` is not advertised by
   default.
-- Connections closed by a limit or timeout get no `421`/`BYE`.
+- Connections closed by a limit, a failed-login block or a timeout get no `421`/`BYE`.
+- The failed-login block counts per source address (IPv6 per /64): users behind one NAT or
+  webmail server share it unless that address is exempt.
 - Legacy rules trust the source address: the proxy must see real client addresses (no SNAT
   or load balancer in front). A rule with `sni` needs SNI, which clients connecting by IP
   address do not send.

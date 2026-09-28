@@ -20,7 +20,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// IPv4-mapped IPv6) as is, an IPv6 address by its /64. A single host is
 /// usually handed a whole /64 (RFC 7934, SLAAC), so counting per /128 would let
 /// one host open `max_preauth_per_ip` connections from each of 2^64 addresses.
-fn preauth_key(ip: IpAddr) -> IpAddr {
+pub(crate) fn preauth_key(ip: IpAddr) -> IpAddr {
     match ip.to_canonical() {
         IpAddr::V6(v6) => {
             let prefix = u128::from(v6) & !((1u128 << 64) - 1);

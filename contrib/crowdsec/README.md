@@ -14,6 +14,13 @@ and five scenarios that ban attacking source IPs with the CrowdSec engine and a 
 `internal` and `external` are the proxy's `scope` field: internal means the source is in
 `scope.internal_networks`. All five scenarios count external sources only.
 
+The proxy also blocks a source itself after too many failed logins (`[auth_ratelimit]`,
+on by default). The two work side by side: every refused credential still writes its
+`authresult` line, so the scenarios see the attempts up to the proxy's block, and a
+bouncer then keeps the source out for the length of the CrowdSec decision. The proxy's
+`ratelimit` line (a block started) is not an `authresult` line; the parser does not
+match it and it is not counted as a failed login.
+
 ## Install
 
 The package ships these files (not activated) under `/usr/share/doc/mail-auth-proxy/crowdsec/`;

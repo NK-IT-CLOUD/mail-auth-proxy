@@ -159,6 +159,41 @@ pub fn record_throttle_eviction() {
     THROTTLE_EVICTIONS.fetch_add(1, Ordering::Relaxed);
 }
 
+// ratelimit_blocks[proto]: connections closed at accept because their
+// source is blocked by the auth rate limit.
+static RATELIMIT_BLOCKS: [AtomicU64; N_PROTO] = [const { AtomicU64::new(0) }; N_PROTO];
+// Blocks started (a source reached the failure threshold).
+static RATELIMIT_BANS: AtomicU64 = AtomicU64::new(0);
+// Sources blocked right now, as of the last sweep or block.
+static RATELIMIT_ACTIVE: AtomicU64 = AtomicU64::new(0);
+// Sources dropped from the full rate-limit table while still counted.
+static RATELIMIT_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Record a connection closed at accept because its source is blocked.
+#[inline]
+pub fn record_ratelimit_block(proto: Proto) {
+    RATELIMIT_BLOCKS[proto.idx()].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a block that started; `active` is the number of blocked sources.
+#[inline]
+pub fn record_ratelimit_ban(active: u64) {
+    RATELIMIT_BANS.fetch_add(1, Ordering::Relaxed);
+    RATELIMIT_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+/// Set the number of blocked sources (after a sweep).
+#[inline]
+pub fn set_ratelimit_active(active: u64) {
+    RATELIMIT_ACTIVE.store(active, Ordering::Relaxed);
+}
+
+/// Record sources dropped from the full rate-limit table.
+#[inline]
+pub fn record_ratelimit_evictions(n: u64) {
+    RATELIMIT_EVICTIONS.fetch_add(n, Ordering::Relaxed);
+}
+
 /// Record a backend that failed (unreachable, TLS, protocol) during auth.
 #[inline]
 pub fn record_backend_error(proto: Proto) {
@@ -453,6 +488,33 @@ fn render() -> String {
     o.push_str(&format!(
         "mail_auth_proxy_legacy_throttle_evictions_total {}\n",
         THROTTLE_EVICTIONS.load(Ordering::Relaxed)
+    ));
+
+    o.push_str("# HELP mail_auth_proxy_ratelimit_blocks_total Connections closed at accept because the source is blocked after too many failed logins.\n");
+    o.push_str("# TYPE mail_auth_proxy_ratelimit_blocks_total counter\n");
+    for (p, plabel) in PROTO_LABELS.iter().enumerate() {
+        let v = RATELIMIT_BLOCKS[p].load(Ordering::Relaxed);
+        o.push_str(&format!(
+            "mail_auth_proxy_ratelimit_blocks_total{{proto=\"{plabel}\"}} {v}\n"
+        ));
+    }
+    o.push_str("# HELP mail_auth_proxy_ratelimit_bans_total Sources blocked after reaching the failed-login threshold.\n");
+    o.push_str("# TYPE mail_auth_proxy_ratelimit_bans_total counter\n");
+    o.push_str(&format!(
+        "mail_auth_proxy_ratelimit_bans_total {}\n",
+        RATELIMIT_BANS.load(Ordering::Relaxed)
+    ));
+    o.push_str("# HELP mail_auth_proxy_ratelimit_active_blocks Sources blocked now (updated every few seconds).\n");
+    o.push_str("# TYPE mail_auth_proxy_ratelimit_active_blocks gauge\n");
+    o.push_str(&format!(
+        "mail_auth_proxy_ratelimit_active_blocks {}\n",
+        RATELIMIT_ACTIVE.load(Ordering::Relaxed)
+    ));
+    o.push_str("# HELP mail_auth_proxy_ratelimit_evictions_total Sources dropped from the full rate-limit table while counted or blocked.\n");
+    o.push_str("# TYPE mail_auth_proxy_ratelimit_evictions_total counter\n");
+    o.push_str(&format!(
+        "mail_auth_proxy_ratelimit_evictions_total {}\n",
+        RATELIMIT_EVICTIONS.load(Ordering::Relaxed)
     ));
 
     o.push_str("# HELP mail_auth_proxy_active_connections Client connections currently open.\n");

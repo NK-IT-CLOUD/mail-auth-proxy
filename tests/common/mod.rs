@@ -1068,6 +1068,9 @@ pub struct Opts {
     /// TOML lines added to the harness issuer (`openid_configuration_url`,
     /// `scope`).
     pub issuer_extra: &'static str,
+    /// Keys of the `[auth_ratelimit]` section; `None`: the defaults (the
+    /// harness sources are loopback, which the defaults exempt).
+    pub ratelimit: Option<String>,
 }
 
 impl Default for Opts {
@@ -1082,6 +1085,7 @@ impl Default for Opts {
             notify_socket: None,
             smtp_xclient: true,
             issuer_extra: "",
+            ratelimit: None,
         }
     }
 }
@@ -1191,6 +1195,8 @@ idle_secs = {idle}
 connect_secs = 3
 
 {metrics}
+
+{ratelimit}
 "#,
             cert = pki.proxy_cert.display(),
             key = pki.proxy_key.display(),
@@ -1209,6 +1215,11 @@ connect_secs = 3
             } else {
                 format!("[metrics]\nenabled = false\nlisten = \"{METRICS_IP}:0\"")
             },
+            ratelimit = opts
+                .ratelimit
+                .as_ref()
+                .map(|r| format!("[auth_ratelimit]\n{r}"))
+                .unwrap_or_default(),
         );
         let path = pki.dir.path().join("config.toml");
         std::fs::write(&path, config).unwrap();

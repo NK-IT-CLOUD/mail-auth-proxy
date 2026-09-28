@@ -23,6 +23,14 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Issuer keys `openid_configuration_url` and `scope`: the IdP's discovery document and
   the scope a client needs, sent in the RFC 7628 error result for a rejected token so
   that clients without a preset IdP can find one. At most one issuer sets them.
+- `[auth_ratelimit]`: a source address (IPv4 address, IPv6 /64) with too many refused
+  credentials has its new connections closed at accept, before TLS, for a time that
+  doubles with every further block. Keys `enabled`, `failures` (20), `window_secs` (600),
+  `block_secs` (900), `max_block_secs` (86400), `exempt_internal` (false) and
+  `exempt_networks` (loopback). A block logs one `ratelimit` line on the `authlog`
+  target; metrics `mail_auth_proxy_ratelimit_blocks_total`, `…_bans_total`,
+  `…_active_blocks` and `…_evictions_total`. See
+  [architecture: failed-login rate limit](docs/architecture.md#failed-login-rate-limit).
 
 ### Changed
 - A token that fails validation (`bad_token`) is no longer refused at once, also
@@ -34,6 +42,14 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   same for every rejected token. The round trip counts against the pre-auth budget;
   the `authresult` line is unchanged. Clients or scripts that expect the failure reply
   right after `AUTHENTICATE`/`AUTH` must answer the challenge first.
+- Failed logins now block their source by default: after 20 distinct refused
+  credentials within 10 minutes (tokens or passwords, any account) the address is
+  closed at accept for 15 minutes, repeated blocks up to 24 hours. Only loopback is
+  exempt. Add webmail servers, NAT gateways and other addresses through which many
+  users log in to `auth_ratelimit.exempt_networks` (or set `exempt_internal = true`),
+  or set `enabled = false` to keep the previous behaviour. Backend outages and
+  connections without a credential do not count, and a rejected token counts once
+  despite its error-result round trip; the `authresult` line is unchanged.
 - `mail_auth_proxy_build_info` has a second label, `commit` (the value of
   `mail-auth-proxy --version`). Queries selecting on `version` keep working; recording
   rules or alerts that list the exact label set of the series need `commit` added.

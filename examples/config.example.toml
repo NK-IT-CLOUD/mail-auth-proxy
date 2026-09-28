@@ -129,3 +129,12 @@ connect_secs = 10                          # backend connect / TLS / PROXY heade
 [metrics]                                  # optional feature, off by default
 enabled = false
 # listen = "127.0.0.1:9102"                # required when enabled; no authentication
+
+[auth_ratelimit]                           # on by default
+enabled = true
+failures = 20                              # distinct failed logins of one source (IPv4, IPv6 /64) ...
+window_secs = 600                          # ... within this window start a block
+block_secs = 900                           # first block; each further one doubles ...
+max_block_secs = 86400                     # ... up to this
+exempt_internal = false                    # true: never block scope.internal_networks
+exempt_networks = ["127.0.0.0/8", "::1/128"]  # add a webmail server or NAT gateway here

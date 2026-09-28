@@ -14,7 +14,7 @@ The proxy terminates client TLS for three protocols and runs each protocol's dia
 
 ```
 client ──TLS──▶ mail-auth-proxy ─────────────────────────────TLS (verified)──▶ backend
-                 1. accept: connection limits
+                 1. accept: failed-login block of the source, connection limits
                  2. TLS handshake, SNI noted
                  3. greeting / capabilities: OAuth mechanisms always, PLAIN/LOGIN only
                     where a legacy rule matches source address, SNI and protocol
@@ -26,7 +26,7 @@ client ──TLS──▶ mail-auth-proxy ────────────�
                  7. relay the backend's verdict; on success relay bytes until either side closes
 ```
 
-Each connection is one tokio task. Connections share only the JWKS key set, the server certificate, the ManageSieve capability cache, the legacy gate's caches and counters, the connection limits and the metrics. Trust boundaries and the threat model are in [SECURITY.md](../SECURITY.md#trust-boundaries).
+Each connection is one tokio task. Connections share only the JWKS key set, the server certificate, the ManageSieve capability cache, the legacy gate's caches and counters, the connection limits, the failed-login counters and the metrics. Trust boundaries and the threat model are in [SECURITY.md](../SECURITY.md#trust-boundaries).
 
 ## Client TLS
 
@@ -213,6 +213,27 @@ Limits are checked at `accept()`, before TLS:
 
 - A connection over any limit is closed at once, with no protocol greeting, no `421` and no `BYE`. It is counted in `mail_auth_proxy_connections_rejected_total{proto}`.
 - The per-IP slot and the unauthenticated-share slot are released once the backend accepts the credential. An authenticated session counts only against `max_connections`, so many logged-in sessions from one IP (a webmail host, a NAT) do not exhaust the per-IP limit.
+
+## Failed-login rate limit
+
+`[auth_ratelimit]` blocks a source address that presents too many refused credentials. A session takes one credential, so a guesser opens a new connection for each attempt; the per-account throttle covers passwords only, and only per account. The rate limit also covers token guessing, scanners and password spraying over many accounts, without a log-based blocker.
+
+- **Source:** an IPv4 address (also IPv4-mapped), an IPv6 /64, as for `limits.max_preauth_per_ip`.
+- **Counted:** every refused credential, one per `authresult` line with `result="fail"` and a credential: `bad_token`, `authzid_mismatch`, `blocked_endpoint`, `unknown_domain`, `unknown_account`, `throttled`, `oversize`, `backend_reject`. All reasons count alike, so the attempt that starts a block tells nothing about the account; `throttled` counts for the same reason (it occurs only for accounts that exist).
+- **Not counted:** `protocol` (no credential: a TLS or certificate fault on the proxy's side would otherwise block every client), and every outage: an unavailable backend or account check, or token keys that could not be checked. Outages write no `authresult` line and never block anyone.
+- **Repeats:** a credential identical to one of the source's last 8 failures in the window (same user and same password or token) counts once. A client retrying a stale password or an expired token does not block its address, and repeating a guess gains nothing. The comparison uses a keyed 64-bit fingerprint; the secret is not kept.
+- **Successful logins** do not reset the count: one valid account must not clear the way for guesses at others.
+- **Block:** after `failures` counted failures within `window_secs` (a window starts with the first failure), new connections from the source are closed at accept for `block_secs`, on every listener. Each further block of the same source doubles, up to `max_block_secs`; the escalation is forgotten once the last block ended `max_block_secs` ago. Failures of connections opened before the block do not extend it.
+- **Exempt:** sources in `exempt_networks` (default: loopback), and with `exempt_internal = true` also sources in `scope.internal_networks`. They are not counted at all.
+- **Memory:** at most 65,536 sources. A full table first drops entries with nothing left to remember, then the least valuable 1,024 (unblocked before blocked, oldest first); they are counted in `mail_auth_proxy_ratelimit_evictions_total`. Entries are also swept every 10 s.
+
+A blocked connection is closed like one over a connection limit: before TLS, with no greeting, no `421`, no `554` and no `BYE`. RFC 5321 (section 3.1: `554` instead of the greeting) and RFC 9051 (section 7.1.5: `BYE` as the greeting) allow a server to turn a connection away with a reply, but on the implicit-TLS IMAP port that reply needs a full TLS handshake per blocked connection, and a distinct reply would tell a guesser that it was blocked and how fast it may go. A client behind a blocked address sees a connection failure, the same as with a firewall-based ban.
+
+The block does not change the reply timing of the credentials before it: a refusal is answered as late as before ([Refusal replies and timing](#refusal-replies-and-timing)), and the count is the same for every reason, so neither the block nor its timing tells whether an account exists.
+
+The block starts with one `ratelimit` log line ([operations: other log lines](operations.md#other-log-lines)); every closed connection counts in `mail_auth_proxy_ratelimit_blocks_total{proto}`, not in `connections_rejected_total`. Sessions that were logged in before the block keep running.
+
+To keep observing attacks on a legacy rule open to public networks, as a honeypot, set `enabled = false` or a high `failures`; the `authresult` lines then keep coming for every attempt.
 
 ## Timeouts
 

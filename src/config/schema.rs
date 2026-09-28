@@ -54,6 +54,8 @@ pub struct Config {
     pub timeouts: Timeouts,
     #[serde(default)]
     pub metrics: Metrics,
+    #[serde(default)]
+    pub auth_ratelimit: AuthRateLimit,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -544,6 +546,68 @@ impl Metrics {
     pub fn is_enabled(&self) -> bool {
         self.enabled.unwrap_or(self.listen.is_some())
     }
+}
+
+/// Blocking of source addresses with too many failed logins: after
+/// `failures` counted failures within `window_secs`, new connections from
+/// the source are closed at accept for `block_secs`, doubled for each
+/// further block up to `max_block_secs`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthRateLimit {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_ratelimit_failures")]
+    pub failures: u32,
+    #[serde(default = "default_ratelimit_window_secs")]
+    pub window_secs: u64,
+    #[serde(default = "default_ratelimit_block_secs")]
+    pub block_secs: u64,
+    /// Longest block; equal to `block_secs`: no escalation.
+    #[serde(default = "default_ratelimit_max_block_secs")]
+    pub max_block_secs: u64,
+    /// Never block sources inside `scope.internal_networks`.
+    #[serde(default)]
+    pub exempt_internal: bool,
+    /// Sources that are never blocked (CIDR): local relays such as a webmail
+    /// server, NAT gateways.
+    #[serde(default = "default_ratelimit_exempt_networks")]
+    pub exempt_networks: Vec<String>,
+}
+
+impl Default for AuthRateLimit {
+    fn default() -> Self {
+        AuthRateLimit {
+            enabled: true,
+            failures: default_ratelimit_failures(),
+            window_secs: default_ratelimit_window_secs(),
+            block_secs: default_ratelimit_block_secs(),
+            max_block_secs: default_ratelimit_max_block_secs(),
+            exempt_internal: false,
+            exempt_networks: default_ratelimit_exempt_networks(),
+        }
+    }
+}
+
+fn default_ratelimit_failures() -> u32 {
+    20
+}
+
+fn default_ratelimit_window_secs() -> u64 {
+    600
+}
+
+fn default_ratelimit_block_secs() -> u64 {
+    900
+}
+
+fn default_ratelimit_max_block_secs() -> u64 {
+    86_400
+}
+
+/// Loopback: a local webmail or relay logs in for many users.
+fn default_ratelimit_exempt_networks() -> Vec<String> {
+    vec!["127.0.0.0/8".into(), "::1/128".into()]
 }
 
 #[cfg(test)]

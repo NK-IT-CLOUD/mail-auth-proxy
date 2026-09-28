@@ -59,7 +59,10 @@ The file is strict. Startup fails, and `--check-config` reports, when:
   fragment, `scope` is not an RFC 6749 scope, or more than one issuer sets
   `openid_configuration_url` or `scope` (the error result goes to a client whose token
   was not trusted, so it names one IdP for everyone);
-- `doveadm_*` keys are set without `account_check = "doveadm"`, or are missing with it.
+- `doveadm_*` keys are set without `account_check = "doveadm"`, or are missing with it;
+- `auth_ratelimit.failures`, `window_secs` or `block_secs` is 0, `window_secs` or
+  `block_secs` is above 86400, `max_block_secs` is below `block_secs` or above 604800, or
+  an `exempt_networks` entry is not a CIDR.
 
 Startup also fails when a JWKS is unreachable or has no usable key, or a listener cannot
 bind.
@@ -85,6 +88,7 @@ by that group and by nobody else, for example `root:mail-auth-proxy` mode `0640`
 | `[scope]` | networks labelled `internal` in logs and metrics (a label only) |
 | `[limits]`, `[timeouts]` | connection limits and pre-authentication deadlines |
 | `[metrics]` | optional Prometheus endpoint |
+| `[auth_ratelimit]` | blocking of source addresses with too many failed logins (on by default) |
 
 ## Keys
 
@@ -152,6 +156,13 @@ backend `.…` keys below, written inline (`backend = { address = "…" }`) or a
 | `timeouts.connect_secs` | integer | 10 | backend connect, TLS handshake, PROXY header; 1-3600 |
 | `metrics.enabled` | bool | `false`; `true` if only `listen` is set | serve the Prometheus endpoint |
 | `metrics.listen` | `ip:port` | required when enabled | Prometheus endpoint, no authentication (warning if not loopback); must not clash with a mail listener |
+| `auth_ratelimit.enabled` | bool | `true` | block sources with too many failed logins ([architecture.md](architecture.md#failed-login-rate-limit)) |
+| `auth_ratelimit.failures` | integer | 20 | counted failures of one source (IPv4 address, IPv6 /64) that start a block; ≥ 1. A repeated identical credential counts once |
+| `auth_ratelimit.window_secs` | integer | 600 | window in which the failures are counted, from the first one; 1-86400 |
+| `auth_ratelimit.block_secs` | integer | 900 | length of the first block; 1-86400 |
+| `auth_ratelimit.max_block_secs` | integer | 86400 | each further block of the same source doubles up to this; `block_secs` to 604800. Equal to `block_secs`: no escalation |
+| `auth_ratelimit.exempt_internal` | bool | `false` | never count sources in `scope.internal_networks` |
+| `auth_ratelimit.exempt_networks` | array of CIDR | `["127.0.0.0/8", "::1/128"]` | sources that are never counted, e.g. a webmail server or a NAT gateway through which many users log in; a public network gives a warning. An empty list exempts nothing, not even loopback |
 
 Environment: `RUST_LOG` (log filter, default `info`; see [operations.md](operations.md#logging)).
 

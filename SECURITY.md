@@ -41,7 +41,8 @@ relays bytes. It never holds a master password or any other credential of its ow
 |---|---|
 | Forged or foreign tokens (`alg=none`, HS*, key confusion, a key of one realm signing for another, ID tokens, expired tokens) | local validation: algorithm from the key, key bound to its issuer, required `iss`/`aud`/`exp`, access-token marker, `email_verified` |
 | A valid token used for another mailbox | the backend login is the token's identity claim; a different SASL user name is refused |
-| Password guessing and spraying from the internet | no password mechanism unless a legacy rule matches the source network; per-account throttle; `authresult` lines with keyed password fingerprints for log-based blocking |
+| Password guessing and spraying from the internet | no password mechanism unless a legacy rule matches the source network; per-account throttle; a failed-login rate limit per source address; `authresult` lines with keyed password fingerprints for log-based blocking |
+| Token guessing and scanning with new connections per attempt | a failed-login rate limit per source address (IPv4 address, IPv6 /64) that closes a blocked source's connections at accept |
 | Account and domain enumeration | refusals and wrong passwords get the same reply and similar timing (see [Hardening](#hardening)) |
 | Resource exhaustion before login | connection caps, per-IP cap on unauthenticated connections, one pre-authentication time budget, command, line, literal, token and password size limits |
 | STARTTLS command injection | nothing is read ahead of the TLS switch, so plaintext pipelined after `STARTTLS` cannot reach the encrypted session |
@@ -92,6 +93,10 @@ relays bytes. It never holds a master password or any other credential of its ow
 - Pre-authentication limits: a global connection cap (at most half unauthenticated), a
   per-source-IP cap on unauthenticated connections, one total time budget from accept to
   credential, a command limit, line and literal size limits.
+- Failed-login rate limit (on by default): a source with too many refused credentials is
+  closed at accept, before TLS, for a growing time. Every refusal reason counts alike and
+  refusal timing is unchanged, so a block does not reveal whether an account exists;
+  outages and pre-auth aborts never count; the table is bounded.
 - Size caps: a password over 1024 bytes and a token over 16384 bytes are refused without
   further processing (`oversize`, `bad_token`); a JWKS response over 256 KiB fails the
   fetch; a line is at most 16384 bytes, a ManageSieve literal at most 64 KiB.
@@ -139,6 +144,10 @@ relays bytes. It never holds a master password or any other credential of its ow
 - **`token_type = "any"`** also accepts ID tokens that carry an accepted audience; use it
   only for IdPs that mark access tokens neither way.
 - **Metrics** have no authentication; bind them to loopback or a management network.
+- **Shared source addresses.** The failed-login rate limit counts per address (IPv6 per
+  /64). Everyone behind one NAT, webmail server or IPv6 /64 shares that count, so one
+  guesser there can block the others. Put such relays you trust into
+  `auth_ratelimit.exempt_networks`; the default exempts only loopback.
 - **Session lifetime.** After a successful login the proxy relays bytes with no idle
   limit, no keepalive and no per-user session limit. Session lifetime is up to the client
   and the backend (for example Dovecot's autologout); a revoked token does not end an open
@@ -161,6 +170,9 @@ A rule with public networks turns the proxy into a password target. If you need 
   account and can be revoked on its own.
 - **Log-based blocking.** Feed the `authresult` lines (`reason`, `rule`, `pwfp`) to
   CrowdSec or a similar tool; `pwfp` shows the same password sprayed from many addresses.
+- **Rate limit.** `[auth_ratelimit]` blocks a guessing source for a while. To watch the
+  attempts on such a rule rather than cut them short, disable it or raise `failures`;
+  the `authresult` lines then record every attempt.
 - **Throttle.** `throttle` stops guessing against one account without asking the backend.
   It also lets anyone lock that account's legacy logins for `window_secs` by failing on
   purpose (OAuth logins are not affected); choose the window with that in mind.
@@ -171,8 +183,10 @@ A rule with public networks turns the proxy into a password target. If you need 
 
 - A compromised identity provider or backend.
 - Denial of service by volume beyond the built-in connection limits.
-- Password strength, and brute-force blocking beyond the per-account throttle (use the
-  `authresult` log with a blocking tool).
+- Password strength, and brute-force blocking beyond the per-account throttle and the
+  per-source rate limit of this process: firewall bans, bans across hosts or services, and
+  distributed guessing from many addresses (use the `authresult` log with a blocking
+  tool).
 
 ## Reporting a vulnerability
 

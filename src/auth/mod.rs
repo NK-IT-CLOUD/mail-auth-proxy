@@ -210,6 +210,8 @@ pub async fn authorize<B: BackendLogin>(
         .record();
         metrics::record_auth(s.proto, s.internal, mech, reason == Reason::Ok);
         metrics::record_refusal(s.proto, reason);
+        ctx.ratelimit
+            .failure(s.proto, s.scope, s.peer.ip(), reason, credential);
     };
     match credential {
         ClientAuthKind::OAuth { user, token } => {

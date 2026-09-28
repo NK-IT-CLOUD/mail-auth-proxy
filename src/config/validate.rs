@@ -1,7 +1,7 @@
 //! Validation: every check serde cannot express, and the normalisation of
 //! the short forms into what the rest of the program reads.
 
-use super::{AccountCheck, Config, Legacy, Rule, TokenType, PASSWORD_GATE_RULE};
+use super::{AccountCheck, AuthRateLimit, Config, Legacy, Rule, TokenType, PASSWORD_GATE_RULE};
 use std::net::{IpAddr, SocketAddr};
 
 /// Upper bound of `oauth.leeway_secs`. The leeway is added to `exp` and
@@ -276,6 +276,7 @@ impl Config {
                 ));
             }
         }
+        self.auth_ratelimit.check(&mut err, warnings);
         match (&self.metrics.listen, self.metrics.is_enabled()) {
             (None, true) => err("metrics.listen is required when metrics.enabled = true".into()),
             (Some(m), enabled) => match m.parse::<std::net::SocketAddr>() {
@@ -608,6 +609,44 @@ fn check_scope(scope: &str) -> Result<(), String> {
         Err(format!(
             "{scope:?} is not a scope (RFC 6749 section 3.3: tokens of printable ASCII without '\"' and '\\', separated by single spaces)"
         ))
+    }
+}
+
+/// Upper bound of `auth_ratelimit.window_secs` and `block_secs`: a day.
+const MAX_RATELIMIT_SECS: u64 = 86_400;
+
+/// Upper bound of `auth_ratelimit.max_block_secs`: a week. An escalated
+/// source is remembered that long after its block, which holds table room.
+const MAX_RATELIMIT_BLOCK_SECS: u64 = 7 * 86_400;
+
+impl AuthRateLimit {
+    fn check(&self, err: &mut impl FnMut(String), warnings: &mut Vec<String>) {
+        if self.failures == 0 {
+            err("auth_ratelimit.failures must be at least 1".into());
+        }
+        for (name, secs) in [
+            ("window_secs", self.window_secs),
+            ("block_secs", self.block_secs),
+        ] {
+            if secs == 0 || secs > MAX_RATELIMIT_SECS {
+                err(format!(
+                    "auth_ratelimit.{name} must be between 1 and {MAX_RATELIMIT_SECS} seconds"
+                ));
+            }
+        }
+        if self.max_block_secs < self.block_secs || self.max_block_secs > MAX_RATELIMIT_BLOCK_SECS {
+            err(format!("auth_ratelimit.max_block_secs must be between block_secs and {MAX_RATELIMIT_BLOCK_SECS} seconds"));
+        }
+        match crate::auth::policy::parse_internal_nets(&self.exempt_networks) {
+            Ok(nets) => {
+                for n in nets.iter().filter(|n| !is_private_net(n)) {
+                    warnings.push(format!(
+                        "auth_ratelimit.exempt_networks: sources in the public network {n} are never blocked"
+                    ));
+                }
+            }
+            Err(e) => err(format!("auth_ratelimit.exempt_networks: {e:#}")),
+        }
     }
 }
 

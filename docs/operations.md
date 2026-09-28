@@ -54,13 +54,15 @@ When a `protocol` record is written:
   - `sieve auth ok; splicing user=… mech=…`
 - Startup, at `INFO`:
   - `legacy password rule rule=<name> networks=[…] sni=… users=… users_file=… protocols=… mechanisms=…` per rule and `legacy password gate domain_gate=… account_check=… throttle=… failure_delay_ms=…`, or `password auth disabled: OAuth only`.
+  - `auth rate limit failures=… window_secs=… block_secs=… max_block_secs=… exempt_internal=… exempt_networks=[…]`, or `auth rate limit disabled`.
   - `legacy list file reloaded` when a users or domains file changes; `ERROR … legacy list file unusable; it matches nothing until it is fixed` when it becomes missing or invalid, and `legacy list file usable again` when it is fixed.
   - `imap listener up`, `submission listener up`, `sieve listener up` (with `listen=` and `backend=`)
   - `reload: certificate loaded`, `reload: JWKS refreshed` (or `reload: JWKS refresh already running`) after `SIGHUP` (`ERROR reload: certificate unusable; keeping the current one`, `WARN reload: JWKS refresh failed; keeping previous keys` on failure)
   - `shutting down: listeners closed, waiting for open sessions drain_secs=10`, then `all sessions ended; exiting` or `WARN sessions still open after the drain time; closing them`
   - `metrics endpoint up`
 - `WARN`:
-  - `config: …` at startup and with `--check-config`, one line per warning: `token_type = "any"`; `require_email_verified` with an `identity_claim` other than `email`; a public network in `[password_gate]` (one line each); `[password_gate]` disabled but `sni` set; a legacy rule that accepts every user from public networks; `[legacy]` settings without any rule; `failure_delay_ms = 0`; `metrics.listen` not on loopback.
+  - `authlog: ratelimit action="block" proto="<proto>" scope="<internal|external>" peer=<ip> source=<cidr> failures=<n> block_secs=<n> strikes=<n>` when a source is blocked ([architecture.md](architecture.md#failed-login-rate-limit)): `proto`, `scope` and `peer` of the failure that reached the threshold, `source` the blocked address or /64 (`198.51.100.7/32`, `2001:db8:1:2::/64`), `failures` the counted failures, `block_secs` the length of this block, `strikes` the number of blocks in a row (1 for the first). One line per block, on the `authlog` target like the `authresult` line, but not an `authresult` line: parsers anchored on `authresult result=` do not see it. The connections closed during the block are counted in `mail_auth_proxy_ratelimit_blocks_total` and logged only at `DEBUG`, so a blocked source cannot fill the journal.
+  - `config: …` at startup and with `--check-config`, one line per warning: `token_type = "any"`; `require_email_verified` with an `identity_claim` other than `email`; a public network in `[password_gate]` (one line each); `[password_gate]` disabled but `sni` set; a legacy rule that accepts every user from public networks; `[legacy]` settings without any rule; `failure_delay_ms = 0`; `metrics.listen` not on loopback; a public network in `auth_ratelimit.exempt_networks`.
   - `fetching JWKS …`, `parsing JWKS …`, `JWKS has no usable signing keys`, `JWKS refresh failed; keeping previous keys`, `JWKS refresh for unknown kid` (the refresh an unknown `kid` triggered failed)
   - `loading system CA certificates`
   - `metrics accept error`
@@ -70,6 +72,7 @@ When a `protocol` record is written:
   - `…: accept error` (the listener waits 100 ms and keeps accepting)
 - `DEBUG`:
   - `…: connection limit reached, closing` for a connection closed at accept by a limit
+  - `…: source blocked after failed logins, closing` for a connection closed at accept by the failed-login rate limit
   - `relay ended with an error` when the byte relay after login ends with an I/O error
   - `JWKS refreshed kids=… failed=…` after each periodic refresh
 
@@ -90,6 +93,10 @@ Metrics are off by default. They are on with `metrics.enabled = true` or when on
 | `mail_auth_proxy_backend_errors_total` | counter | `proto` | backend or legacy account check (doveadm) unreachable or failing while a client waited for its verdict (outage, not a failed login) |
 | `mail_auth_proxy_legacy_list_errors_total` | counter | `list` (users_file, domains_file) | failed re-reads of a legacy list file; while it fails, the list matches nothing |
 | `mail_auth_proxy_legacy_throttle_evictions_total` | counter | | accounts dropped from the full throttle table (65,536 accounts) while their failure window was still running; their count starts over. Rising means failed passwords for that many distinct accounts within one window, a spraying volume that dilutes the per-account throttle. |
+| `mail_auth_proxy_ratelimit_blocks_total` | counter | `proto` | connections closed at accept because their source is blocked by the failed-login rate limit (not in `connections_rejected_total`) |
+| `mail_auth_proxy_ratelimit_bans_total` | counter | | blocks started: a source reached `auth_ratelimit.failures` |
+| `mail_auth_proxy_ratelimit_active_blocks` | gauge | | sources blocked now; set when a block starts and by a sweep every 10 s, so an ended block leaves it up to 10 s later |
+| `mail_auth_proxy_ratelimit_evictions_total` | counter | | sources dropped from the full rate-limit table (65,536 sources) while they still had failures, a block or its escalation to remember. Rising means failed logins from that many distinct sources at once, a volume the rate limit cannot track per source |
 | `mail_auth_proxy_active_connections` | gauge | `proto` | admitted connections currently open |
 | `mail_auth_proxy_tls_cert_expiry_timestamp_seconds` | gauge | | `notAfter` of the client-facing certificate in use, Unix seconds; follows a `SIGHUP` reload, stays when a reload is refused; 0 if it cannot be read. Alert on `… - time() < 14 * 86400`: a renewed file that was never reloaded still shows the old date. |
 | `mail_auth_proxy_jwks_last_success_timestamp_seconds` | gauge | `issuer` (each `oauth.issuers` entry) | Unix time of the last JWKS fetch of the issuer that produced usable keys: at startup, periodic, on `SIGHUP`, or for an unknown `kid`. Alert when it is older than a few `oauth.refresh_secs`: the proxy still validates with the previous keys, but misses a key rotation. |
@@ -112,8 +119,11 @@ The shipped unit uses `Type=notify`, so `systemctl start` returns only when the 
 
 ## Log-based blocking
 
-Apart from its connection limits and the per-account throttle of the legacy gate, the
-proxy blocks nothing. Feed the `authresult` lines to a log-based blocker. The parser and
+The proxy itself has its connection limits, the per-account throttle of the legacy gate
+and the [failed-login rate limit](architecture.md#failed-login-rate-limit), which blocks a
+source on this proxy for a while. A log-based blocker adds longer bans, bans at the
+firewall, and detection across services and hosts. Feed it the `authresult` lines; the
+`ratelimit` line is separate and not counted as a failed login. The parser and
 five scenarios in [contrib/crowdsec](../contrib/crowdsec/) cover brute force, password
 spraying (many accounts from one address), password probing on OAuth-only endpoints, slow guessing and honeypot
 account names. Whitelist your own management networks there.
@@ -134,6 +144,7 @@ and an `Environment=` line) while you look for them, and switch back afterwards.
 | Password clients get "not available on this endpoint" | `reason="blocked_endpoint"`, `rule=""` | no legacy rule matches: the source address is not in `networks` (NAT or a load balancer in front), the client sends no or another SNI than the rule's `sni` (connecting by IP address sends none), protocol or mechanism not listed |
 | Password logins fail slowly with `unknown_domain` / `unknown_account` / `throttled` | `authresult` `reason` and `rule` | domain not in `allowed_domains`/`domains_file`; account not found by doveadm; account throttled after recent failures |
 | Password logins get retry-later although the backend is up | `WARN … session ended … error=` with the account check | doveadm HTTP API unreachable, wrong key, TLS not trusted (`doveadm_ca_file`) |
+| All clients of one address get connection failures (no greeting, no TLS) for minutes or hours | `WARN authlog: ratelimit … source=<cidr>`; `mail_auth_proxy_ratelimit_blocks_total` | the failed-login rate limit blocked the address: many users behind one NAT or webmail server with wrong passwords, or an attacker sharing it. Add the address to `auth_ratelimit.exempt_networks` (or set `exempt_internal`) and restart; a restart also clears all blocks |
 | A password rule suddenly matches nobody | `ERROR … legacy list file unusable` | a `users_file` or `domains_file` became unreadable or invalid; fix it, it is re-read within seconds |
 | Postfix logs the proxy's address instead of the client's | Postfix log | `submission.xclient = true` but the proxy is not in `smtpd_authorized_xclient_hosts`: Postfix does not advertise `XCLIENT` and the step is skipped silently |
 | Every submission login gets `454` retry-later | `WARN … backend advertises XCLIENT to this proxy but submission.xclient = false` | the proxy is in `smtpd_authorized_xclient_hosts` but `submission.xclient` is off; set it to `true` or remove the proxy from that list |

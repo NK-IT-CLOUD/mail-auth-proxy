@@ -64,6 +64,8 @@ pub struct Shared {
     /// Name used in greetings and EHLO.
     pub hostname: String,
     pub limits: Arc<crate::limits::Limits>,
+    /// Blocking of sources with too many failed logins.
+    pub ratelimit: Arc<crate::ratelimit::AuthRateLimit>,
     pub tuning: Tuning,
 }
 
@@ -271,6 +273,18 @@ pub async fn run(cfg: config::Config) -> Result<()> {
             throttle=?l.throttle, failure_delay_ms=l.failure_delay_ms, "legacy password gate");
     }
     legacy.spawn_reloader();
+    let ratelimit = Arc::new(crate::ratelimit::AuthRateLimit::new(
+        &cfg.auth_ratelimit,
+        &nets,
+    )?);
+    if ratelimit.is_enabled() {
+        let r = &cfg.auth_ratelimit;
+        tracing::info!(target: crate::obs::target::MAIN, failures=r.failures, window_secs=r.window_secs, block_secs=r.block_secs,
+            max_block_secs=r.max_block_secs, exempt_internal=r.exempt_internal, exempt_networks=?r.exempt_networks, "auth rate limit");
+    } else {
+        tracing::info!(target: crate::obs::target::MAIN, "auth rate limit disabled");
+    }
+    ratelimit.spawn_sweeper();
     let validator = Arc::new(crate::auth::token::Validator::new(&cfg.oauth).await?);
     // IdPs rotate signing keys; without a refresh the proxy stops accepting
     // every token minted after a rotation until it is restarted.
@@ -286,6 +300,7 @@ pub async fn run(cfg: config::Config) -> Result<()> {
             cfg.limits.max_connections,
             cfg.limits.max_preauth_per_ip,
         ),
+        ratelimit,
         tuning: Tuning {
             idle: std::time::Duration::from_secs(cfg.timeouts.idle_secs),
             connect: std::time::Duration::from_secs(cfg.timeouts.connect_secs),

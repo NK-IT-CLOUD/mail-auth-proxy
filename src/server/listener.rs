@@ -49,6 +49,13 @@ pub(super) fn spawn_listener<P, F, Fut>(
             };
             match accepted {
                 Ok((tcp, peer)) => {
+                    // Closed like the connection limits: no TLS, no greeting.
+                    // The block itself was logged when it started.
+                    if ctx.ratelimit.is_blocked(peer.ip()) {
+                        metrics::record_ratelimit_block(proto);
+                        tracing::debug!(target: crate::obs::target::MAIN, %peer, "{ended}: source blocked after failed logins, closing");
+                        continue;
+                    }
                     let Some(permit) = ctx.limits.admit(peer.ip().to_canonical()) else {
                         metrics::record_rejected(proto);
                         tracing::debug!(target: crate::obs::target::MAIN, %peer, "{ended}: connection limit reached, closing");
