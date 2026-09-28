@@ -4,11 +4,12 @@ use mail_auth_proxy::{config, server};
 /// Default configuration path (the packaged location).
 const DEFAULT_CONFIG: &str = "/etc/mail-auth-proxy/config.toml";
 
-const USAGE: &str = "usage: mail-auth-proxy [--check-config | --print-config] [CONFIG]
+const USAGE: &str = "usage: mail-auth-proxy [-t | --check-config | --print-config] [CONFIG]
        mail-auth-proxy --version
 
   CONFIG           configuration file (default /etc/mail-auth-proxy/config.toml)
-  --check-config   validate CONFIG, load its certificates and CA files, then exit
+  -t, --check-config
+                   validate CONFIG, load its certificates and CA files, then exit
   --print-config   print the effective configuration
   --version        print the version";
 
@@ -42,7 +43,7 @@ async fn main() -> Result<()> {
     let mut path = None;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
-            "--check-config" => mode = Mode::Check,
+            "-t" | "--check-config" => mode = Mode::Check,
             "--print-config" => mode = Mode::Print,
             "--version" => {
                 println!("mail-auth-proxy {}", mail_auth_proxy::version());

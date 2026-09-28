@@ -7,7 +7,7 @@ The file is TOML, format version 2. A commented example is
 ## Command line
 
 ```
-mail-auth-proxy [--check-config | --print-config] [CONFIG]
+mail-auth-proxy [-t | --check-config | --print-config] [CONFIG]
 mail-auth-proxy --version
 mail-auth-proxy -h | --help
 ```
@@ -15,7 +15,7 @@ mail-auth-proxy -h | --help
 | Argument | Effect |
 |---|---|
 | `CONFIG` | configuration file, default `/etc/mail-auth-proxy/config.toml` |
-| `--check-config` | validate the file and exit: every problem at once, including unreadable certificates, keys and CA files, the legacy users and domains files and the doveadm key and CA file; JWKS reachability is not checked. Exit status 0 when valid, 1 otherwise. |
+| `-t`, `--check-config` | validate the file and exit: every problem at once, including unreadable certificates, keys and CA files, the legacy users and domains files and the doveadm key and CA file; JWKS reachability is not checked. Exit status 0 when valid, 1 otherwise. |
 | `--print-config` | print the effective configuration as TOML on stdout (defaults filled in, `[password_gate]` shown as the rule it stands for); exits non-zero after printing if the file is invalid |
 | `--version` | print `mail-auth-proxy X.Y.Z (commit <sha12>)`; `commit unknown` for a plain `cargo build` |
 | `-h`, `--help` | print the usage on stdout and exit with status 0 |

@@ -7,6 +7,7 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `-t`, short form of `--check-config`.
 - Metric `process_start_time_seconds`: start time of the process, so restarts show in
   Prometheus.
 - Metric `mail_auth_proxy_backend_login_duration_seconds` (histogram by `proto`): how
