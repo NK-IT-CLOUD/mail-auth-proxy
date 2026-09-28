@@ -279,8 +279,8 @@ pub async fn authorize<B: BackendLogin>(
                 tokio::time::sleep_until(gate.refusal_deadline(s.proto, started)).await;
                 return Outcome::Denied;
             }
-            let rule = match gate.check(s.proto, s.peer.ip(), s.sni, mech, user).await {
-                legacy::Verdict::Pass { rule } => rule,
+            let (rule, turn) = match gate.check(s.proto, s.peer.ip(), s.sni, mech, user).await {
+                legacy::Verdict::Pass { rule, turn } => (rule, turn),
                 legacy::Verdict::Deny { reason, rule } => {
                     event(user, reason, &pwfp, rule);
                     tokio::time::sleep_until(gate.refusal_deadline(s.proto, started)).await;
@@ -301,6 +301,7 @@ pub async fn authorize<B: BackendLogin>(
             {
                 Ok(conn) => {
                     gate.backend_accepted(user);
+                    drop(turn);
                     event(user, Reason::Ok, "", rule);
                     metrics::record_upstream_forward(s.proto);
                     Outcome::Ok {
@@ -311,11 +312,13 @@ pub async fn authorize<B: BackendLogin>(
                 Err(BackendError::Rejected(reply)) => {
                     let answer_at = gate.rejected_deadline(s.proto, started);
                     gate.backend_rejected(user);
+                    drop(turn);
                     event(user, Reason::BackendReject, &pwfp, rule);
                     tokio::time::sleep_until(answer_at).await;
                     Outcome::Rejected(reply)
                 }
                 Err(BackendError::Unavailable(e)) => {
+                    drop(turn);
                     metrics::record_backend_error(s.proto);
                     // Only accounts that passed the gate get here: padded
                     // like a refusal, so the timing does not tell them apart.

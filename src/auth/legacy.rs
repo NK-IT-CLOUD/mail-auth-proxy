@@ -307,10 +307,24 @@ impl Rule {
 
 /// Per-account failure counting for the throttle. Bounded: at most
 /// `THROTTLE_CAPACITY` accounts are tracked.
+///
+/// Password attempts for one account take turns (`turns`): the next attempt
+/// is checked only after the previous one has its backend verdict counted, so
+/// parallel connections cannot run more attempts than `failures` allows.
 struct Throttle {
     failures: u32,
     window: Duration,
     seen: Mutex<HashMap<String, (u32, Instant)>>,
+    /// Accounts with an attempt in flight or waiting.
+    turns: Mutex<HashMap<String, TurnSlot>>,
+}
+
+/// One account's turn lock and the number of attempts holding or waiting for
+/// it; the slot is removed when that number drops to 0.
+#[derive(Default)]
+struct TurnSlot {
+    lock: Arc<tokio::sync::Mutex<()>>,
+    claims: usize,
 }
 
 const THROTTLE_CAPACITY: usize = 65_536;
@@ -362,12 +376,72 @@ impl Throttle {
             .unwrap_or_else(|p| p.into_inner())
             .remove(&Self::key(user));
     }
+
+    /// Waits until no other attempt for `user` is in flight. Cancelling the
+    /// wait (the client's time budget ran out) releases the claim as well.
+    async fn turn(&self, user: &str) -> Turn<'_> {
+        let key = Self::key(user);
+        let lock = {
+            let mut turns = self.turns.lock().unwrap_or_else(|p| p.into_inner());
+            let slot = turns.entry(key.clone()).or_default();
+            slot.claims += 1;
+            slot.lock.clone()
+        };
+        let claim = Claim {
+            throttle: self,
+            key,
+        };
+        let guard = lock.lock_owned().await;
+        Turn(Some((guard, claim)))
+    }
+}
+
+/// One attempt waiting for or holding an account's turn.
+struct Claim<'a> {
+    throttle: &'a Throttle,
+    key: String,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        let mut turns = self
+            .throttle
+            .turns
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(slot) = turns.get_mut(&self.key) {
+            slot.claims -= 1;
+            if slot.claims == 0 {
+                turns.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// An account's turn for one password attempt: held from the throttle check
+/// until the backend verdict is counted, then dropped (lock first, then claim).
+pub struct Turn<'a>(Option<(tokio::sync::OwnedMutexGuard<()>, Claim<'a>)>);
+
+impl Turn<'_> {
+    fn none() -> Self {
+        Turn(None)
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        if let Some((guard, claim)) = self.0.take() {
+            drop(guard);
+            drop(claim);
+        }
+    }
 }
 
 /// The gate's verdict on one password attempt.
 pub enum Verdict<'a> {
-    /// Forward the password; `rule` let it through.
-    Pass { rule: &'a str },
+    /// Forward the password; `rule` let it through. Keep `turn` until the
+    /// backend verdict is reported with `backend_accepted`/`backend_rejected`.
+    Pass { rule: &'a str, turn: Turn<'a> },
     /// Refused before the backend. `rule` is the matching rule, or empty
     /// when no rule allows this user.
     Deny { reason: Reason, rule: &'a str },
@@ -450,6 +524,7 @@ impl Gate {
                 failures: t.failures,
                 window: Duration::from_secs(t.window_secs),
                 seen: Mutex::new(HashMap::new()),
+                turns: Mutex::new(HashMap::new()),
             }),
             failure_delay: Duration::from_millis(cfg.failure_delay_ms),
         })
@@ -625,11 +700,18 @@ impl Gate {
                 Err(e) => return Verdict::Unavailable(e),
             }
         }
-        // 4. Throttle.
-        if self.throttle.as_ref().is_some_and(|t| t.is_throttled(user)) {
-            return deny(Reason::Throttled);
-        }
-        Verdict::Pass { rule }
+        // 4. Throttle, checked in this account's turn.
+        let turn = match &self.throttle {
+            Some(t) => {
+                let turn = t.turn(user).await;
+                if t.is_throttled(user) {
+                    return deny(Reason::Throttled);
+                }
+                turn
+            }
+            None => Turn::none(),
+        };
+        Verdict::Pass { rule, turn }
     }
 
     /// The backend rejected the password of `user`.
@@ -694,7 +776,7 @@ mod tests {
 
     fn pass(v: Verdict<'_>) -> Option<String> {
         match v {
-            Verdict::Pass { rule } => Some(rule.to_string()),
+            Verdict::Pass { rule, .. } => Some(rule.to_string()),
             _ => None,
         }
     }
@@ -887,12 +969,82 @@ mod tests {
         assert!(pass(check("bob@example.org").await).is_some());
     }
 
+    /// Parallel attempts for one account take turns: no more of them reach the
+    /// backend than the throttle allows failures, and no turn is left behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn throttle_holds_under_parallel_attempts() {
+        let g = Arc::new(gate_with(Legacy {
+            throttle: Some(config::Throttle {
+                failures: 2,
+                window_secs: 3600,
+            }),
+            rules: vec![rule("all", &["127.0.0.0/8"])],
+            ..Legacy::default()
+        }));
+        let tasks: Vec<_> = (0..20)
+            .map(|_| {
+                let g = g.clone();
+                tokio::spawn(async move {
+                    match g
+                        .check(
+                            Proto::Imap,
+                            ip("127.0.0.1"),
+                            None,
+                            "PLAIN",
+                            "bob@example.org",
+                        )
+                        .await
+                    {
+                        Verdict::Pass { turn, .. } => {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            g.backend_rejected("bob@example.org");
+                            drop(turn);
+                            1
+                        }
+                        _ => 0,
+                    }
+                })
+            })
+            .collect();
+        let mut passed = 0;
+        for t in tasks {
+            passed += t.await.unwrap();
+        }
+        assert_eq!(passed, 2);
+        let t = g.throttle.as_ref().unwrap();
+        assert!(t.turns.lock().unwrap().is_empty());
+    }
+
+    /// An attempt cancelled while it waits for its turn leaves nothing behind.
+    #[tokio::test]
+    async fn cancelled_wait_releases_its_claim() {
+        let t = Throttle {
+            failures: 5,
+            window: Duration::from_secs(3600),
+            seen: Mutex::new(HashMap::new()),
+            turns: Mutex::new(HashMap::new()),
+        };
+        let first = t.turn("a@x").await;
+        let waited = tokio::time::timeout(Duration::from_millis(20), t.turn("A@x")).await;
+        assert!(
+            waited.is_err(),
+            "the second attempt must wait for the first"
+        );
+        assert_eq!(
+            t.turns.lock().unwrap().get("a@x").map(|s| s.claims),
+            Some(1)
+        );
+        drop(first);
+        assert!(t.turns.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn throttle_window_expires_and_capacity_is_bounded() {
         let t = Throttle {
             failures: 1,
             window: Duration::from_millis(1),
             seen: Mutex::new(HashMap::new()),
+            turns: Mutex::new(HashMap::new()),
         };
         t.failure("a@x");
         std::thread::sleep(Duration::from_millis(5));
@@ -901,6 +1053,7 @@ mod tests {
             failures: 1,
             window: Duration::from_secs(3600),
             seen: Mutex::new(HashMap::new()),
+            turns: Mutex::new(HashMap::new()),
         };
         for i in 0..THROTTLE_CAPACITY + 10 {
             t.failure(&format!("u{i}@x"));

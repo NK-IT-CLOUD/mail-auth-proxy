@@ -6,6 +6,11 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+- Parallel password attempts for one account could all pass the legacy throttle
+  before the first backend rejection was counted, so more than `failures` guesses fit
+  into one window. Attempts for the same account now take turns (CWE-362).
+
 ## [0.1.0] - 2026-09-27
 
 ### Added

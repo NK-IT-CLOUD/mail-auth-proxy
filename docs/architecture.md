@@ -105,7 +105,7 @@ Sources: doc.dovecot.org 2.4.5 "Doveadm → HTTP API" and the `user` command in 
 
 ### Throttle
 
-Each backend rejection counts against the account for `window_secs` from its first failure. The key is the login folded to ASCII lower case, so `Bob@x` and `bob@x` share one counter. Once `failures` is reached, further attempts are refused without asking the backend until the window ends. A successful login resets the count. At most 65 536 accounts are tracked (expired entries are dropped first, then the oldest). Only rejections of existing accounts are counted, so unknown names do not fill the table.
+Each backend rejection counts against the account for `window_secs` from its first failure. The key is the login folded to ASCII lower case, so `Bob@x` and `bob@x` share one counter. Once `failures` is reached, further attempts are refused without asking the backend until the window ends. A successful login resets the count. Password attempts for one account take turns: the next one is checked only after the previous one has its backend verdict counted, so parallel connections cannot run more attempts than `failures` allows. Correct passwords wait at most for one backend answer; nothing is refused because of parallel logins. At most 65 536 accounts are tracked (expired entries are dropped first, then the oldest). Only rejections of existing accounts are counted, so unknown names do not fill the table.
 
 ### User and domain files
 
