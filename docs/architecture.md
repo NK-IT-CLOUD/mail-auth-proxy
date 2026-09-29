@@ -26,7 +26,7 @@ client ──TLS──▶ mail-auth-proxy ────────────�
                  7. relay the backend's verdict; on success relay bytes until either side closes
 ```
 
-Each connection is one tokio task. Connections share only the JWKS key set, the server certificate, the ManageSieve capability cache, the legacy gate's caches and counters, the connection limits, the failed-login counters and the metrics. Trust boundaries and the threat model are in [SECURITY.md](../SECURITY.md#trust-boundaries).
+Each connection is one tokio task. Connections share only the JWKS key set, the server certificates, the ManageSieve capability cache, the legacy gate's caches and counters, the connection limits, the failed-login counters and the metrics. Trust boundaries and the threat model are in [SECURITY.md](../SECURITY.md#trust-boundaries).
 
 ## Startup
 
@@ -36,8 +36,8 @@ Each connection is one tokio task. Connections share only the JWKS key set, the 
 ## Client TLS
 
 - rustls with the aws-lc-rs provider. TLS 1.2 and TLS 1.3 use rustls' default cipher suites. IMAP and ManageSieve negotiate ALPN with their IANA identifiers `imap` and `managesieve`: a client that offers ALPN without that identifier is refused in the handshake (`no_application_protocol`); one that offers none is accepted. SMTP has no identifier and ignores ALPN. There is no client-certificate authentication.
-- One certificate chain (`tls.cert`, `tls.key`) is served for every SNI name. A legacy rule with `sni` is only usable if that certificate covers both the public name and the rule's names.
-- The SNI is read after the handshake and used only by the legacy rules ([legacy gate](#legacy-gate)). A client that sends no SNI matches only rules without `sni`. Clients that connect by IP address never send SNI.
+- The certificate is chosen by SNI (RFC 6066 §3) from `tls.cert` (the default) and `tls.certificates`: exact DNS name first, then a wildcard for one leftmost label (RFC 9525 §6.3), ASCII case-insensitive; no SNI gets the default. The accepted names are the subjectAltName DNS names of the configured certificates. The proxy reads the ClientHello first (rustls `Acceptor`); a name that no certificate carries ends the handshake with the fatal alert `unrecognized_name` before a certificate is sent (RFC 9325 §3.7). Details in [configuration.md](configuration.md#tls-server-names).
+- The SNI after the handshake is therefore always a name of the proxy. It is used by the legacy rules ([legacy gate](#legacy-gate)) and the OAUTHBEARER `host` check. A client that sends no SNI matches only rules without `sni`. Clients that connect by IP address never send SNI.
 
 ## Line reading
 

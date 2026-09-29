@@ -84,10 +84,35 @@ fn default_hostname() -> String {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tls {
-    /// PEM certificate chain served to clients.
+    /// PEM certificate chain of the default certificate: served to clients
+    /// without SNI and to those that ask for one of its names.
     pub cert: String,
     /// PEM private key.
     pub key: String,
+    /// More certificates, each chosen by the name a client asks for (SNI).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub certificates: Vec<CertKey>,
+}
+
+/// A certificate chain and its private key (PEM files).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CertKey {
+    pub cert: String,
+    pub key: String,
+}
+
+impl Tls {
+    /// Every certificate with the config key it is under (`tls`,
+    /// `tls.certificates[0]`, …), the default first.
+    pub fn pairs(&self) -> impl Iterator<Item = (String, &str, &str)> {
+        std::iter::once(("tls".to_string(), &self.cert[..], &self.key[..])).chain(
+            self.certificates
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (format!("tls.certificates[{i}]"), &c.cert[..], &c.key[..])),
+        )
+    }
 }
 
 /// A backend the proxy logs in to with the client's own credential.

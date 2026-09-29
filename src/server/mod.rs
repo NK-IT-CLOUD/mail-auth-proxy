@@ -121,7 +121,8 @@ struct Local {
 
 /// Build everything that needs no network: certificates, backends, gate.
 fn build_local(cfg: &config::Config) -> Result<Local> {
-    let certs = tls::load_server_tls(&cfg.tls.cert, &cfg.tls.key)?;
+    metrics::register_certs(cfg.tls.pairs().map(|(_, cert, _)| cert));
+    let certs = Arc::new(tls::CertStore::load(&cfg.tls)?);
     let nets = crate::auth::policy::parse_internal_nets(&cfg.scope.internal_networks)?;
     let legacy = crate::auth::legacy::Gate::new(
         &cfg.legacy,
@@ -180,19 +181,22 @@ fn keepalive(s: &config::Session) -> crate::wire::Keepalive {
 /// configuration errors, reported by validation.
 pub fn file_problems(cfg: &config::Config) -> Vec<String> {
     let mut out = Vec::new();
-    // Each file on its own first, so a missing cert does not hide a missing key.
-    let mut readable = true;
-    for (name, path) in [("tls.cert", &cfg.tls.cert), ("tls.key", &cfg.tls.key)] {
-        if path.is_empty() {
-            readable = false;
-        } else if let Err(e) = std::fs::metadata(path).and_then(|_| std::fs::File::open(path)) {
-            out.push(format!("{name}: {path}: {e}"));
-            readable = false;
+    // Each file on its own first, so a missing cert does not hide a missing
+    // key; then each pair on its own, so one bad pair does not hide another.
+    for (i, (at, cert, key)) in cfg.tls.pairs().enumerate() {
+        let mut readable = true;
+        for (name, path) in [("cert", cert), ("key", key)] {
+            if path.is_empty() {
+                readable = false;
+            } else if let Err(e) = std::fs::metadata(path).and_then(|_| std::fs::File::open(path)) {
+                out.push(format!("{at}.{name}: {path}: {e}"));
+                readable = false;
+            }
         }
-    }
-    if readable {
-        if let Err(e) = tls::load_server_tls(&cfg.tls.cert, &cfg.tls.key) {
-            out.push(format!("tls: {e:#}"));
+        if readable {
+            if let Err(e) = tls::check_pair(cert, key, i == 0) {
+                out.push(format!("{at}: {e:#}"));
+            }
         }
     }
     let mut backends = vec![("imap.backend", &cfg.imap.backend)];
@@ -244,6 +248,41 @@ pub fn file_problems(cfg: &config::Config) -> Vec<String> {
     out
 }
 
+/// What the certificate files mean for the configuration without making it
+/// invalid: a default certificate without a DNS name (clients that send SNI
+/// are refused), and legacy rule names (`sni`) that no certificate carries
+/// (clients asking for them are refused in the handshake, so the name never
+/// matches). Empty if the certificates do not load; `file_problems` reports
+/// that.
+pub fn file_warnings(cfg: &config::Config) -> Vec<String> {
+    match tls::CertStore::load(&cfg.tls) {
+        Ok(store) => tls_warnings(cfg, &store),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn tls_warnings(cfg: &config::Config, store: &tls::CertStore) -> Vec<String> {
+    let mut out = Vec::new();
+    if store.default_has_no_names() {
+        out.push(format!(
+            "tls.cert: {} has no DNS name in its subjectAltName; it serves clients without SNI only, a client that sends SNI is refused",
+            cfg.tls.cert
+        ));
+    }
+    let names = store.names();
+    for r in &cfg.legacy.rules {
+        for n in r.sni.iter().flatten() {
+            if !tls::serves(&names, n) {
+                out.push(format!(
+                    "legacy.rules[{}].sni: {n:?} is not a name of any configured certificate; a client asking for it is refused in the TLS handshake",
+                    r.name
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// How long a shutdown waits for open sessions to end before it closes them.
 const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -275,6 +314,10 @@ pub async fn run(cfg: config::Config) -> Result<()> {
         submission,
         sieve,
     } = build_local(&cfg)?;
+    tracing::info!(target: crate::obs::target::MAIN, names=?certs.names(), "TLS server names");
+    for w in tls_warnings(&cfg, &certs) {
+        tracing::warn!(target: crate::obs::target::MAIN, "config: {w}");
+    }
     if legacy.is_off() {
         tracing::info!(target: crate::obs::target::MAIN, "password auth disabled: OAuth only");
     } else {
@@ -426,9 +469,10 @@ pub async fn run(cfg: config::Config) -> Result<()> {
     Ok(())
 }
 
-/// SIGHUP: re-read the client certificate and refresh every JWKS. Each part
-/// keeps what it had when it fails; open connections are not touched. The
-/// configuration file itself is not re-read.
+/// SIGHUP: re-read the client certificates and refresh every JWKS. Each part
+/// (each certificate on its own) keeps what it had when it fails; open
+/// connections are not touched. The configuration file itself is not
+/// re-read.
 ///
 /// The refresh runs in its own task (a slow IdP can take up to the fetch
 /// timeout per issuer), so the signal loop stays free to handle SIGTERM at
@@ -438,10 +482,14 @@ fn reload(
     validator: &Arc<crate::auth::token::Validator>,
     running: &mut Option<tokio::task::JoinHandle<()>>,
 ) {
-    match certs.reload() {
-        Ok(()) => tracing::info!(target: crate::obs::target::MAIN, "reload: certificate loaded"),
-        Err(e) => {
-            tracing::error!(target: crate::obs::target::MAIN, error=%format!("{e:#}"), "reload: certificate unusable; keeping the current one")
+    for (cert, r) in certs.reload() {
+        match r {
+            Ok(()) => {
+                tracing::info!(target: crate::obs::target::MAIN, cert=%cert, "reload: certificate loaded")
+            }
+            Err(e) => {
+                tracing::error!(target: crate::obs::target::MAIN, cert=%cert, error=%format!("{e:#}"), "reload: certificate unusable; keeping the current one")
+            }
         }
     }
     if running.as_ref().is_some_and(|t| !t.is_finished()) {

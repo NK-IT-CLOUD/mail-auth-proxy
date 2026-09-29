@@ -24,7 +24,7 @@ use tokio::net::TcpStream;
 /// The submission listener's own settings.
 pub struct Submission {
     /// TLS after STARTTLS; SMTP has no ALPN identifier.
-    pub acceptor: tokio_rustls::TlsAcceptor,
+    pub acceptor: crate::server::tls::Acceptor,
     pub backend: BackendConn,
     /// Announce the client address with XCLIENT when the backend offers it.
     pub xclient: bool,

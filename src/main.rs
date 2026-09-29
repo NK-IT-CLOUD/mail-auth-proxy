@@ -73,9 +73,13 @@ async fn main() -> Result<()> {
             // Validation errors and file errors together, all of them.
             let mut problems = loaded.errors.clone();
             problems.extend(server::file_problems(&loaded.config));
+            let file_warnings = server::file_warnings(&loaded.config);
+            for w in &file_warnings {
+                tracing::warn!("config: {w}");
+            }
             if problems.is_empty() {
                 println!("{path}: configuration OK ({} warning(s)); JWKS reachability is checked at start",
-                    loaded.warnings.len());
+                    loaded.warnings.len() + file_warnings.len());
                 return Ok(());
             }
             eprintln!(

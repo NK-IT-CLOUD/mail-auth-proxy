@@ -96,7 +96,7 @@ fn rewrite_caps(be_caps: &[String], plain: bool) -> String {
 /// The ManageSieve listener's own settings and capability cache.
 pub struct Sieve {
     /// TLS after STARTTLS with ALPN `managesieve`.
-    pub acceptor: tokio_rustls::TlsAcceptor,
+    pub acceptor: crate::server::tls::Acceptor,
     pub backend: BackendConn,
     pub caps: CapsCache,
     /// How long cached backend capabilities are relayed.

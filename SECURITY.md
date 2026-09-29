@@ -66,7 +66,8 @@ relays bytes. It never holds a master password or any other credential of its ow
    - the account must not be throttled.
 
    Without rules every endpoint is OAuth-only. SNI is chosen by the client and can be
-   forged; the source address is the real boundary. A password refused anywhere is parsed
+   forged (among the names of the configured certificates; any other name is refused in
+   the handshake); the source address is the real boundary. A password refused anywhere is parsed
    only to log the attempt (with a keyed fingerprint, never in clear) and is never
    forwarded. Refusals and wrong passwords get the same reply and padded timing (see
    [Hardening](#hardening)), so the proxy does not reveal which accounts or domains
@@ -168,7 +169,7 @@ relays bytes. It never holds a master password or any other credential of its ow
   `ca_file` is set). Keep it limited to CAs you trust to vouch for your identity
   provider.
 - **Certificates.** Send the proxy `SIGHUP` after a renewal and check the log: a
-  certificate that fails to load is logged and the old one stays in use
+  certificate that fails to load is logged with its file and the old one stays in use
   ([INSTALL.md](INSTALL.md#certificates)).
 
 ### Offering legacy passwords to the internet

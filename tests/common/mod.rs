@@ -7,7 +7,7 @@
 //!
 //! - `Pki`: an rcgen CA, the proxy certificate (mail.internal.test,
 //!   mail.public.test and the listener IPs) and the backend certificate
-//!   (backend.test), written to a temp dir.
+//!   (backend.test), written to a temp dir; `issue` makes more from the CA.
 //! - `Idp`: a P-256 key served as JWKS over plain http on 127.0.0.1 and a
 //!   token minter with Keycloak-like defaults.
 //! - `MockBackend`: records what each backend connection carried (PROXY v2
@@ -27,8 +27,8 @@
 //!   killed, and every `authresult` line it wrote must match the CrowdSec grok
 //!   pattern. `HARNESS_LOGS=1 cargo test -- --nocapture` prints its stderr.
 //! - `Client`: TCP from 127.0.0.1 (internal) or 127.0.0.2 (external), TLS
-//!   trusting the test CA with SNI mail.internal.test, mail.public.test or
-//!   none (connect by IP).
+//!   trusting the test CA with SNI mail.internal.test, mail.public.test,
+//!   another name, or none (connect by IP).
 #![allow(dead_code)] // each test binary uses its own subset
 
 use base64::Engine as _;
@@ -142,6 +142,16 @@ pub struct Pki {
     /// Server config with the proxy's certificate (valid for 127.0.0.1), for
     /// a mock doveadm over https.
     pub proxy_server: Arc<rustls::ServerConfig>,
+    /// The proxy certificate as DER (the default certificate).
+    pub proxy_der: Vec<u8>,
+    ca: rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
+}
+
+/// A certificate `Pki::issue` wrote: its files and its DER.
+pub struct Issued {
+    pub cert: PathBuf,
+    pub key: PathBuf,
+    pub der: Vec<u8>,
 }
 
 impl Pki {
@@ -247,6 +257,34 @@ impl Pki {
             client: Arc::new(client),
             backend: Arc::new(backend),
             proxy_server: Arc::new(proxy_server),
+            proxy_der: proxy_cert.der().to_vec(),
+            ca,
+        }
+    }
+
+    /// A server certificate from the test CA for the DNS `names`, written to
+    /// `<file>.pem` and `<file>.key`; `not_after` as (year, month, day), or
+    /// rcgen's default (4096-01-01).
+    pub fn issue(&self, file: &str, names: &[&str], not_after: Option<(i32, u8, u8)>) -> Issued {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut p =
+            rcgen::CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
+                .unwrap();
+        p.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        if let Some((y, m, d)) = not_after {
+            p.not_after = rcgen::date_time_ymd(y, m, d);
+        }
+        let cert = p.signed_by(&key, &self.ca).unwrap();
+        let (cert_file, key_file) = (
+            self.dir.path().join(format!("{file}.pem")),
+            self.dir.path().join(format!("{file}.key")),
+        );
+        std::fs::write(&cert_file, cert.pem()).unwrap();
+        std::fs::write(&key_file, key.serialize_pem()).unwrap();
+        Issued {
+            cert: cert_file,
+            key: key_file,
+            der: cert.der().to_vec(),
         }
     }
 }
@@ -1185,6 +1223,8 @@ pub struct Opts {
     pub session: Option<String>,
     /// The ManageSieve backend is down when the proxy starts.
     pub sieve_down: bool,
+    /// `[[tls.certificates]]` besides the default certificate (cert, key).
+    pub tls_certificates: Vec<(PathBuf, PathBuf)>,
 }
 
 impl Default for Opts {
@@ -1202,6 +1242,7 @@ impl Default for Opts {
             ratelimit: None,
             session: None,
             sieve_down: false,
+            tls_certificates: Vec::new(),
         }
     }
 }
@@ -1291,7 +1332,7 @@ hostname = "{HOSTNAME}"
 [tls]
 cert = "{cert}"
 key = "{key}"
-
+{tls_certificates}
 [imap]
 listen = "{IMAP_IP}:0"
 backend = {imap_be}
@@ -1329,6 +1370,15 @@ connect_secs = 3
 "#,
             cert = pki.proxy_cert.display(),
             key = pki.proxy_key.display(),
+            tls_certificates = opts
+                .tls_certificates
+                .iter()
+                .map(|(c, k)| format!(
+                    "[[tls.certificates]]\ncert = \"{}\"\nkey = \"{}\"\n",
+                    c.display(),
+                    k.display()
+                ))
+                .collect::<String>(),
             imap_be = backend(imap, true),
             smtp_be = backend(smtp, false),
             xclient = opts.smtp_xclient,
@@ -1836,6 +1886,8 @@ pub enum Sni {
     Public,
     /// Connect by IP address: no SNI at all.
     None,
+    /// Any other name.
+    Name(&'static str),
 }
 
 /// Where the client connects from.
@@ -1943,6 +1995,7 @@ impl Client {
             Sni::Public => rustls::pki_types::ServerName::try_from(PUBLIC_SNI).unwrap(),
             // An IP address as the server name: rustls sends no SNI.
             Sni::None => rustls::pki_types::ServerName::IpAddress(self.server.ip().into()),
+            Sni::Name(n) => rustls::pki_types::ServerName::try_from(n).unwrap(),
         };
         let connector = tokio_rustls::TlsConnector::from(client);
         let tls = tokio::time::timeout(IO_TIMEOUT, connector.connect(name, tcp))

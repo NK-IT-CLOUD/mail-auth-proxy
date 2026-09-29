@@ -22,8 +22,9 @@ Requirement levels (MUST, SHOULD, MAY) are those of the cited text; an empty Lev
 | renegotiation_info, extended_master_secret | MUST | RFC 9325 §3.5 | Yes | rustls; renegotiation is refused |
 | 0-RTT data | | RFC 9325 §3.10, RFC 8446 §8 | Yes (disabled) | |
 | No resumption across different SNI | MUST | RFC 6066 §3 | Yes | rustls checks the SNI on resumption |
-| SNI supported | MUST | RFC 9325 §3.7 | Yes | SNI is read after the handshake. It is used, together with the client address, by the legacy (password) rules. |
-| Reject an unrecognised server name | SHOULD | RFC 9325 §3.7 | Deviation | One certificate is served for every name. See D-TLS-1. |
+| SNI supported | MUST | RFC 9325 §3.7 | Yes | The certificate is chosen by SNI (`tls.cert`, `tls.certificates`); without SNI the default `tls.cert`. After the handshake the name is used by the legacy (password) rules and the OAUTHBEARER `host` check. |
+| Certificate chosen by name: exact DNS name, a wildcard only as the whole leftmost label and for one label, no CN | | RFC 9525 §6.3, §2 (formerly RFC 6125 §6.4.3) | Yes | The accepted names are the subjectAltName DNS names of the configured certificates. An exact name wins over a wildcard; ASCII case-insensitive, a trailing dot ignored. |
+| Reject an unrecognised server name | SHOULD | RFC 9325 §3.7, RFC 6066 §3 | Yes | Fatal `unrecognized_name` alert, before a certificate is sent. |
 | ALPN supported; reject a non-matching ALPN | MUST / advised | RFC 9325 §3.8, RFC 7301 §3.2 | Yes | IMAP `imap`, ManageSieve `managesieve` (IANA). A client that offers ALPN without it gets the `no_application_protocol` alert; one that offers none is accepted. SMTP has no ALPN identifier and ignores ALPN. |
 | Implicit TLS for IMAP (port 993) | SHOULD | RFC 8314 §3.2 | Yes | |
 | Implicit TLS for submission (port 465) | SHOULD | RFC 8314 §3.3, RFC 9325 §3.2 | No | Only STARTTLS on 587. See D-SMTP-1. |
@@ -207,7 +208,7 @@ Metric names follow the Prometheus naming guidelines: an application prefix (`ma
 | `mail_auth_proxy_active_connections{proto}` | gauge |
 | `mail_auth_proxy_upstream_forward_total{proto}` | counter |
 | `mail_auth_proxy_sessions_ended_total{proto,reason}` | counter |
-| `mail_auth_proxy_tls_cert_expiry_timestamp_seconds` | gauge |
+| `mail_auth_proxy_tls_cert_expiry_timestamp_seconds{cert}` | gauge |
 | `mail_auth_proxy_jwks_last_success_timestamp_seconds{issuer}` | gauge |
 | `mail_auth_proxy_jwks_refresh_failures_total{issuer}` | counter |
 | `mail_auth_proxy_jwks_keys_skipped_total{issuer}` | counter |
@@ -260,11 +261,6 @@ The LOGIN mechanism is server-first, so RFC 4954 §4 and RFC 4959 §3 require th
 - `host` is compared with the TLS server name when the client sent SNI. Without SNI (a client that connects by IP address) the proxy does not know which name the client used, so `host` is not compared.
 - `port` is never compared: behind NAT or port forwarding the port the client dialed differs from the one the proxy listens on.
 - Tokens are bound to the service by their audience.
-
-### D-TLS-1: server name
-
-- One certificate is served for every server name, whatever name the client sends.
-- RFC 9325 §3.7 recommends rejecting unknown names to prevent cross-protocol attacks (ALPACA). ALPN (§3.8) protects IMAP and ManageSieve; SMTP has no ALPN identifier, so on the submission port nothing replaces the name check.
 
 ### D-IMAP-3: `IMAP4rev2` is not advertised before login
 
@@ -328,6 +324,7 @@ The configured server name is used in greetings and in the backend EHLO. It must
 - RFC 9110 HTTP Semantics (auth-scheme): https://www.rfc-editor.org/rfc/rfc9110.html#section-11.1
 - RFC 9293 TCP: https://www.rfc-editor.org/rfc/rfc9293.html#section-3.8.4
 - RFC 9325 TLS BCP: https://www.rfc-editor.org/rfc/rfc9325.html#section-3
+- RFC 9525 Service Identity in TLS (obsoletes RFC 6125): https://www.rfc-editor.org/rfc/rfc9525.html#section-6.3
 - draft-murchison-sasl-login-00: https://datatracker.ietf.org/doc/html/draft-murchison-sasl-login-00
 - Google XOAUTH2: https://developers.google.com/workspace/gmail/imap/xoauth2-protocol
 - PROXY protocol: https://www.haproxy.org/download/3.2/doc/proxy-protocol.txt

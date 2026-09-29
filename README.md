@@ -82,7 +82,7 @@ accepts a password only where a rule allows it.
 **Operations**
 - One fixed `authresult` log line per login, made for log-based blocking; CrowdSec parser
   and scenarios in [contrib/crowdsec](contrib/crowdsec/).
-- Optional Prometheus metrics, systemd unit with `Type=notify`, `SIGHUP` reloads certificate
+- Optional Prometheus metrics, systemd unit with `Type=notify`, `SIGHUP` reloads certificates
   and JWKS without dropping connections.
 - Connection caps, per-IP pre-auth cap, a pre-auth time budget and size limits on lines,
   literals, tokens and passwords.
@@ -179,7 +179,7 @@ journalctl -u mail-auth-proxy -n 20                                     # expect
 ```
 
 Log in with a mail client and look for `authresult result="ok"` in the journal. After a
-certificate renewal, `systemctl reload mail-auth-proxy` loads the new certificate and
+certificate renewal, `systemctl reload mail-auth-proxy` loads the new certificates and
 refreshes the JWKS without closing open connections; a configuration change needs a restart.
 
 <details>
@@ -229,7 +229,7 @@ authentication, so keep it on loopback or a management network.
 | `mail_auth_proxy_upstream_forward_total` | sessions spliced to a backend |
 | `mail_auth_proxy_backend_login_duration_seconds` | histogram of successful backend logins |
 | `mail_auth_proxy_jwks_last_success_timestamp_seconds` | last JWKS fetch with usable keys, per issuer |
-| `mail_auth_proxy_tls_cert_expiry_timestamp_seconds` | expiry of the certificate in use |
+| `mail_auth_proxy_tls_cert_expiry_timestamp_seconds` | expiry of each certificate in use (label `cert`) |
 
 The complete list with labels, including `mail_auth_proxy_build_info`,
 `process_start_time_seconds`, the JWKS refresh failures and skipped keys, the legacy-gate and the other

@@ -412,14 +412,39 @@ pub fn record_jwks_keys_skipped(issuer: &str, n: u64) {
     }
 }
 
-// notAfter (Unix s) of the client-facing certificate in use; 0 until loaded
-// or when it cannot be read.
-static CERT_NOT_AFTER: AtomicU64 = AtomicU64::new(0);
+/// The client-facing certificate from one configured file.
+struct CertStats {
+    /// The certificate file: the `cert` label value.
+    cert: String,
+    /// notAfter (Unix s) of the certificate in use; 0 until loaded or when it
+    /// cannot be read.
+    not_after: AtomicU64,
+}
 
-/// Record the `notAfter` of the certificate now served (Unix seconds, 0 if
-/// unknown).
-pub fn set_cert_not_after(unix: u64) {
-    CERT_NOT_AFTER.store(unix, Ordering::Relaxed);
+// The configured certificate files, set once at startup; the label set is
+// fixed then (the configuration is not re-read).
+static CERTS: std::sync::OnceLock<Vec<CertStats>> = std::sync::OnceLock::new();
+
+/// Register the configured certificate files (the `cert` label values of
+/// the certificate expiry). Only the first call counts.
+pub fn register_certs<'a>(certs: impl IntoIterator<Item = &'a str>) {
+    let _ = CERTS.set(
+        certs
+            .into_iter()
+            .map(|c| CertStats {
+                cert: c.to_string(),
+                not_after: AtomicU64::new(0),
+            })
+            .collect(),
+    );
+}
+
+/// Record the `notAfter` of the certificate now served from the file `cert`
+/// (Unix seconds, 0 if unknown). A file that was not registered is ignored.
+pub fn set_cert_not_after(cert: &str, unix: u64) {
+    if let Some(s) = CERTS.get().and_then(|v| v.iter().find(|s| s.cert == cert)) {
+        s.not_after.store(unix, Ordering::Relaxed);
+    }
 }
 
 // Unix time (s) the server started; see `mark_process_start`.
@@ -621,12 +646,15 @@ fn render() -> String {
         }
     }
 
-    o.push_str("# HELP mail_auth_proxy_tls_cert_expiry_timestamp_seconds Unix time the served certificate expires (notAfter); 0 if unreadable.\n");
+    o.push_str("# HELP mail_auth_proxy_tls_cert_expiry_timestamp_seconds Unix time the served certificate expires (notAfter), by certificate file; 0 if unreadable.\n");
     o.push_str("# TYPE mail_auth_proxy_tls_cert_expiry_timestamp_seconds gauge\n");
-    o.push_str(&format!(
-        "mail_auth_proxy_tls_cert_expiry_timestamp_seconds {}\n",
-        CERT_NOT_AFTER.load(Ordering::Relaxed)
-    ));
+    for c in CERTS.get().map_or(&[][..], |v| &v[..]) {
+        o.push_str(&format!(
+            "mail_auth_proxy_tls_cert_expiry_timestamp_seconds{{cert=\"{}\"}} {}\n",
+            escape_label(&c.cert),
+            c.not_after.load(Ordering::Relaxed)
+        ));
+    }
 
     let issuers = ISSUERS.get().map_or(&[][..], |v| &v[..]);
     o.push_str("# HELP mail_auth_proxy_jwks_last_success_timestamp_seconds Unix time of the last JWKS fetch with usable keys, by issuer.\n");
@@ -949,7 +977,17 @@ mod tests {
         record_jwks_fetch(issuer, false);
         record_jwks_fetch("https://unregistered.test", false);
         record_jwks_keys_skipped("https://unregistered.test", 1);
+        // Certificate files: one series each, the file as label (escaped).
+        register_certs(["/etc/tls/default.pem", "/etc/tls/\"odd\"\\.pem"]);
+        set_cert_not_after("/etc/tls/\"odd\"\\.pem", 1_900_000_000);
+        set_cert_not_after("/etc/tls/unregistered.pem", 1);
         let out = render();
+        assert!(out.contains(
+            "mail_auth_proxy_tls_cert_expiry_timestamp_seconds{cert=\"/etc/tls/default.pem\"} 0\n"
+        ));
+        assert!(out.contains(
+            "mail_auth_proxy_tls_cert_expiry_timestamp_seconds{cert=\"/etc/tls/\\\"odd\\\"\\\\.pem\"} 1900000000\n"
+        ));
         assert!(out.contains(
             "mail_auth_proxy_jwks_refresh_failures_total{issuer=\"https://idp.test/\\\"realm\\\"\\\\x\"} 1\n"
         ));

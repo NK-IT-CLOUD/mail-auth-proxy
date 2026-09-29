@@ -21,7 +21,7 @@ use tokio::net::TcpStream;
 /// The IMAP listener's own settings.
 pub struct Imap {
     /// TLS with ALPN `imap`.
-    pub acceptor: tokio_rustls::TlsAcceptor,
+    pub acceptor: crate::server::tls::Acceptor,
     pub backend: BackendConn,
 }
 

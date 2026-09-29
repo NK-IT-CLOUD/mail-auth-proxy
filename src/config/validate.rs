@@ -42,8 +42,17 @@ impl Config {
         }
         // Empty file paths are reported here only; `server::file_problems`
         // skips them.
-        for (name, path) in [("tls.cert", &self.tls.cert), ("tls.key", &self.tls.key)] {
-            check_path(name, Some(path), &mut err);
+        let mut certs: Vec<(String, &str)> = Vec::new();
+        for (at, cert, key) in self.tls.pairs() {
+            check_path(&format!("{at}.cert"), Some(cert), &mut err);
+            check_path(&format!("{at}.key"), Some(key), &mut err);
+            // The file names the certificate in the metrics and the reload log.
+            match certs.iter().find(|(_, c)| *c == cert) {
+                Some((first, _)) if !cert.is_empty() => {
+                    err(format!("{at}.cert = {cert:?} is already {first}.cert"));
+                }
+                _ => certs.push((at, cert)),
+            }
         }
 
         let mut listens = vec![("imap.listen", &self.imap.listen)];
@@ -1094,6 +1103,61 @@ mod tests {
         crate::config::parse(text)
             .map(|l| l.errors.join("\n"))
             .unwrap_or_else(|e| format!("parse: {e}"))
+    }
+
+    /// `[[tls.certificates]]` next to the `[tls]` default: every path is
+    /// checked under its own key, a certificate file may appear once, and
+    /// the printed form keeps the list.
+    #[test]
+    fn tls_certificates() {
+        let with =
+            |list: &str| V2.replace("key = \"/k.pem\"\n", &format!("key = \"/k.pem\"\n{list}"));
+        let entry = |c: &str, k: &str| format!("[[tls.certificates]]\ncert = {c:?}\nkey = {k:?}\n");
+
+        let text = with(&(entry("/t.pem", "/t.key") + &entry("/w.pem", "/k.pem")));
+        let c = parse(&text).unwrap().config;
+        let pairs: Vec<_> = c.tls.pairs().collect();
+        assert_eq!(
+            pairs,
+            [
+                ("tls".to_string(), "/c.pem", "/k.pem"),
+                ("tls.certificates[0]".to_string(), "/t.pem", "/t.key"),
+                ("tls.certificates[1]".to_string(), "/w.pem", "/k.pem"),
+            ]
+        );
+        let printed = toml::to_string(&c).unwrap();
+        assert!(printed.contains("[[tls.certificates]]"), "{printed}");
+        assert_eq!(parse(&printed).unwrap().config.tls.certificates.len(), 2);
+        // Without the list the printed form is the one of before.
+        let printed = toml::to_string(&parse(V2).unwrap().config).unwrap();
+        assert!(!printed.contains("certificates"), "{printed}");
+
+        for (list, want) in [
+            (entry("", "/t.key"), "tls.certificates[0].cert is empty"),
+            (entry("/t.pem", ""), "tls.certificates[0].key is empty"),
+            (
+                entry("t.pem", "/t.key"),
+                "tls.certificates[0].cert = \"t.pem\" must be an absolute path",
+            ),
+            (
+                entry("/c.pem", "/t.key"),
+                "tls.certificates[0].cert = \"/c.pem\" is already tls.cert",
+            ),
+            (
+                entry("/t.pem", "/t.key") + &entry("/t.pem", "/u.key"),
+                "tls.certificates[1].cert = \"/t.pem\" is already tls.certificates[0].cert",
+            ),
+        ] {
+            let errors = crate::config::parse(&with(&list)).unwrap().errors;
+            assert_eq!(errors, [want], "{list}");
+        }
+        // Keys are checked per entry: an unknown key is a schema error.
+        assert!(crate::config::parse(&with(
+            "[[tls.certificates]]\ncert = \"/t.pem\"\nkey = \"/t.key\"\nsni = []\n"
+        ))
+        .is_err());
+        // Both files of an entry are required.
+        assert!(crate::config::parse(&with("[[tls.certificates]]\ncert = \"/t.pem\"\n")).is_err());
     }
 
     /// The shipped example is valid and gives no warning.

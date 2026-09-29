@@ -35,7 +35,7 @@ The file is strict. Startup fails, and `--check-config` reports, when:
 - a key is unknown or misspelled, or `config_version = 2` is missing;
 - a required value is missing or empty, a listener is not `ip:port`, a backend is not
   `host:port` or its certificate name is invalid;
-- a file path is set to `""`: `tls.cert`, `tls.key`, a backend `ca_file`, `users_file`,
+- a file path is set to `""`: `tls.cert`, `tls.key`, `tls.certificates[].cert`/`.key`, a backend `ca_file`, `users_file`,
   `domains_file`, `doveadm_key_file` or `doveadm_ca_file` (`<key> is empty`;
   `--check-config` reports it once, without a file error on top);
 - two listeners (the metrics endpoint included, when enabled) take the same port on the
@@ -44,7 +44,9 @@ The file is strict. Startup fails, and `--check-config` reports, when:
   (`net.ipv6.bindv6only = 0`), so `[::]:993` and `0.0.0.0:993` clash. Port 0 never
   clashes;
 - `server.hostname` is not a host name (see the key below);
-- a file path (`tls.cert`, `tls.key`, `*.backend.ca_file`, `legacy.domains_file`,
+- the same certificate file is configured twice (`tls.cert` and `tls.certificates[].cert`
+  together): it names the certificate in the metrics and the reload log;
+- a file path (`tls.cert`, `tls.key`, `tls.certificates[]`, `*.backend.ca_file`, `legacy.domains_file`,
   `legacy.doveadm_key_file`, `legacy.doveadm_ca_file`, `legacy.rules[].users_file`) is
   empty or not absolute: a relative path would depend on the working directory;
 - a JWKS URL or `doveadm_url` is not `https://` (plain `http://` is allowed only for
@@ -83,7 +85,7 @@ by that group and by nobody else, for example `root:mail-auth-proxy` mode `0640`
 | Section | Purpose |
 |---|---|
 | `[server]` | the name used in greetings and EHLO |
-| `[tls]` | certificate and key served to clients |
+| `[tls]`, `[[tls.certificates]]` | the default certificate and key, and more certificates chosen by SNI |
 | `[imap]`, `[submission]`, `[sieve]` | listener and backend per protocol; `[imap]` is required, omit `[submission]` or `[sieve]` to disable them |
 | `[oauth]`, `[[oauth.issuers]]` | JWKS refresh and clock skew; one entry per issuer with its token rules |
 | `[[legacy.rules]]` | legacy passwords: which source networks, names, protocols, mechanisms and users may use them |
@@ -105,7 +107,8 @@ backend `.…` keys below, written inline (`backend = { address = "…" }`) or a
 |---|---|---|---|
 | `config_version` | integer | required | must be `2`, set at the top before the first `[section]`; a file without it fails with `config_version is missing: the file must set config_version = 2 …` |
 | `server.hostname` | string | `mail-auth-proxy` | name in the IMAP/SMTP/Sieve greetings, EHLO replies and the backend EHLO. A host name as SMTP defines it (RFC 5321 §4.1.2): labels of letters, digits and hyphens separated by dots, 1-63 characters each without a hyphen at either end, at most 253 in all, no trailing dot. IP addresses and address literals (`[192.0.2.1]`) are refused, because the EHLO reply takes a domain only. A single label, the default included, gives a warning: the backend EHLO takes the fully-qualified primary host name (RFC 5321 §4.1.4, §2.3.5) |
-| `tls.cert`, `tls.key` | path | required | PEM chain and key served for every SNI |
+| `tls.cert`, `tls.key` | path | required | PEM chain and key of the default certificate: served to clients without SNI and to those that ask for one of its DNS names |
+| `tls.certificates[].cert`, `.key` | path | none | more certificates (`[[tls.certificates]]`, one table each), each served to clients that ask for one of its DNS names. Each must carry at least one DNS name ([TLS server names](#tls-server-names)) |
 | `imap.listen` | `ip:port` | required | implicit-TLS listener |
 | `imap.backend` | backend | required | implicit-TLS IMAP backend |
 | `submission.listen` | `ip:port` | section optional | STARTTLS listener; omit the section to disable SMTP |
@@ -137,7 +140,7 @@ backend `.…` keys below, written inline (`backend = { address = "…" }`) or a
 | `scope.internal_networks` | array of CIDR | empty (default: the `[password_gate]` networks) | label `scope=internal` in logs and metrics; allows nothing |
 | `legacy.rules[].name` | string | required | unique, 1-64 of `A-Z a-z 0-9 . _ -`; logged as `rule=` |
 | `legacy.rules[].networks` | array of CIDR | required | client source networks; the rule's security boundary |
-| `legacy.rules[].sni` | array | any SNI (also none) | names the client must have asked for |
+| `legacy.rules[].sni` | array | any SNI (also none) | names the client must have asked for; each should be a name of a configured certificate ([TLS server names](#tls-server-names)) |
 | `legacy.rules[].users` | array | any user | `user@domain` (local part exact, domain case-insensitive) or `*@domain` |
 | `legacy.rules[].users_file` | path | none | more `users` entries, one per line, `#` comments; re-read on change |
 | `legacy.rules[].protocols` | `imap` \| `submission` \| `sieve` | all | protocols the rule applies to |
@@ -175,6 +178,48 @@ backend `.…` keys below, written inline (`backend = { address = "…" }`) or a
 | `session.keepalive_count` | integer | 5 | unanswered probes before the kernel drops the connection; 2-127 (RFC 9293 §3.8.4: one lost probe must not end a connection). With the defaults a dead peer is dropped after at most 15 minutes of silence |
 | `session.idle_limit_secs` | integer | off | after login: close the session after this long without a byte in either direction; 1-2592000. Below 1800 gives a warning: IMAP and ManageSieve clients may rely on at least 30 minutes (RFC 9051 §5.4, RFC 5804 §1.2), and IDLE clients re-issue IDLE only every 29 minutes (RFC 9051 §6.3.13) |
 | `session.max_session_secs` | integer | off | after login: close the session this long after the login, busy or not; 1-2592000; below 1800 gives the same warning |
+
+## TLS server names
+
+The names a client may ask for with SNI (RFC 6066 §3) are the DNS names in the
+subjectAltName of the configured certificates; there is no separate list. For a client
+that sends SNI the proxy serves:
+
+1. the first certificate (`tls.cert`, then `tls.certificates` in order) that carries the
+   name itself;
+2. else the first one with a wildcard for it: `*.example.org` covers exactly one leftmost
+   label, so `imap.example.org` but neither `example.org` nor `a.b.example.org`
+   (RFC 9525 §6.3). A wildcard needs two labels after `*.`; `*.org` covers nothing.
+
+Names compare ASCII case-insensitively, a trailing dot is ignored. The subject CN is not a
+name (RFC 9525 §2), nor is an IP address in the subjectAltName.
+
+A client that sends no SNI (it connected by IP address) gets the default certificate
+`tls.cert`. A client that asks for a name no certificate carries is refused in the
+handshake with the fatal alert `unrecognized_name`, before any certificate is sent
+(RFC 9325 §3.7: the server SHOULD NOT continue). So `legacy.rules[].sni` and the
+OAUTHBEARER `host` check only ever see names of the proxy.
+
+`--check-config` loads every pair and reports each unusable one under its own key, and a
+certificate in `tls.certificates` without a DNS name (only SNI selects it). It warns when
+the default certificate has no DNS name (then every client that sends SNI is refused) and
+when a `legacy.rules[].sni` name is carried by no certificate (a client asking for it is
+refused, so the rule never matches with it). At startup the log line `TLS server names`
+lists every name.
+
+```toml
+[tls]
+cert = "/etc/mail-auth-proxy/tls/example.org.pem"      # mail.example.org, no SNI
+key = "/etc/mail-auth-proxy/tls/example.org.key"
+
+[[tls.certificates]]
+cert = "/etc/mail-auth-proxy/tls/example.net.pem"      # mail.example.net
+key = "/etc/mail-auth-proxy/tls/example.net.key"
+
+[[tls.certificates]]
+cert = "/etc/mail-auth-proxy/tls/wildcard.pem"         # *.example.com
+key = "/etc/mail-auth-proxy/tls/wildcard.key"
+```
 
 Environment: `RUST_LOG` (log filter, default `info`; see [operations.md](operations.md#logging)).
 

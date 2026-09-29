@@ -19,9 +19,12 @@ key = "/path/to/privkey.pem"                  # readable by group mail-auth-prox
 # More certificates, each served to clients that ask (SNI) for one of its DNS
 # names (subjectAltName; `*.example.net` covers one label). A client that asks
 # for a name no certificate carries is refused in the TLS handshake.
-# [[tls.certificates]]
-# cert = "/path/to/example.net/fullchain.pem"
-# key = "/path/to/example.net/privkey.pem"
+[[tls.certificates]]
+cert = "/path/to/example.net/fullchain.pem"
+key = "/path/to/example.net/privkey.pem"
+[[tls.certificates]]
+cert = "/path/to/wildcard.example.org/fullchain.pem"
+key = "/path/to/wildcard.example.org/privkey.pem"
 
 # ── Protocols ────────────────────────────────────────────────────────────────
 # Every backend connection is TLS-verified: against `verify_name` (default: the

@@ -1,4 +1,4 @@
-//! TLS material: the client-facing certificate and the backend trust anchors.
+//! TLS material: the client-facing certificates and the backend trust anchors.
 
 use anyhow::Result;
 use rustls::crypto::CryptoProvider;
@@ -6,37 +6,193 @@ use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use std::sync::{Arc, RwLock};
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 
-/// The client-facing certificate, replaceable while the server runs.
+/// The client-facing certificates, each replaceable while the server runs.
 ///
-/// rustls asks the resolver for the certificate on every handshake, so a
+/// The first is the default: it serves clients that send no SNI. A client
+/// that sends one gets the certificate that carries the name (a DNS name in
+/// its subjectAltName); a name no certificate carries is refused
+/// (`Acceptor::accept`). rustls asks the resolver on every handshake, so a
 /// `reload` takes effect for the next connection; established sessions keep
 /// the certificate they were opened with.
 #[derive(Debug)]
-pub(super) struct CertStore {
+pub(crate) struct CertStore {
+    provider: Arc<CryptoProvider>,
+    entries: Vec<Entry>,
+}
+
+/// One configured certificate and key file.
+#[derive(Debug)]
+struct Entry {
     cert: String,
     key: String,
-    provider: Arc<CryptoProvider>,
-    current: RwLock<Arc<CertifiedKey>>,
+    current: RwLock<Arc<Served>>,
+}
+
+/// A loaded certificate: what rustls serves and the names SNI selects it by.
+#[derive(Debug)]
+struct Served {
+    key: Arc<CertifiedKey>,
+    /// The dNSName entries of the subjectAltName, lowercase and without a
+    /// trailing dot; a wildcard as `*.` plus at least two labels.
+    names: Vec<String>,
 }
 
 impl CertStore {
-    /// Re-read the certificate and key files. On any error the certificate
-    /// in use stays.
-    pub(super) fn reload(&self) -> Result<()> {
-        let fresh = load_certified_key(&self.cert, &self.key, &self.provider)?;
-        *self.current.write().unwrap_or_else(|p| p.into_inner()) = in_use(fresh);
-        Ok(())
+    /// Load every pair of `tls` (the default first). Any unusable pair fails.
+    pub(crate) fn load(tls: &crate::config::Tls) -> Result<CertStore> {
+        let provider = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .crypto_provider()
+            .clone();
+        let entries = tls
+            .pairs()
+            .enumerate()
+            .map(|(i, (_, cert, key))| {
+                let served = load_served(cert, key, i == 0, &provider)?;
+                Ok(Entry {
+                    cert: cert.to_string(),
+                    key: key.to_string(),
+                    current: RwLock::new(in_use(cert, served)),
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(CertStore { provider, entries })
+    }
+
+    /// Re-read every certificate and key file. A pair that fails keeps the
+    /// certificate it had; the others are replaced. The result names each
+    /// certificate file with its outcome, in configuration order.
+    pub(crate) fn reload(&self) -> Vec<(&str, Result<()>)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let r = load_served(&e.cert, &e.key, i == 0, &self.provider).map(|fresh| {
+                    *e.current.write().unwrap_or_else(|p| p.into_inner()) = in_use(&e.cert, fresh);
+                });
+                (e.cert.as_str(), r)
+            })
+            .collect()
+    }
+
+    /// Every name a client may ask for (SNI), in configuration order.
+    pub(crate) fn names(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .flat_map(|e| e.served().names.clone())
+            .collect()
+    }
+
+    /// Whether the default certificate carries no DNS name.
+    pub(crate) fn default_has_no_names(&self) -> bool {
+        self.entries[0].served().names.is_empty()
+    }
+
+    /// The certificate for a client that asked for `sni`, if any serves it.
+    fn select(&self, sni: Option<&str>) -> Option<Arc<CertifiedKey>> {
+        let served: Vec<Arc<Served>> = self.entries.iter().map(Entry::served).collect();
+        let names: Vec<&[String]> = served.iter().map(|s| &s.names[..]).collect();
+        pick(&names, sni).map(|i| served[i].key.clone())
     }
 }
 
-/// The certificate now served; its expiry goes to the metrics.
-fn in_use(ck: CertifiedKey) -> Arc<CertifiedKey> {
+impl Entry {
+    fn served(&self) -> Arc<Served> {
+        self.current
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+}
+
+/// A name as SNI compares it: ASCII lowercase, without a trailing dot.
+fn normalize(name: &str) -> String {
+    name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase()
+}
+
+/// Which of the certificates with `names` serves `sni`. Without SNI the
+/// first (the default). Otherwise the first that carries the name itself,
+/// else the first with a wildcard for it: `*.example.org` stands for exactly
+/// one leftmost label, so it covers `a.example.org` but neither
+/// `example.org` nor `a.b.example.org` (RFC 9525 §6.3, formerly RFC 6125
+/// §6.4.3). `None` if no
+/// certificate carries the name.
+fn pick(names: &[&[String]], sni: Option<&str>) -> Option<usize> {
+    let Some(sni) = sni else {
+        return (!names.is_empty()).then_some(0);
+    };
+    let sni = normalize(sni);
+    let wildcard = sni
+        .split_once('.')
+        .filter(|(label, _)| !label.is_empty())
+        .map(|(_, parent)| format!("*.{parent}"));
+    names
+        .iter()
+        .position(|n| n.contains(&sni))
+        .or_else(|| wildcard.and_then(|w| names.iter().position(|n| n.contains(&w))))
+}
+
+/// Whether `names` (of one or more certificates) serve a client asking for
+/// `sni`.
+pub(crate) fn serves(names: &[String], sni: &str) -> bool {
+    pick(&[names], Some(sni)).is_some()
+}
+
+/// Whether `cert` and `key` load as a pair, the default certificate or
+/// (`default` false) one chosen by SNI.
+pub(crate) fn check_pair(cert: &str, key: &str, default: bool) -> Result<()> {
+    let provider = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .crypto_provider()
+        .clone();
+    load_served(cert, key, default, &provider).map(|_| ())
+}
+
+/// The DNS names of a certificate: the subjectAltName dNSName entries only
+/// (RFC 9525 §2: the subject CN does not identify a service). A wildcard
+/// needs two labels after `*.`, so `*.org` covers nothing.
+fn dns_names(der: &CertificateDer<'_>) -> Result<Vec<String>> {
+    let cert = webpki::EndEntityCert::try_from(der)
+        .map_err(|e| anyhow::anyhow!("certificate does not parse: {e}"))?;
+    Ok(cert
+        .valid_dns_names()
+        .map(normalize)
+        .filter(|n| {
+            n.strip_prefix("*.")
+                .is_none_or(|parent| parent.contains('.'))
+        })
+        .collect())
+}
+
+/// Load one pair. A certificate other than the default (`default` false) is
+/// only ever chosen by SNI, so it must carry a DNS name.
+fn load_served(cert: &str, key: &str, default: bool, provider: &CryptoProvider) -> Result<Served> {
+    let ck = load_certified_key(cert, key, provider)?;
+    let names = dns_names(ck.end_entity_cert()?).map_err(|e| anyhow::anyhow!("{cert}: {e}"))?;
+    if names.is_empty() && !default {
+        anyhow::bail!("{cert}: no DNS name in the subjectAltName; only the default certificate (tls.cert) serves clients without SNI");
+    }
+    Ok(Served {
+        key: Arc::new(ck),
+        names,
+    })
+}
+
+/// The certificate now served from the file `cert`; its expiry goes to the
+/// metrics.
+fn in_use(cert: &str, served: Served) -> Arc<Served> {
     // `load_certified_key` never returns an empty chain; the leaf is first.
-    let not_after = ck.cert.first().and_then(|c| not_after(c)).unwrap_or(0);
-    crate::obs::metrics::set_cert_not_after(not_after);
-    Arc::new(ck)
+    let not_after = served
+        .key
+        .cert
+        .first()
+        .and_then(|c| not_after(c))
+        .unwrap_or(0);
+    crate::obs::metrics::set_cert_not_after(cert, not_after);
+    Arc::new(served)
 }
 
 /// One DER element: tag, contents and what follows it. Definite lengths of
@@ -121,13 +277,8 @@ pub(crate) fn not_after(der: &[u8]) -> Option<u64> {
 }
 
 impl ResolvesServerCert for CertStore {
-    fn resolve(&self, _hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        Some(
-            self.current
-                .read()
-                .unwrap_or_else(|p| p.into_inner())
-                .clone(),
-        )
+    fn resolve(&self, hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.select(hello.server_name())
     }
 }
 
@@ -144,33 +295,69 @@ fn load_certified_key(cert: &str, key: &str, provider: &CryptoProvider) -> Resul
     Ok(CertifiedKey::from_der(certs, key, provider)?)
 }
 
-/// The client-facing certificate store (reloadable, see `reload`).
-pub(super) fn load_server_tls(cert: &str, key: &str) -> Result<Arc<CertStore>> {
-    let provider = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .crypto_provider()
-        .clone();
-    Ok(Arc::new(CertStore {
-        current: RwLock::new(in_use(load_certified_key(cert, key, &provider)?)),
-        cert: cert.to_string(),
-        key: key.to_string(),
-        provider,
-    }))
+/// The fatal `unrecognized_name` alert (RFC 6066 §3, alert 112) as a
+/// plaintext TLS record: content type alert (21), record version 3.3,
+/// length 2, level fatal (2), description. Sent before the ServerHello, so
+/// it is not encrypted in TLS 1.3 either (RFC 8446 §6).
+const UNRECOGNIZED_NAME: [u8; 7] = [21, 3, 3, 0, 2, 2, 112];
+
+/// TLS for one listener with the certificates of a `CertStore`.
+#[derive(Clone)]
+pub(crate) struct Acceptor {
+    store: Arc<CertStore>,
+    config: Arc<rustls::ServerConfig>,
 }
 
-/// A TLS acceptor for one listener with the certificate of `store`. `alpn`
+impl Acceptor {
+    /// The TLS handshake on `io`. A client whose SNI names none of the
+    /// certificates is refused with `unrecognized_name` before any
+    /// certificate is sent (RFC 6066 §3; RFC 9325 §3.7: the server SHOULD
+    /// NOT continue the handshake), so the legacy gate's `sni` and the
+    /// OAUTHBEARER `host` check only ever see names of the proxy. A client
+    /// without SNI gets the default certificate.
+    pub(crate) async fn accept<IO>(
+        &self,
+        io: IO,
+    ) -> std::io::Result<tokio_rustls::server::TlsStream<IO>>
+    where
+        IO: AsyncRead + AsyncWrite + Unpin,
+    {
+        let start = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), io).await?;
+        if let Some(sni) = start.client_hello().server_name() {
+            if self.store.select(Some(sni)).is_some() {
+                return start.into_stream(self.config.clone()).await;
+            }
+            // rustls parsed it as a DNS name, so it is safe in a log line.
+            let err = std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("TLS server name {sni} is not a name of any configured certificate"),
+            );
+            let mut io = start.io;
+            // Best effort: the connection is closed either way.
+            let _ = io.write_all(&UNRECOGNIZED_NAME).await;
+            let _ = io.shutdown().await;
+            return Err(err);
+        }
+        start.into_stream(self.config.clone()).await
+    }
+}
+
+/// A TLS acceptor for one listener with the certificates of `store`. `alpn`
 /// is the listener's protocol name (RFC 7301, IANA "TLS ALPN Protocol
 /// IDs"): a client that offers ALPN without it is refused in the handshake
 /// (`no_application_protocol`), so a TLS session meant for another protocol
 /// cannot be redirected to this one (RFC 9325 §3.8, ALPACA). A client that
 /// offers no ALPN is accepted. `None` for SMTP, which has no identifier:
 /// ALPN is then ignored.
-pub(super) fn acceptor(store: &Arc<CertStore>, alpn: Option<&[u8]>) -> TlsAcceptor {
+pub(super) fn acceptor(store: &Arc<CertStore>, alpn: Option<&[u8]>) -> Acceptor {
     let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(store.clone());
     cfg.alpn_protocols = alpn.map(|p| vec![p.to_vec()]).unwrap_or_default();
-    TlsAcceptor::from(Arc::new(cfg))
+    Acceptor {
+        store: store.clone(),
+        config: Arc::new(cfg),
+    }
 }
 
 /// Trust anchors for a backend: the CAs in `ca_file` only, or the system
@@ -218,6 +405,146 @@ mod tests {
         p.not_after = rcgen::date_time_ymd(year, month, day);
         let key = rcgen::KeyPair::generate().unwrap();
         p.self_signed(&key).unwrap().der().to_vec()
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// Exact names in any letter case and with a trailing dot; a wildcard
+    /// for one label only; an exact name before any wildcard, else the
+    /// first certificate in order; without SNI the default.
+    #[test]
+    fn picks_by_name() {
+        let default = names(&["mail.example.org"]);
+        let wild = names(&["*.example.net", "*.example.org"]);
+        let tenant = names(&["mail.example.net", "imap.example.com"]);
+        let second = names(&["imap.example.com"]);
+        let certs = [&default[..], &wild, &tenant, &second];
+        for (sni, want) in [
+            (None, Some(0)),
+            (Some("mail.example.org"), Some(0)),
+            (Some("MAIL.Example.ORG"), Some(0)),
+            (Some("mail.example.org."), Some(0)),
+            (Some("imap.example.org"), Some(1)),
+            (Some("IMAP.example.net."), Some(1)),
+            (Some("mail.example.net"), Some(2)),
+            (Some("imap.example.com"), Some(2)),
+            (Some("example.net"), None),
+            (Some("a.b.example.net"), None),
+            (Some(".example.net"), None),
+            (Some("other.test"), None),
+            (Some(""), None),
+        ] {
+            assert_eq!(pick(&certs, sni), want, "{sni:?}");
+        }
+        assert_eq!(pick(&[], None), None);
+        assert!(serves(&tenant, "Mail.Example.NET"));
+        assert!(!serves(&default, "imap.example.org"));
+    }
+
+    fn cert_for(names: &[&str]) -> (rcgen::Certificate, rcgen::KeyPair) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let p =
+            rcgen::CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>())
+                .unwrap();
+        (p.self_signed(&key).unwrap(), key)
+    }
+
+    /// The dNSName entries, normalized; IP addresses and a wildcard over a
+    /// single label (`*.org`) are no names.
+    #[test]
+    fn dns_names_of_a_certificate() {
+        let (c, _) = cert_for(&["Mail.Example.org", "*.Example.NET", "*.org", "192.0.2.1"]);
+        assert_eq!(
+            dns_names(c.der()).unwrap(),
+            ["mail.example.org", "*.example.net"]
+        );
+        let (c, _) = cert_for(&[]);
+        assert!(dns_names(c.der()).unwrap().is_empty());
+        assert!(dns_names(&CertificateDer::from(&b"not a certificate"[..])).is_err());
+    }
+
+    /// Write a certificate and key for `names` to `dir/<file>.pem|.key`;
+    /// returns the paths and the DER.
+    fn write_pair(dir: &std::path::Path, file: &str, names: &[&str]) -> (String, String, Vec<u8>) {
+        let (c, k) = cert_for(names);
+        let cert = dir.join(format!("{file}.pem")).display().to_string();
+        let key = dir.join(format!("{file}.key")).display().to_string();
+        std::fs::write(&cert, c.pem()).unwrap();
+        std::fs::write(&key, k.serialize_pem()).unwrap();
+        (cert, key, c.der().to_vec())
+    }
+
+    fn tls_config(pairs: &[(&str, &str)]) -> crate::config::Tls {
+        crate::config::Tls {
+            cert: pairs[0].0.into(),
+            key: pairs[0].1.into(),
+            certificates: pairs[1..]
+                .iter()
+                .map(|(c, k)| crate::config::CertKey {
+                    cert: c.to_string(),
+                    key: k.to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    fn served_der(store: &CertStore, sni: Option<&str>) -> Option<Vec<u8>> {
+        store.select(sni).map(|k| k.cert[0].to_vec())
+    }
+
+    /// Only the default certificate may be without a DNS name: another one
+    /// is chosen by SNI alone.
+    #[test]
+    fn only_the_default_may_have_no_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (c0, k0, _) = write_pair(dir.path(), "a", &["192.0.2.1"]);
+        let (c1, k1, _) = write_pair(dir.path(), "b", &["mail.example.org"]);
+        let store = CertStore::load(&tls_config(&[(&c0, &k0), (&c1, &k1)])).unwrap();
+        assert!(store.default_has_no_names());
+        assert_eq!(store.names(), ["mail.example.org"]);
+        let e = CertStore::load(&tls_config(&[(&c1, &k1), (&c0, &k0)]))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("no DNS name"), "{e}");
+        assert!(check_pair(&c0, &k0, true).is_ok());
+        assert!(check_pair(&c0, &k0, false).is_err());
+        assert!(
+            check_pair(&c1, &k0, true).is_err(),
+            "key of another certificate"
+        );
+    }
+
+    /// A reload replaces each pair on its own; an unusable one (unreadable,
+    /// or an SNI certificate that lost its names) keeps what it served.
+    #[test]
+    fn reload_is_per_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (c0, k0, d0) = write_pair(dir.path(), "a", &["mail.example.org"]);
+        let (c1, k1, d1) = write_pair(dir.path(), "b", &["mail.example.net"]);
+        let (c2, k2, d2) = write_pair(dir.path(), "c", &["*.example.com"]);
+        let store = CertStore::load(&tls_config(&[(&c0, &k0), (&c1, &k1), (&c2, &k2)])).unwrap();
+        assert_eq!(served_der(&store, None), Some(d0.clone()));
+        assert_eq!(
+            served_der(&store, Some("mail.example.net")),
+            Some(d1.clone())
+        );
+        assert_eq!(served_der(&store, Some("x.example.com")), Some(d2.clone()));
+
+        let (_, _, d0_new) = write_pair(dir.path(), "a", &["mail.example.org"]);
+        std::fs::write(&c1, "not a certificate").unwrap();
+        write_pair(dir.path(), "c", &["192.0.2.1"]);
+        let outcome: Vec<(String, bool)> = store
+            .reload()
+            .into_iter()
+            .map(|(c, r)| (c.to_string(), r.is_ok()))
+            .collect();
+        assert_eq!(outcome, [(c0, true), (c1, false), (c2, false)]);
+        assert_eq!(served_der(&store, None), Some(d0_new));
+        assert_eq!(served_der(&store, Some("mail.example.net")), Some(d1));
+        assert_eq!(served_der(&store, Some("x.example.com")), Some(d2));
+        assert_eq!(served_der(&store, Some("other.example")), None);
     }
 
     #[test]

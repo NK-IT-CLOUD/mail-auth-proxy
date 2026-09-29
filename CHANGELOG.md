@@ -25,8 +25,22 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that offers ALPN without the listener's identifier is refused in the TLS handshake, so
   a TLS session meant for another service cannot be redirected to them (RFC 9325 §3.8,
   ALPACA). Clients without ALPN are unaffected; SMTP has no identifier and ignores it.
+- Certificates by SNI (RFC 6066 §3): `[[tls.certificates]]` (`cert`, `key`) next to the
+  `[tls]` default. A client gets the certificate that carries the name it asks for, an
+  exact subjectAltName DNS name first, then a wildcard for one leftmost label (RFC 9525
+  §6.3); a client without SNI gets `tls.cert`. `SIGHUP` reloads each certificate on its
+  own; `--check-config` loads every pair and warns about a `legacy.rules[].sni` name no
+  certificate carries. The `[tls] cert`/`key` form is unchanged.
 
 ### Changed
+- A client that asks (SNI) for a name that no configured certificate carries is refused
+  in the TLS handshake with the fatal alert `unrecognized_name` (RFC 9325 §3.7); it got
+  the one certificate before. The accepted names are the subjectAltName DNS names of the
+  certificates. Clients without SNI are unaffected.
+- `mail_auth_proxy_tls_cert_expiry_timestamp_seconds` has the label `cert` (the
+  certificate file), one series per certificate. With one certificate there is still one
+  series, now labelled; a query or an exact series match on the unlabelled series must
+  be adjusted, and with several certificates an alert takes the earliest (`min`).
 - The ManageSieve backend's capabilities are probed once at startup, so the first
   greetings no longer wait for a probe. A failure there is logged and counted in
   `mail_auth_proxy_backend_errors_total{proto="sieve"}`; the start goes on.

@@ -40,7 +40,10 @@ async fn jwks_success_and_failures_by_issuer() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn certificate_expiry_follows_reload() {
     let h = Harness::start().await;
-    let expiry = "mail_auth_proxy_tls_cert_expiry_timestamp_seconds";
+    let expiry = &format!(
+        "mail_auth_proxy_tls_cert_expiry_timestamp_seconds{{cert=\"{}\"}}",
+        h.pki.proxy_cert.display()
+    );
     assert_eq!(h.proxy.metric(expiry).await, PROXY_NOT_AFTER);
 
     std::fs::copy(&h.pki.renewed_cert, &h.pki.proxy_cert).unwrap();

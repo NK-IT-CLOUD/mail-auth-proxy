@@ -147,21 +147,24 @@ The same applies to the TLS key, a doveadm key file and legacy users/domains fil
 
 ### Certificates
 
-The proxy serves one certificate chain for every name. It must cover every name clients
-use: the public name and, if you use `sni` in a legacy rule, those names too.
+The certificates must together cover every name clients use: the public name and, if you
+use `sni` in a legacy rule, those names too. One certificate (`tls.cert`) is enough;
+further ones (`[[tls.certificates]]`) are chosen by the name the client asks for (SNI). A
+client that asks for a name none of them carries is refused in the TLS handshake
+([configuration.md](docs/configuration.md#tls-server-names)).
 
 After a renewal, copy the new files into place with the same owner and mode and send the
 process `SIGHUP`:
 
 ```bash
 sudo systemctl reload mail-auth-proxy    # sends SIGHUP
-journalctl -u mail-auth-proxy -n 5    # expect "reload: certificate loaded"
+journalctl -u mail-auth-proxy -n 5    # expect "reload: certificate loaded" per certificate
 ```
 
-`SIGHUP` re-reads certificate and key and refreshes every JWKS without closing open
+`SIGHUP` re-reads every certificate and key and refreshes every JWKS without closing open
 connections. It does not re-read the configuration file; a configuration change needs a
-restart. A certificate that fails to load is logged at `ERROR` and the old one stays in
-use. For certbot, a deploy hook can run these commands.
+restart. A certificate that fails to load is logged at `ERROR` with its file and the old
+one stays in use; the other certificates are reloaded. For certbot, a deploy hook can run these commands.
 
 Backend certificates are always verified, against the system trust store or the CAs in
 the backend's `ca_file`.
