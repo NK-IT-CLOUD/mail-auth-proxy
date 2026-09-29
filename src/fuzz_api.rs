@@ -18,7 +18,7 @@ pub use crate::proto::imap::preauth::ClientAuth;
 pub use crate::wire::line::{
     decode_login_field, read_client_line, read_line, read_sasl_response, verb_is, LineError,
 };
-pub use crate::wire::proxyproto::{v2_header, v2_local_header};
+pub use crate::wire::proxyproto::{ipv4_if_mapped, v2_header, v2_local_header};
 
 /// Longest accepted protocol line (`wire::line`).
 pub const MAX_LINE: usize = crate::wire::line::MAX_LINE;

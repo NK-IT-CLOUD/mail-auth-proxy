@@ -18,7 +18,7 @@ use rustls::pki_types::ServerName;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_rustls::TlsConnector;
 
 /// A backend and how to reach it: address, the name its certificate must
 /// carry, and a TLS connector with that backend's trust anchors.
@@ -58,7 +58,6 @@ pub struct Shared {
     pub validator: Arc<crate::auth::token::Validator>,
     /// The error result a rejected token is answered with (RFC 7628).
     pub error_challenge: crate::auth::discovery::ErrorChallenge,
-    pub acceptor: TlsAcceptor,
     /// `scope.internal_networks`, parsed once: the internal/external label
     /// of every connection. A label only; it allows nothing.
     pub nets: Vec<IpNet>,
@@ -112,7 +111,6 @@ impl<P> std::ops::Deref for Ctx<P> {
 
 /// Everything built from the configuration without network access.
 struct Local {
-    acceptor: TlsAcceptor,
     certs: Arc<tls::CertStore>,
     nets: Vec<IpNet>,
     legacy: crate::auth::legacy::Gate,
@@ -123,7 +121,7 @@ struct Local {
 
 /// Build everything that needs no network: certificates, backends, gate.
 fn build_local(cfg: &config::Config) -> Result<Local> {
-    let (acceptor, certs) = tls::load_server_tls(&cfg.tls.cert, &cfg.tls.key)?;
+    let certs = tls::load_server_tls(&cfg.tls.cert, &cfg.tls.key)?;
     let nets = crate::auth::policy::parse_internal_nets(&cfg.scope.internal_networks)?;
     let legacy = crate::auth::legacy::Gate::new(
         &cfg.legacy,
@@ -131,6 +129,7 @@ fn build_local(cfg: &config::Config) -> Result<Local> {
     )?;
     let keepalive = keepalive(&cfg.session);
     let imap = Imap {
+        acceptor: tls::acceptor(&certs, Some(b"imap")),
         backend: BackendConn::new(&cfg.imap.backend, keepalive)?,
     };
     let submission = cfg
@@ -138,6 +137,7 @@ fn build_local(cfg: &config::Config) -> Result<Local> {
         .as_ref()
         .map(|s| -> Result<Submission> {
             Ok(Submission {
+                acceptor: tls::acceptor(&certs, None),
                 backend: BackendConn::new(&s.backend, keepalive)?,
                 xclient: s.xclient,
                 ehlo_extensions: s.ehlo_extensions.clone(),
@@ -149,6 +149,7 @@ fn build_local(cfg: &config::Config) -> Result<Local> {
         .as_ref()
         .map(|s| -> Result<Sieve> {
             Ok(Sieve {
+                acceptor: tls::acceptor(&certs, Some(b"managesieve")),
                 backend: BackendConn::new(&s.backend, keepalive)?,
                 caps: CapsCache::default(),
                 caps_ttl: std::time::Duration::from_secs(s.capability_cache_secs),
@@ -156,7 +157,6 @@ fn build_local(cfg: &config::Config) -> Result<Local> {
         })
         .transpose()?;
     Ok(Local {
-        acceptor,
         certs,
         nets,
         legacy,
@@ -268,7 +268,6 @@ pub async fn run(cfg: config::Config) -> Result<()> {
     crate::obs::authlog::init_fingerprint_key().context("password fingerprint key")?;
     crate::ratelimit::init_fingerprint_key().context("rate limit fingerprint key")?;
     let Local {
-        acceptor,
         certs,
         nets,
         legacy,
@@ -308,7 +307,6 @@ pub async fn run(cfg: config::Config) -> Result<()> {
     let shared = Arc::new(Shared {
         validator,
         error_challenge: crate::auth::discovery::ErrorChallenge::from_config(&cfg.oauth),
-        acceptor,
         nets,
         legacy,
         hostname: cfg.server.hostname.clone(),
@@ -388,14 +386,16 @@ pub async fn run(cfg: config::Config) -> Result<()> {
     if let Some((sv, protocol)) = cfg.sieve.as_ref().zip(sieve) {
         let sieve_listener = TcpListener::bind(&sv.listen).await?;
         tracing::info!(target: crate::obs::target::MAIN, listen=%sv.listen, backend=%sv.backend.address, "sieve listener up");
+        let ctx = Arc::new(Ctx {
+            shared: shared.clone(),
+            protocol,
+        });
+        tokio::spawn(crate::proto::sieve::probe_at_startup(ctx.clone()));
         listener::spawn_listener(
             sieve_listener,
             metrics::Proto::Sieve,
             "sieve session ended",
-            Arc::new(Ctx {
-                shared: shared.clone(),
-                protocol,
-            }),
+            ctx,
             crate::proto::sieve::handle,
             life.clone(),
         );

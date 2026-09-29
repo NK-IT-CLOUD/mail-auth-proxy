@@ -93,7 +93,11 @@ pub async fn read_client_line<S: AsyncRead + Unpin>(
     loop {
         // A close with nothing read is `Eof`; a close in the middle of a line
         // is a different error.
-        match tokio::time::timeout(idle, s.read(&mut b)).await {
+        let read = match read_ready(s, &mut b).await {
+            Some(r) => Ok(r),
+            None => tokio::time::timeout(idle, s.read(&mut b)).await,
+        };
+        match read {
             Ok(Ok(0)) if consumed == 0 => return Err(LineError::Eof),
             Ok(Ok(0)) => return Err(LineError::EofMidLine),
             Ok(Ok(_)) => {}
@@ -127,6 +131,26 @@ pub async fn read_client_line<S: AsyncRead + Unpin>(
             Err(LineError::Utf8(why))
         }
     }
+}
+
+/// Read into `b` if bytes are available now, `None` if the read would wait.
+/// The line reader takes one byte per read and arms the idle timer only when
+/// it has to wait: a timer per byte made a long line, which arrives in one
+/// piece, many times slower to read.
+async fn read_ready<S: AsyncRead + Unpin>(
+    s: &mut S,
+    b: &mut [u8],
+) -> Option<std::io::Result<usize>> {
+    std::future::poll_fn(|cx| {
+        let mut buf = tokio::io::ReadBuf::new(b);
+        match std::pin::Pin::new(&mut *s).poll_read(cx, &mut buf) {
+            std::task::Poll::Ready(r) => {
+                std::task::Poll::Ready(Some(r.map(|()| buf.filled().len())))
+            }
+            std::task::Poll::Pending => std::task::Poll::Ready(None),
+        }
+    })
+    .await
 }
 
 /// `Vec::push` that grows by copying into a new buffer and overwriting the

@@ -23,12 +23,12 @@ Requirement levels (MUST, SHOULD, MAY) are those of the cited text; an empty Lev
 | 0-RTT data | | RFC 9325 §3.10, RFC 8446 §8 | Yes (disabled) | |
 | No resumption across different SNI | MUST | RFC 6066 §3 | Yes | rustls checks the SNI on resumption |
 | SNI supported | MUST | RFC 9325 §3.7 | Yes | SNI is read after the handshake. It is used, together with the client address, by the legacy (password) rules. |
-| Reject an unrecognised server name | SHOULD | RFC 9325 §3.7 | Deviation | One certificate is served for every name. See deviation D-TLS-1. |
-| ALPN supported; reject a non-matching ALPN | MUST / advised | RFC 9325 §3.8, RFC 7301 §3.2 | No | See D-TLS-1. IANA registers `imap` and `managesieve`; SMTP has no ALPN identifier. |
+| Reject an unrecognised server name | SHOULD | RFC 9325 §3.7 | Deviation | One certificate is served for every name. See D-TLS-1. |
+| ALPN supported; reject a non-matching ALPN | MUST / advised | RFC 9325 §3.8, RFC 7301 §3.2 | Yes | IMAP `imap`, ManageSieve `managesieve` (IANA). A client that offers ALPN without it gets the `no_application_protocol` alert; one that offers none is accepted. SMTP has no ALPN identifier and ignores ALPN. |
 | Implicit TLS for IMAP (port 993) | SHOULD | RFC 8314 §3.2 | Yes | |
 | Implicit TLS for submission (port 465) | SHOULD | RFC 8314 §3.3, RFC 9325 §3.2 | No | Only STARTTLS on 587. See D-SMTP-1. |
 | Plaintext is never accepted for authentication | MUST | RFC 9325 §3.2 | Yes | Fixed policy, not configurable |
-| TLS close_notify before closing | SHOULD | RFC 8314 §3.4 | Partial | Sent when the relay ends; not on error paths |
+| TLS close_notify before closing | SHOULD | RFC 8314 §3.4 | Yes | On every TLS session the proxy ends: after a refusal, an outage, a timeout, LOGOUT or QUIT, and when the relay ends. Within 2 s, then the connection closes regardless. |
 | Log TLS parameters with authentication records | SHOULD | RFC 8314 §4 | No | |
 | Backend certificate verified against a configured name; cannot be disabled | MUST | RFC 8314 §5.3 / RFC 7817 (client role) | Yes | |
 
@@ -40,7 +40,7 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 |---|---|---|---|---|
 | Greeting `* OK [CAPABILITY …]` | | RFC 9051 §7.1.1, §7.2.2 | Yes | |
 | CAPABILITY, NOOP, LOGOUT in not-authenticated state | MUST | RFC 9051 §6.1 | Yes | LOGOUT sends `* BYE` and then the tagged OK |
-| CAPABILITY response contains `IMAP4rev2` | MUST | RFC 9051 §6.1.1 | Yes | Advertised whatever the backend supports. See D-IMAP-3. |
+| CAPABILITY response contains `IMAP4rev2` | MUST | RFC 9051 §6.1.1 | Partial | Before login the list has `IMAP4rev1` only: the proxy does not know whether the backend speaks IMAP4rev2. After login the backend's list is relayed (RFC 9051 §6.2.2 allows it to differ). See D-IMAP-3. |
 | AUTH=PLAIN implemented on implicit-TLS ports | MUST | RFC 9051 §6.1.1 | Partial | Implemented. It is advertised and accepted only where a legacy rule allows it. See D-AUTH-1. |
 | `LOGINDISABLED` where LOGIN is not permitted | MUST (config) | RFC 9051 §6.2.3 | Yes | Advertised on every connection where no legacy rule offers LOGIN (the LOGIN command counts as the LOGIN mechanism) |
 | AUTHENTICATE with a `+ ` continuation and base64 responses | MUST | RFC 9051 §6.2.2 | Yes | |
@@ -51,7 +51,7 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 | `*` cancels; invalid base64 → tagged BAD | MUST | RFC 9051 §6.2.2 | Yes | A response that decodes but holds no valid credential gets `NO [AUTHENTICATIONFAILED]` |
 | Unsupported mechanism → tagged NO | SHOULD | RFC 9051 §6.2.2 | Yes | Then the connection closes. See D-GEN-1. |
 | After a failed AUTHENTICATE, the client may retry | MAY (client) | RFC 9051 §6.2.2 | Deviation | One attempt per connection. See D-GEN-1. |
-| LOGIN with astring arguments (atom, quoted, literal) | MUST | RFC 9051 §6.2.3, §9 | Partial | Atoms and quoted strings only; literals get BAD. See D-IMAP-1. |
+| LOGIN with astring arguments (atom, quoted, literal) | MUST | RFC 9051 §6.2.3, §9 | Yes | Synchronising `{n}` after a `+` continuation and non-synchronising `{n+}` (RFC 9051 §4.3), up to 16384 octets each. Where LOGIN is not offered, a synchronising literal gets `NO` without a continuation. |
 | Response codes AUTHENTICATIONFAILED, UNAVAILABLE | | RFC 5530 §3 | Yes | AUTHENTICATIONFAILED for rejected credentials; UNAVAILABLE when the backend is unavailable. A backend `NO` with UNAVAILABLE, INUSE, SERVERBUG or LIMIT is an outage, not a rejection. |
 | ID command answered `* ID NIL` | MUST | RFC 2971 §3.1-3.2 | Yes | |
 | `ID` listed in CAPABILITY | | RFC 2971 §3 | Yes | |
@@ -69,8 +69,8 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 | Greeting `220 <domain> ESMTP` | | RFC 5321 §4.2, §4.3.1 | Yes | The name comes from configuration. See D-SMTP-4. |
 | EHLO/HELO replies | | RFC 5321 §4.1.1.1 | Yes | |
 | STARTTLS advertised before TLS, not after | MUST | RFC 3207 §4.2 | Yes | |
-| `530 5.7.0` for commands that need TLS | SHOULD | RFC 3207 §4 | Partial | For MAIL, RCPT, DATA, BDAT and AUTH. RSET, NOOP and HELO get `250`. |
-| STARTTLS with parameters → `501` | | RFC 3207 §4 | Deviation | Parameters are ignored (cosmetic) |
+| `530 5.7.0` for every command other than NOOP, EHLO, STARTTLS and QUIT before TLS | SHOULD | RFC 3207 §4 | Yes | |
+| STARTTLS with parameters → `501` | | RFC 3207 §4 | Yes | |
 | State discarded after STARTTLS | MUST | RFC 3207 §4.2 | Yes | Nothing from the plaintext phase is kept |
 | No command injection across STARTTLS | | RFC 3207 §4.2, RFC 9325 §3.2 | Yes | Bytes pipelined after STARTTLS are not read as commands; the TLS handshake fails |
 | AUTH not advertised before TLS | SHOULD | RFC 4954 §4 (note), §6 (538) | Yes | |
@@ -85,10 +85,10 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 | Commands before AUTH → `530 5.7.0` | SHOULD | RFC 4954 §6 | Yes | |
 | Authentication lines up to 12288 octets | | RFC 4954 §4 | Yes | Limit 16384 |
 | Server closes only after QUIT, 421 or a timeout | MUST NOT (otherwise) | RFC 5321 §3.8, §7.8 | Yes | After a failed or unsupported AUTH the reply is followed by `421 4.7.0 <domain> closing connection`, then the close. One AUTH per connection, see D-GEN-1. |
-| Unknown commands → `500` | SHOULD | RFC 5321 §4.2.4 | Deviation | `502` (cosmetic) |
+| Unknown commands → `500` | SHOULD | RFC 5321 §4.2.4 | Yes | |
 | Server timeout ≥ 5 minutes | SHOULD | RFC 5321 §4.5.3.2.7 | Deviation | Pre-authentication budget. See D-GEN-2. |
 | PIPELINING: responses in order, input not lost | MUST | RFC 2920 §3.2 | Yes | Commands pipelined after AUTH are relayed once authentication succeeds |
-| Enhanced status codes on 2xx/4xx/5xx replies | MUST (when offered) | RFC 2034 §4, RFC 3463 | Partial | `250 OK` for NOOP/RSET carries no code |
+| Enhanced status codes on 2xx/4xx/5xx replies | MUST (when offered) | RFC 2034 §4, RFC 3463 | Yes | Except the `250` replies to EHLO and HELO, which RFC 2034 §4 exempts |
 | Only advertise extensions that work | MUST | RFC 5321 §4.2.4 | Partial | The post-TLS extension list is configured statically and must match the backend. See D-SMTP-3. |
 | PIPELINING, ENHANCEDSTATUSCODES, DSN, 8BITMIME offered | SHOULD | RFC 6409 §7 | Yes (default list) | |
 | Implicit TLS on 465 | SHOULD | RFC 8314 §3.3 | No | D-SMTP-1 |
@@ -99,7 +99,7 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 |---|---|---|---|---|
 | Capability greeting ending in `OK` | | RFC 5804 §1.7 | Yes | |
 | IMPLEMENTATION and VERSION always returned | MUST | RFC 5804 §1.7 | Yes | Before TLS, IMPLEMENTATION is the configured server name |
-| SIEVE always returned | MUST | RFC 5804 §1.7 | Partial | After TLS always. Before TLS from the last successful capability probe; while none has succeeded, the greeting waits for one. Missing while no probe has succeeded and the current one fails (up to 5 s until the next attempt). D-SIEVE-1. |
+| SIEVE always returned | MUST | RFC 5804 §1.7 | Partial | After TLS always. Before TLS from the last successful capability probe; the first runs at startup, and while none has succeeded the greeting waits for one. Missing while no probe has succeeded and the current one fails (up to 5 s until the next attempt). D-SIEVE-1. |
 | SASL list empty only if STARTTLS is offered; mechanisms listed must be usable | | RFC 5804 §1.7 | Yes | Empty before TLS; AUTHENTICATE before TLS gets `NO (ENCRYPT-NEEDED)` |
 | STARTTLS; capabilities re-issued after TLS without STARTTLS | MUST | RFC 5804 §2.2 | Yes | The backend's post-TLS capabilities are relayed, with the SASL line rewritten by the legacy rules |
 | AUTHENTICATE, CAPABILITY, STARTTLS, LOGOUT, NOOP valid before authentication; others → NO | MUST | RFC 5804 §2 | Yes | Before TLS, AUTHENTICATE gets `NO (ENCRYPT-NEEDED)` |
@@ -160,18 +160,18 @@ Bearer tokens are validated locally as signed JWTs (JWS compact serialisation) a
 | Separate rules for different token kinds | MUST | RFC 8725 §3.12 | Yes (except `token_type = "any"`) | |
 | The client is identified by `client_id` | | RFC 9068 §2.2 | Yes | `allowed_clients` is compared with `client_claim`: by default `client_id` for `token_type = "rfc9068"`, `azp` for the other modes |
 | `email_verified` is boolean `true` when the email is the identity | | OIDC Core §5.1 | Yes | |
-| email not used as a unique identifier across issuers | MUST NOT (RP) | OIDC Core §5.7 | Deviation | The configured identity claim (default `email`) is the mailbox login for all issuers. D-JWT-3. |
+| email not used as a unique identifier across issuers | MUST NOT (RP) | OIDC Core §5.7 | Depends on configuration | The configured identity claim (default `email`) is the mailbox login. `identity_domains` limits each issuer to its own domains; without it every issuer is trusted for every identity. D-JWT-3. |
 | JWKS `keys` required; unknown members ignored | MUST | RFC 7517 §5 | Yes | |
-| Unusable JWKs ignored | SHOULD | RFC 7517 §5 | Yes | Unknown `kty` and non-`sig` `use` are skipped; a key with missing or undecodable members is skipped with a warning and counted in `mail_auth_proxy_jwks_keys_skipped_total` |
+| Unusable JWKs ignored | SHOULD | RFC 7517 §5 | Yes | Unknown `kty`, a `use` other than `sig` and `key_ops` without `verify` (RFC 7517 §4.3) are skipped; a key with missing or undecodable members is skipped with a warning and counted in `mail_auth_proxy_jwks_keys_skipped_total` |
 | JWKS only over https | | RFC 8725 §3.8 (example) | Yes | http only for loopback; only a 2xx response is used; no redirects; 256 KiB cap |
 
 ## 7. Backend connections
 
 | Requirement | Level | Reference | Status | Notes |
 |---|---|---|---|---|
-| PROXY v2 binary header: signature, version 2, PROXY or LOCAL command, TCP4/TCP6 | MUST | haproxy PROXY protocol §2.2 | Yes | Sent in one write before the TLS handshake. IPv4-mapped IPv6 clients are sent as TCP6. |
+| PROXY v2 binary header: signature, version 2, PROXY or LOCAL command, TCP4/TCP6 | MUST | haproxy PROXY protocol §2.2 | Yes | Sent in one write before the TLS handshake. IPv4-mapped IPv6 addresses (dual-stack listener) are sent as TCP4. |
 | LOCAL header for the proxy's own connections, length 0 | | §2.2 | Yes | Used for the ManageSieve capability probe |
-| XCLIENT only when advertised; xtext values; `IPV6:` prefix; `[UNAVAILABLE]` | | Postfix XCLIENT_README | Yes | NAME and ADDR are sent. HELO, PORT and PROTO are not. D-SMTP-2. A backend that advertises XCLIENT while `submission.xclient = false`, or still advertises it after the proxy's XCLIENT, is an outage: the client could send its own XCLIENT after login. |
+| XCLIENT only when advertised; xtext values; `IPV6:` prefix; `[UNAVAILABLE]`; at most 512 octets | | Postfix XCLIENT_README | Yes | NAME and ADDR always; HELO (the client's post-TLS EHLO or HELO name), PROTO and PORT where the backend lists them. A HELO name that is empty, longer than 255 characters or would push the command past 512 octets is sent as `[UNAVAILABLE]`. A backend that advertises XCLIENT while `submission.xclient = false`, or still advertises it after the proxy's XCLIENT, is an outage: the client could send its own XCLIENT after login. |
 | EHLO again after XCLIENT's `220` | | XCLIENT_README | Yes | |
 | STARTTLS to the backend, EHLO again after TLS | MUST | RFC 3207 §4.2 | Yes | |
 | SMTP client: no initial response if the AUTH line would exceed the command-line limit | MUST | RFC 4954 §4, RFC 5321 §4.5.3.1.4 | Yes | The response is always sent after `334`. A reply 500-509 (syntax class) to the response is a rejection for a password and an outage for a token. |
@@ -261,27 +261,19 @@ The LOGIN mechanism is server-first, so RFC 4954 §4 and RFC 4959 §3 require th
 - `port` is never compared: behind NAT or port forwarding the port the client dialed differs from the one the proxy listens on.
 - Tokens are bound to the service by their audience.
 
-### D-TLS-1: SNI and ALPN
+### D-TLS-1: server name
 
-- One certificate is served for every server name, and ALPN is not negotiated.
-- RFC 9325 §3.7-3.8 recommend rejecting unknown names and non-matching ALPN values to prevent cross-protocol attacks (ALPACA).
+- One certificate is served for every server name, whatever name the client sends.
+- RFC 9325 §3.7 recommends rejecting unknown names to prevent cross-protocol attacks (ALPACA). ALPN (§3.8) protects IMAP and ManageSieve; SMTP has no ALPN identifier, so on the submission port nothing replaces the name check.
 
-### D-IMAP-1: IMAP literals are not accepted in LOGIN
+### D-IMAP-3: `IMAP4rev2` is not advertised before login
 
-Passwords that a client would send as a literal (for example, some with 8-bit characters) cannot be used with the LOGIN command. `AUTHENTICATE PLAIN` works.
-
-### D-IMAP-3: `IMAP4rev2` is advertised before login regardless of the backend
-
-- After login the backend's real capability list is relayed, which RFC 9051 §6.2.2 allows.
-- A backend without IMAP4rev2 (for example, Dovecot with default settings) will not honour `ENABLE IMAP4rev2`.
+- Before login the proxy lists `IMAP4rev1` only. After login the backend's own capability list is relayed, which RFC 9051 §6.2.2 allows to differ; a backend with IMAP4rev2 lists it there, and `ENABLE IMAP4rev2` goes to the backend.
+- Advertising `IMAP4rev2` before login would promise what a backend without it (for example, Dovecot with default settings) does not honour.
 
 ### D-SMTP-1: no implicit TLS for submission (465)
 
 Only STARTTLS on 587 is implemented.
-
-### D-SMTP-2: trace information
-
-XCLIENT carries the client address but not the client's EHLO name or port, so the backend's `Received:` trace names the proxy's EHLO domain (RFC 5321 §4.4).
 
 ### D-SMTP-3: static EHLO list
 
@@ -293,13 +285,15 @@ The configured server name is used in greetings and in the backend EHLO. It must
 
 ### D-SIEVE-1: SIEVE missing from the pre-TLS greeting while the backend is down
 
-- Behaviour: the plaintext greeting takes the backend's `"SIEVE"` line from the last successful capability probe. While no probe has succeeded since startup, the greeting waits for one; if that probe fails, the greeting goes out without the line. After a failed probe the next attempt waits 5 s, and greetings in that time also lack it. Once a probe has succeeded, its line is used whatever its age.
+- Behaviour: the plaintext greeting takes the backend's `"SIEVE"` line from the last successful capability probe. The first probe runs at startup. While no probe has succeeded, the greeting waits for one; if that probe fails, the greeting goes out without the line. After a failed probe the next attempt waits 5 s, and greetings in that time also lack it. Once a probe has succeeded, its line is used whatever its age.
 - What the specification says: SIEVE MUST be returned in every capability response (RFC 5804 §1.7).
 - Rationale: the line only goes missing while the backend cannot be reached, and then a login fails anyway with `NO (TRYLATER)`. Inventing a SIEVE list would show the client extensions the backend may not have; holding the greeting until the backend returns would tie up pre-auth slots for the whole outage.
 
 ### D-JWT-3: identity namespace across issuers
 
-With more than one issuer configured, a given identity-claim value maps to the same backend login regardless of issuer. Every configured issuer is trusted for every identity (compare OIDC Core §5.7).
+- A given identity-claim value maps to the same backend login regardless of the issuer that asserted it (compare OIDC Core §5.7).
+- `oauth.issuers[].identity_domains` limits an issuer to identities in its domains, so with disjoint domains no issuer can log in to another issuer's users. An issuer without it is trusted for every identity; with more than one issuer the configuration warns about it.
+- Issuers that share a domain share its mailboxes.
 
 ## References
 

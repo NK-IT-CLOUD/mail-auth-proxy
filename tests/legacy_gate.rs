@@ -1150,10 +1150,35 @@ async fn oversize_password_is_refused_like_a_wrong_one() {
     }
 }
 
+/// IMAP LOGIN takes its arguments as literals (RFC 9051 §6.2.3, §9): a
+/// synchronising one after a `+` continuation, a non-synchronising one at
+/// once. The octets reach the backend unchanged, spaces, quotes and CRLF
+/// included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn imap_login_with_literals() {
+    let h = Harness::start_with(opts(
+        "[[legacy.rules]]\nname = \"all\"\nnetworks = [\"127.0.0.0/8\"]\n".into(),
+    ))
+    .await;
+    let (mut c, _) = h.imap(Src::Internal, Sni::None).await;
+    c.send("a LOGIN {17+}\r\ndave@example.test {7}").await;
+    assert_eq!(c.line().await, "+ Ready for literal data");
+    c.send("p w\"\r\n1").await;
+    let reply = c.line().await;
+    assert!(reply.starts_with("a OK"), "{reply}");
+    let s = h.imap_be.sessions().pop().unwrap();
+    assert_eq!(s.login.as_deref(), Some("dave@example.test"));
+    assert_eq!(s.secret.as_deref(), Some("p w\"\r\n1"));
+    let (reason, rule, user, _) = last_result(&h, 0).await;
+    assert_eq!(
+        (reason.as_str(), rule.as_str(), user.as_str()),
+        ("ok", "all", "dave@example.test")
+    );
+}
+
 /// The password cap holds for every form a password can arrive in: IMAP
-/// LOGIN with a quoted string, SMTP AUTH LOGIN with the password on its own
-/// continuation line. An IMAP literal is not accepted at all (protocol
-/// error) and never reaches the backend either.
+/// LOGIN with a quoted string or a literal, SMTP AUTH LOGIN with the
+/// password on its own continuation line.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn oversize_password_in_login_forms() {
     let h = Harness::start_with(opts(format!(
@@ -1196,14 +1221,17 @@ async fn oversize_password_in_login_forms() {
     assert!(a.took >= Duration::from_millis(DELAY_MS));
     expect_oversize(before, "carol@example.test").await;
 
-    // IMAP LOGIN with a literal: refused as a protocol error.
+    // IMAP LOGIN with a synchronising literal.
     let before = h.proxy.authresults().len();
     let (mut c, _) = h.imap(Src::Internal, Sni::None).await;
     c.send(&format!("a LOGIN bob@example.test {{{}}}", huge.len()))
         .await;
-    let reply = c.line().await;
-    assert!(reply.starts_with("a BAD"), "{reply}");
-    assert_eq!(last_result(&h, before).await.0, "protocol");
+    assert_eq!(c.line().await, "+ Ready for literal data");
+    let t0 = Instant::now();
+    c.send(&huge).await;
+    assert_eq!(classify(Kind::Imap, &c.line().await), Answer::Failed);
+    assert!(t0.elapsed() >= Duration::from_millis(DELAY_MS));
+    expect_oversize(before, "bob@example.test").await;
 
     for kind in [Kind::Imap, Kind::Smtp] {
         assert!(h.backend(kind).sessions().is_empty(), "{kind:?}");

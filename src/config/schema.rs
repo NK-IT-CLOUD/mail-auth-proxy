@@ -215,6 +215,11 @@ pub struct Issuer {
     /// keys are skipped.
     #[serde(default = "default_true")]
     pub infer_key_algorithm: bool,
+    /// If not empty, the identity must be an address in one of these domains
+    /// (ASCII case-insensitive): what this issuer may log in to. Without it
+    /// the issuer is trusted for every mailbox.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_domains: Vec<String>,
     /// If not empty, only tokens whose `client_claim` is listed are accepted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_clients: Vec<String>,

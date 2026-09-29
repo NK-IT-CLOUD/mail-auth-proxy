@@ -187,7 +187,13 @@ async fn check_cell(h: &Harness, kind: Kind, cell: &Cell, before: &Before, clien
                 assert_eq!(s.proxy_header, None);
                 assert_eq!(
                     s.xclient.as_deref(),
-                    Some(format!("XCLIENT NAME=[UNAVAILABLE] ADDR={}", cell.src.ip()).as_str()),
+                    Some(
+                        format!(
+                            "XCLIENT HELO=client.test PROTO=ESMTP NAME=[UNAVAILABLE] ADDR={}",
+                            cell.src.ip()
+                        )
+                        .as_str()
+                    ),
                     "{}",
                     cell.id()
                 );
@@ -247,9 +253,9 @@ async fn imap_gate_matrix() {
                 let before = Before::take(&h, Kind::Imap).await;
                 let (mut c, greeting) = h.imap(src, sni).await;
                 let caps = if cell.password_allowed() {
-                    "IMAP4rev1 IMAP4rev2 SASL-IR ID AUTH=XOAUTH2 AUTH=OAUTHBEARER AUTH=PLAIN AUTH=LOGIN"
+                    "IMAP4rev1 SASL-IR ID AUTH=XOAUTH2 AUTH=OAUTHBEARER AUTH=PLAIN AUTH=LOGIN"
                 } else {
-                    "IMAP4rev1 IMAP4rev2 SASL-IR ID LOGINDISABLED AUTH=XOAUTH2 AUTH=OAUTHBEARER"
+                    "IMAP4rev1 SASL-IR ID LOGINDISABLED AUTH=XOAUTH2 AUTH=OAUTHBEARER"
                 };
                 assert_eq!(
                     greeting,

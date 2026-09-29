@@ -9,7 +9,7 @@
 //!
 //! Spec: <https://www.haproxy.org/download/2.9/doc/proxy-protocol.txt> §2.2.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 /// The 12-byte v2 signature that opens every header.
 const SIG: [u8; 12] = [
@@ -42,9 +42,13 @@ pub fn v2_local_header() -> Vec<u8> {
 ///
 /// `src` and `dst` must share an address family; the accepted client socket and
 /// its local address always do, so callers pass the client peer and the
-/// listener-side local address of the *same* socket. Returns `None` if the two
-/// families differ (defensive — should never happen for one socket).
+/// listener-side local address of the *same* socket. Two IPv4-mapped IPv6
+/// addresses (a dual-stack listener) are sent as the IPv4 addresses they
+/// are, so the backend logs `192.0.2.7`, not `::ffff:192.0.2.7`. Returns
+/// `None` if the two families differ (defensive — should never happen for
+/// one socket).
 pub fn v2_header(src: SocketAddr, dst: SocketAddr) -> Option<Vec<u8>> {
+    let (src, dst) = ipv4_if_mapped(src, dst);
     let mut out = Vec::with_capacity(28);
     out.extend_from_slice(&SIG);
     out.push(VER_CMD_PROXY);
@@ -75,6 +79,18 @@ pub fn v2_header(src: SocketAddr, dst: SocketAddr) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// `src` and `dst` as IPv4 if both are IPv4-mapped IPv6 addresses,
+/// otherwise unchanged.
+pub fn ipv4_if_mapped(src: SocketAddr, dst: SocketAddr) -> (SocketAddr, SocketAddr) {
+    match (src.ip().to_canonical(), dst.ip().to_canonical()) {
+        (s @ IpAddr::V4(_), d @ IpAddr::V4(_)) => (
+            SocketAddr::new(s, src.port()),
+            SocketAddr::new(d, dst.port()),
+        ),
+        _ => (src, dst),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +112,25 @@ mod tests {
         assert_eq!(&h[20..24], &[192, 0, 2, 31]); // dst ip
         assert_eq!(&h[24..26], &51344u16.to_be_bytes()); // src port
         assert_eq!(&h[26..28], &993u16.to_be_bytes()); // dst port
+    }
+
+    /// A dual-stack listener sees IPv4 clients as IPv4-mapped IPv6; the
+    /// header carries them as TCP over IPv4.
+    #[test]
+    fn ipv4_mapped_addresses_are_sent_as_ipv4() {
+        let src: SocketAddr = "[::ffff:203.0.113.7]:51344".parse().unwrap();
+        let dst: SocketAddr = "[::ffff:192.0.2.31]:993".parse().unwrap();
+        let h = v2_header(src, dst).unwrap();
+        let v4 = v2_header(
+            "203.0.113.7:51344".parse().unwrap(),
+            "192.0.2.31:993".parse().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(h, v4);
+        assert_eq!(h[13], 0x11); // TCP over IPv4
+                                 // Only one of the two mapped: both stay IPv6.
+        let dst6: SocketAddr = "[2001:db8::1]:993".parse().unwrap();
+        assert_eq!(v2_header(src, dst6).unwrap()[13], 0x21);
     }
 
     #[test]

@@ -57,6 +57,7 @@ token_type = "keycloak"
 identity_claim = "email"                   # the mailbox login forwarded to the backend
 # require_email_verified defaults to true when identity_claim = "email"
 # allowed_clients = ["thunderbird", "webmail"]   # optional azp allowlist
+# identity_domains = ["example.org"]       # optional: the only domains this issuer may log in to
 # infer_key_algorithm = true               # keys without "alg": ES256/ES384 by curve, RS256 for RSA (default true)
 # Named in the error result a client gets for a rejected token (RFC 7628), so it
 # can find the IdP. Only one issuer may set these two keys.

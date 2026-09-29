@@ -172,6 +172,19 @@ impl Config {
                     ));
                 }
             }
+            for d in &iss.identity_domains {
+                if d.is_empty()
+                    || d.contains('@')
+                    || d.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    err(format!(
+                        "{at}.identity_domains: {d:?} is not a domain (no @, whitespace or control characters)"
+                    ));
+                }
+            }
+            if self.oauth.issuers.len() > 1 && iss.identity_domains.is_empty() {
+                warnings.push(format!("{at}: without identity_domains this issuer can log in to every mailbox, also those of the other issuers' users (OIDC Core section 5.7)"));
+            }
             if iss.token_type == TokenType::Any {
                 warnings.push(format!("{at}: token_type = \"any\" also accepts ID tokens that carry an accepted audience"));
             }
@@ -999,6 +1012,48 @@ mod tests {
         // One issuer with the fields and one without is fine.
         let l = crate::config::parse(&format!("{V2}{second}scope = \"mail\"\n")).unwrap();
         assert!(l.errors.is_empty(), "{:?}", l.errors);
+    }
+
+    /// `identity_domains` takes domains only. With several issuers, each one
+    /// without it is warned about: it can log in to every mailbox.
+    #[test]
+    fn issuer_identity_domains() {
+        let with = |first: &str, second: &str| {
+            let cfg = V2.replace(
+                "token_type = \"keycloak\"\n",
+                &format!("token_type = \"keycloak\"\n{first}"),
+            );
+            crate::config::parse(&format!(
+                "{cfg}[[oauth.issuers]]\nissuer = \"https://idp2.example\"\njwks_url = \"https://idp2.example/certs\"\naudiences = [\"dovecot\"]\ntoken_type = \"rfc9068\"\n{second}"
+            ))
+            .unwrap()
+        };
+        let domains = |d: &str| format!("identity_domains = [\"{d}\"]\n");
+        let unbound = |l: &crate::config::Loaded| {
+            l.warnings
+                .iter()
+                .filter(|w| w.contains("without identity_domains"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let l = with(&domains("example.org"), &domains("example.net"));
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        assert!(unbound(&l).is_empty(), "{:?}", l.warnings);
+        let l = with(&domains("example.org"), "");
+        assert_eq!(unbound(&l).len(), 1, "{:?}", l.warnings);
+        assert!(unbound(&l)[0].starts_with("oauth.issuers[1]"));
+        assert_eq!(unbound(&with("", "")).len(), 2);
+        let one = crate::config::parse(V2).unwrap();
+        assert!(unbound(&one).is_empty(), "one issuer: {:?}", one.warnings);
+        for bad in ["", "a@example.org", "example .org"] {
+            let e = with(&domains(bad), &domains("example.net"))
+                .errors
+                .join("\n");
+            assert!(
+                e.contains("oauth.issuers[0].identity_domains"),
+                "{bad:?}: {e}"
+            );
+        }
     }
 
     /// `[password_gate]` short form: one rule plus the scope label; `[scope]`

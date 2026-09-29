@@ -58,9 +58,15 @@ fuzz_target!(|data: &[u8]| {
     let dst = addr(&data[19..37], data[0] & 2 != 0);
     match v2_header(src, dst) {
         Some(h) => {
-            // Flow info and scope id are not part of the header.
+            // Flow info and scope id are not part of the header; two
+            // IPv4-mapped addresses are sent as IPv4.
             let strip = |a: SocketAddr| SocketAddr::new(a.ip(), a.port());
-            assert_eq!(parse(&h), (strip(src), strip(dst)));
+            let (s, d) = ipv4_if_mapped(strip(src), strip(dst));
+            assert_eq!(parse(&h), (s, d));
+            assert_eq!(
+                h[13] == 0x11,
+                src.ip().to_canonical().is_ipv4() && dst.ip().to_canonical().is_ipv4()
+            );
         }
         None => assert_ne!(src.is_ipv4(), dst.is_ipv4(), "same family refused"),
     }

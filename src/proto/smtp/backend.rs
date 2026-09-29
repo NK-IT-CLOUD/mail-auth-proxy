@@ -23,6 +23,36 @@ pub(super) struct SmtpLogin<'a> {
     pub xclient: bool,
     /// The client's address.
     pub peer: SocketAddr,
+    /// The client's last greeting after TLS, for XCLIENT.
+    pub helo: Option<&'a ClientHelo>,
+}
+
+/// The greeting command a client sent after TLS: EHLO or HELO and its
+/// argument (RFC 5321 §4.1.1.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientHelo {
+    pub extended: bool,
+    pub name: String,
+}
+
+impl ClientHelo {
+    /// The greeting of an EHLO or HELO line, `None` for any other line. The
+    /// argument is its first word, empty if there is none.
+    pub fn parse(line: &str) -> Option<ClientHelo> {
+        let mut words = line.split_whitespace();
+        let verb = words.next()?;
+        let extended = if verb.eq_ignore_ascii_case("EHLO") {
+            true
+        } else if verb.eq_ignore_ascii_case("HELO") {
+            false
+        } else {
+            return None;
+        };
+        Some(ClientHelo {
+            extended,
+            name: words.next().unwrap_or("").to_string(),
+        })
+    }
 }
 
 impl BackendLogin for SmtpLogin<'_> {
@@ -150,17 +180,11 @@ impl SmtpLogin<'_> {
             ));
         }
         if self.xclient && offers_xclient {
-            // IPv4-mapped (::ffff:a.b.c.d) is announced as the IPv4 address it is.
-            let addr = match self.peer.ip().to_canonical() {
-                std::net::IpAddr::V4(v4) => format!("ADDR={v4}"),
-                std::net::IpAddr::V6(v6) => format!("ADDR=IPV6:{v6}"),
-            };
-            // NAME must be sent explicitly: attributes the command omits keep the
-            // value the session already had, so an ADDR-only XCLIENT would pin the
-            // proxy's own hostname onto the real client's IP in `client=` and in the
-            // Received header. The proxy does no reverse lookup, so the honest
-            // value is the spec's placeholder for "not available".
-            be.write_all(format!("XCLIENT NAME=[UNAVAILABLE] {addr}\r\n").as_bytes())
+            let advertised = ehlo_lines
+                .iter()
+                .find(|l| verb_is(l, "XCLIENT"))
+                .map_or("", String::as_str);
+            be.write_all(xclient_line(advertised, self.peer, self.helo).as_bytes())
                 .await?;
             // Postfix answers XCLIENT with a fresh 220 greeting and resets the
             // session state, so the SMTP conversation must restart with EHLO.
@@ -222,6 +246,79 @@ impl SmtpLogin<'_> {
         }
         Ok((be, code))
     }
+}
+
+/// Longest SMTP command line (RFC 5321 §4.5.3.1.4), CRLF included; XCLIENT
+/// must fit it (Postfix XCLIENT_README, note 1).
+const MAX_COMMAND: usize = 512;
+
+/// The XCLIENT command for the client at `peer` with greeting `helo`,
+/// `advertised` being the backend's `XCLIENT` EHLO line (its attribute
+/// names).
+///
+/// NAME and ADDR are always sent. NAME must be explicit: attributes the
+/// command omits keep the value the session already had, so an ADDR-only
+/// XCLIENT would pin the proxy's own hostname onto the real client's IP in
+/// `client=` and in the Received header. The proxy does no reverse lookup,
+/// so the value is the spec's placeholder for "not available". HELO, PROTO
+/// and PORT (the client's EHLO or HELO name, which of the two, its source
+/// port) are sent where advertised, so the backend's Received header names
+/// the client's greeting, not the proxy's (RFC 5321 §4.4); the backend keeps
+/// them across the proxy's own EHLO that follows. Values are xtext (RFC
+/// 3461 §4). A HELO name that would push the command past `MAX_COMMAND` or
+/// is longer than 255 characters is sent as `[UNAVAILABLE]`.
+fn xclient_line(advertised: &str, peer: SocketAddr, helo: Option<&ClientHelo>) -> String {
+    let offered = |attr: &str| {
+        advertised
+            .split_whitespace()
+            .skip(1)
+            .any(|a| a.eq_ignore_ascii_case(attr))
+    };
+    // IPv4-mapped (::ffff:a.b.c.d) is announced as the IPv4 address it is.
+    let addr = match peer.ip().to_canonical() {
+        std::net::IpAddr::V4(v4) => format!("ADDR={v4}"),
+        std::net::IpAddr::V6(v6) => format!("ADDR=IPV6:{v6}"),
+    };
+    let mut fixed = Vec::new();
+    if let Some(h) = helo.filter(|_| offered("PROTO")) {
+        fixed.push(format!(
+            "PROTO={}",
+            if h.extended { "ESMTP" } else { "SMTP" }
+        ));
+    }
+    if offered("PORT") {
+        fixed.push(format!("PORT={}", peer.port()));
+    }
+    fixed.push("NAME=[UNAVAILABLE]".into());
+    fixed.push(addr);
+    let tail = fixed.join(" ");
+    let helo = helo.filter(|_| offered("HELO")).map(|h| {
+        let name = xtext(&h.name);
+        // "XCLIENT " + "HELO=" + name + " " + tail + CRLF
+        if h.name.is_empty() || h.name.len() > 255 || 15 + name.len() + tail.len() > MAX_COMMAND {
+            "[UNAVAILABLE]".to_string()
+        } else {
+            name
+        }
+    });
+    match helo {
+        Some(h) => format!("XCLIENT HELO={h} {tail}\r\n"),
+        None => format!("XCLIENT {tail}\r\n"),
+    }
+}
+
+/// `s` as xtext (RFC 3461 §4): `!` to `~` as they are except `+` and `=`,
+/// every other byte as `+` and two upper-case hex digits.
+fn xtext(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if (b'!'..=b'~').contains(&b) && b != b'+' && b != b'=' {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("+{b:02X}"));
+        }
+    }
+    out
 }
 
 /// Most lines accepted in one SMTP reply. An EHLO reply has a dozen or so; a
@@ -326,6 +423,51 @@ mod tests {
             );
             assert_eq!(auth_verdict(code, true), AuthVerdict::Rejected, "{code}");
         }
+    }
+
+    /// HELO, PROTO and PORT go into XCLIENT only where the backend lists
+    /// them; NAME and ADDR always, last. The HELO name is xtext; one that
+    /// would not fit the 512-octet command is `[UNAVAILABLE]`.
+    #[test]
+    fn xclient_attributes() {
+        let v4: SocketAddr = "192.0.2.7:40123".parse().unwrap();
+        let ehlo = ClientHelo::parse("EHLO client.example").unwrap();
+        let all = "XCLIENT NAME ADDR PROTO HELO PORT LOGIN";
+        assert_eq!(
+            xclient_line(all, v4, Some(&ehlo)),
+            "XCLIENT HELO=client.example PROTO=ESMTP PORT=40123 NAME=[UNAVAILABLE] ADDR=192.0.2.7\r\n"
+        );
+        assert_eq!(
+            xclient_line("XCLIENT NAME ADDR", v4, Some(&ehlo)),
+            "XCLIENT NAME=[UNAVAILABLE] ADDR=192.0.2.7\r\n"
+        );
+        assert_eq!(
+            xclient_line(all, v4, None),
+            "XCLIENT PORT=40123 NAME=[UNAVAILABLE] ADDR=192.0.2.7\r\n"
+        );
+        let helo = ClientHelo::parse("helo [198.51.100.1]").unwrap();
+        let v6: SocketAddr = "[2001:db8::5]:587".parse().unwrap();
+        assert_eq!(
+            xclient_line("XCLIENT name addr proto helo", v6, Some(&helo)),
+            "XCLIENT HELO=[198.51.100.1] PROTO=SMTP NAME=[UNAVAILABLE] ADDR=IPV6:2001:db8::5\r\n"
+        );
+        let odd = ClientHelo::parse("EHLO a+b=cé").unwrap();
+        assert!(xclient_line(all, v4, Some(&odd)).starts_with("XCLIENT HELO=a+2Bb+3Dc+C3+A9 "));
+        for name in ["", &"x".repeat(256), &"\u{1}".repeat(200)] {
+            let h = ClientHelo {
+                extended: true,
+                name: name.to_string(),
+            };
+            let line = xclient_line(all, v6, Some(&h));
+            assert!(line.starts_with("XCLIENT HELO=[UNAVAILABLE] "), "{line}");
+        }
+        let longest = ClientHelo {
+            extended: true,
+            name: "\u{1}".repeat(128),
+        };
+        assert!(xclient_line(all, v6, Some(&longest)).len() <= MAX_COMMAND);
+        assert_eq!(ClientHelo::parse("MAIL FROM:<a@b>"), None);
+        assert_eq!(ClientHelo::parse("EHLO").unwrap().name, "");
     }
 
     #[tokio::test]

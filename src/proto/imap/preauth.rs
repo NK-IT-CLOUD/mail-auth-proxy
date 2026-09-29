@@ -18,8 +18,11 @@ use zeroize::Zeroizing;
 /// far as the legacy gate offers them on this connection. LOGINDISABLED
 /// (RFC 3501 §6.2.3) tells clients not to try the LOGIN command, which counts
 /// as the LOGIN mechanism. ID is answered, so it is advertised (RFC 2971 §3).
+/// IMAP4rev2 is not: whether the backend speaks it shows only in its own
+/// list after login, which the client is sent (RFC 9051 §6.2.2 allows the
+/// lists to differ).
 fn capabilities(pw: MechSet) -> String {
-    let mut caps = String::from("IMAP4rev1 IMAP4rev2 SASL-IR ID");
+    let mut caps = String::from("IMAP4rev1 SASL-IR ID");
     if !pw.login {
         caps.push_str(" LOGINDISABLED");
     }
@@ -111,13 +114,24 @@ pub async fn read_client_auth<S: AsyncRead + AsyncWrite + Unpin>(
                 return Ok(None);
             }
             "LOGIN" => {
-                let (user, pass) = match parse_two_astrings(rest) {
+                let (user, pass) = match read_login_args(stream, rest, pw, tuning.idle).await {
                     Ok(up) => up,
                     Err(e) => {
-                        stream
-                            .write_all(format!("{tag} BAD LOGIN arguments\r\n").as_bytes())
-                            .await?;
-                        return Err(anyhow!("LOGIN parse: {e}"));
+                        let reply = if e.is::<Withheld>() {
+                            "NO password authentication not available on this endpoint"
+                        } else {
+                            "BAD LOGIN arguments"
+                        };
+                        // Best effort: the client may already be gone.
+                        let _ = stream
+                            .write_all(format!("{tag} {reply}\r\n").as_bytes())
+                            .await;
+                        let _ = stream.flush().await;
+                        return Err(if e.is::<Withheld>() {
+                            e
+                        } else {
+                            anyhow!("LOGIN parse: {e}")
+                        });
                     }
                 };
                 if user.is_empty() || pass.is_empty() {
@@ -282,56 +296,156 @@ async fn read_sasl_credential<S: AsyncRead + AsyncWrite + Unpin>(
     Ok((kind, None))
 }
 
-/// Parse the two astring arguments of a LOGIN command: each is either a bare
-/// atom or a quoted string with `\"`/`\\` escapes. IMAP literals (`{n}`) are
-/// not supported. The second argument is the password: both are built in
-/// buffers sized for the whole line (no reallocation leaves a partial copy)
-/// and zeroized on drop, also on a parse error.
-pub(crate) fn parse_two_astrings(rest: &str) -> Result<(String, Zeroizing<String>)> {
+/// One LOGIN argument at the start of `s` after any spaces (RFC 9051 §9
+/// `astring`).
+enum Astring<'a> {
+    /// An atom or a quoted string (`\"`/`\\` escapes), and the rest of `s`.
+    Value(Zeroizing<String>, &'a str),
+    /// The header of a literal, `{n}` or the non-synchronising `{n+}`
+    /// (RFC 9051 §4.3). It ends the line; the octets follow on the stream.
+    Literal { len: usize, sync: bool },
+}
+
+/// Largest literal accepted in LOGIN. Longer logins and passwords than the
+/// proxy forwards still fit, so they are refused like a wrong password.
+const MAX_LOGIN_LITERAL: usize = crate::wire::line::MAX_LINE;
+
+/// Parse the next LOGIN argument of `s`. A value is built in a buffer sized
+/// for the whole line (no reallocation leaves a partial copy) and zeroized
+/// on drop, also on a parse error.
+fn next_astring(s: &str) -> Result<Astring<'_>> {
     // No IMAP string holds a NUL (RFC 9051 §4.3), and the backend gets the
     // credential as PLAIN, where NUL separates the fields.
-    if rest.contains('\0') {
+    if s.contains('\0') {
         return Err(anyhow!("NUL in LOGIN arguments"));
     }
-    let mut chars = rest.trim().chars().peekable();
-    let mut out: Vec<Zeroizing<String>> = Vec::with_capacity(2);
-    while out.len() < 2 {
-        while matches!(chars.peek(), Some(' ')) {
+    let s = s.trim_start_matches(' ');
+    let mut chars = s.char_indices().peekable();
+    match chars.peek() {
+        Some((_, '"')) => {
             chars.next();
+            let mut v = Zeroizing::new(String::with_capacity(s.len()));
+            loop {
+                match chars.next() {
+                    Some((_, '\\')) => {
+                        v.push(chars.next().ok_or_else(|| anyhow!("dangling escape"))?.1)
+                    }
+                    Some((i, '"')) => return Ok(Astring::Value(v, &s[i + 1..])),
+                    Some((_, c)) => v.push(c),
+                    None => return Err(anyhow!("unterminated quoted string")),
+                }
+            }
         }
-        match chars.peek() {
-            Some('"') => {
-                chars.next();
-                let mut s = Zeroizing::new(String::with_capacity(rest.len()));
-                loop {
-                    match chars.next() {
-                        Some('\\') => {
-                            s.push(chars.next().ok_or_else(|| anyhow!("dangling escape"))?)
-                        }
-                        Some('"') => break,
-                        Some(c) => s.push(c),
-                        None => return Err(anyhow!("unterminated quoted string")),
-                    }
-                }
-                out.push(s);
+        Some((_, '{')) => {
+            let (len, sync) = s
+                .strip_prefix('{')
+                .and_then(|h| h.strip_suffix('}'))
+                .map(|h| match h.strip_suffix('+') {
+                    Some(n) => (n, false),
+                    None => (h, true),
+                })
+                .filter(|(n, _)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                .ok_or_else(|| anyhow!("malformed literal header"))?;
+            let len = len
+                .parse::<usize>()
+                .ok()
+                .filter(|&n| n <= MAX_LOGIN_LITERAL)
+                .ok_or_else(|| anyhow!("literal larger than {MAX_LOGIN_LITERAL} bytes"))?;
+            Ok(Astring::Literal { len, sync })
+        }
+        Some(_) => {
+            let end = s.find(' ').unwrap_or(s.len());
+            let mut v = Zeroizing::new(String::with_capacity(s.len()));
+            v.push_str(&s[..end]);
+            Ok(Astring::Value(v, &s[end..]))
+        }
+        None => Err(anyhow!("missing argument")),
+    }
+}
+
+/// Parse the two astring arguments of a LOGIN command that holds no literal.
+/// The second argument is the password, zeroized on drop. For the unit tests
+/// and the fuzz target; the listener reads LOGIN with `read_login_args`.
+#[cfg(any(test, fuzzing))]
+pub(crate) fn parse_two_astrings(rest: &str) -> Result<(String, Zeroizing<String>)> {
+    let Astring::Value(mut user, rest) = next_astring(rest.trim())? else {
+        return Err(anyhow!("literal in LOGIN arguments"));
+    };
+    let Astring::Value(pass, _) = next_astring(rest)? else {
+        return Err(anyhow!("literal in LOGIN arguments"));
+    };
+    Ok((std::mem::take(&mut *user), pass))
+}
+
+/// Read the two arguments of a LOGIN command, `rest` being the line after
+/// the command name: atoms, quoted strings or literals (RFC 9051 §6.2.3). A
+/// synchronising literal `{n}` is asked for with a `+` continuation, a
+/// non-synchronising `{n+}` follows at once; the line after its octets
+/// continues the command. Where the connection offers no LOGIN (`pw`), a
+/// synchronising literal is not asked for: the error is `Withheld`, as for
+/// a password mechanism the connection does not offer.
+async fn read_login_args<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    rest: &str,
+    pw: MechSet,
+    idle: Duration,
+) -> Result<(String, Zeroizing<String>)> {
+    let mut line = Zeroizing::new(rest.trim().to_owned());
+    let mut pos = 0;
+    let mut args: Vec<Zeroizing<String>> = Vec::with_capacity(2);
+    while args.len() < 2 {
+        match next_astring(&line[pos..])? {
+            Astring::Value(v, after) => {
+                pos = line.len() - after.len();
+                args.push(v);
             }
-            Some('{') => return Err(anyhow!("IMAP literals not supported")),
-            Some(_) => {
-                let mut s = Zeroizing::new(String::with_capacity(rest.len()));
-                while let Some(&c) = chars.peek() {
-                    if c == ' ' {
-                        break;
+            Astring::Literal { len, sync } => {
+                if sync {
+                    if !pw.login {
+                        let user = args.first().map(|u| u.to_string()).unwrap_or_default();
+                        return Err(anyhow::Error::new(Withheld {
+                            mech: "LOGIN".into(),
+                            user,
+                        }));
                     }
-                    s.push(c);
-                    chars.next();
+                    stream.write_all(b"+ Ready for literal data\r\n").await?;
+                    stream.flush().await?;
                 }
-                out.push(s);
+                args.push(read_literal(stream, len, idle).await?);
+                line = read_client_line(stream, idle).await?;
+                pos = 0;
             }
-            None => return Err(anyhow!("missing argument")),
         }
     }
-    let pass = out.remove(1);
-    Ok((std::mem::take(&mut *out[0]), pass))
+    let pass = args.pop().unwrap_or_default();
+    let user = args.pop().unwrap_or_default();
+    Ok((user.to_string(), pass))
+}
+
+/// Read the `len` octets of a LOGIN literal, waiting at most `idle` for each
+/// read. They can carry the password and are zeroized on drop; a NUL is
+/// refused as in a quoted string.
+async fn read_literal<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    len: usize,
+    idle: Duration,
+) -> Result<Zeroizing<String>> {
+    use tokio::io::AsyncReadExt as _;
+    let mut buf = Zeroizing::new(vec![0u8; len]);
+    let mut filled = 0;
+    while filled < len {
+        match tokio::time::timeout(idle, stream.read(&mut buf[filled..])).await {
+            Ok(Ok(0)) => return Err(anyhow!("eof in a literal")),
+            Ok(Ok(n)) => filled += n,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Err(anyhow!("literal read timed out after {}s", idle.as_secs())),
+        }
+    }
+    if buf.contains(&0) {
+        return Err(anyhow!("NUL in a literal"));
+    }
+    let text = std::str::from_utf8(&buf).map_err(|e| anyhow!("literal utf8: {e}"))?;
+    Ok(Zeroizing::new(text.to_owned()))
 }
 
 /// Return the SASL-IR: use the inline value if present (empty for `=`), else
@@ -365,11 +479,11 @@ mod tests {
     fn capability_lines() {
         assert_eq!(
             capabilities(MechSet::default()),
-            "IMAP4rev1 IMAP4rev2 SASL-IR ID LOGINDISABLED AUTH=XOAUTH2 AUTH=OAUTHBEARER"
+            "IMAP4rev1 SASL-IR ID LOGINDISABLED AUTH=XOAUTH2 AUTH=OAUTHBEARER"
         );
         assert_eq!(
             capabilities(BOTH),
-            "IMAP4rev1 IMAP4rev2 SASL-IR ID AUTH=XOAUTH2 AUTH=OAUTHBEARER AUTH=PLAIN AUTH=LOGIN"
+            "IMAP4rev1 SASL-IR ID AUTH=XOAUTH2 AUTH=OAUTHBEARER AUTH=PLAIN AUTH=LOGIN"
         );
         let plain = MechSet {
             plain: true,
@@ -377,7 +491,7 @@ mod tests {
         };
         assert_eq!(
             capabilities(plain),
-            "IMAP4rev1 IMAP4rev2 SASL-IR ID LOGINDISABLED AUTH=XOAUTH2 AUTH=OAUTHBEARER AUTH=PLAIN"
+            "IMAP4rev1 SASL-IR ID LOGINDISABLED AUTH=XOAUTH2 AUTH=OAUTHBEARER AUTH=PLAIN"
         );
     }
     use base64::Engine as _;
@@ -587,6 +701,86 @@ mod tests {
         assert!(parse_two_astrings("user \"p\0w\"").is_err());
         assert!(parse_two_astrings("us\0er pw").is_err());
         assert!(parse_two_astrings("user \"unterminated").is_err());
+    }
+
+    /// Drive `read_client_auth` with `input` after the greeting; returns
+    /// the result and everything the server wrote after the greeting.
+    async fn login_dialog(pw: MechSet, input: &[u8]) -> (Result<Option<ClientAuth>>, String) {
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let t = tokio::spawn(async move {
+            read_client_auth(&mut server, pw, "test", &Tuning::default()).await
+        });
+        let mut greeting = [0u8; 512];
+        let _ = client.read(&mut greeting).await.unwrap();
+        client.write_all(input).await.unwrap();
+        let r = t.await.unwrap();
+        drop(client.shutdown().await);
+        let mut out = Vec::new();
+        let _ = client.read_to_end(&mut out).await;
+        (r, String::from_utf8(out).unwrap())
+    }
+
+    fn password(r: Result<Option<ClientAuth>>) -> (String, String) {
+        match r.unwrap().unwrap().kind {
+            crate::auth::sasl::ClientAuthKind::Password { user, pass } => (user, pass.to_string()),
+            _ => panic!("expected Password"),
+        }
+    }
+
+    /// LOGIN takes literals (RFC 9051 §6.2.3, §9 `astring`): a synchronising
+    /// `{n}` gets a `+` continuation, a non-synchronising `{n+}` none; the
+    /// octets may hold spaces, quotes and CRLF, and the command continues on
+    /// the line after them.
+    #[tokio::test]
+    async fn login_with_literals() {
+        let (r, out) = login_dialog(BOTH, b"a LOGIN bob@x {6}\r\np w\"\r\\\r\n").await;
+        assert_eq!(password(r), ("bob@x".into(), "p w\"\r\\".into()));
+        assert_eq!(out, "+ Ready for literal data\r\n");
+
+        let (r, out) = login_dialog(BOTH, b"a LOGIN {5+}\r\nbob@x {3+}\r\npw1\r\n").await;
+        assert_eq!(password(r), ("bob@x".into(), "pw1".into()));
+        assert_eq!(out, "");
+
+        let (r, out) = login_dialog(BOTH, b"a LOGIN {5}\r\nbob@x \"pw 2\"\r\n").await;
+        assert_eq!(password(r), ("bob@x".into(), "pw 2".into()));
+        assert_eq!(out, "+ Ready for literal data\r\n");
+    }
+
+    /// Where the connection offers no LOGIN, a synchronising literal is not
+    /// asked for: the command is refused at once. A non-synchronising one has
+    /// been sent anyway and is parsed, like a quoted password.
+    #[tokio::test]
+    async fn login_literal_on_oauth_only_endpoint() {
+        let (r, out) = login_dialog(MechSet::default(), b"a LOGIN bob@x {3}\r\n").await;
+        let Err(e) = r else {
+            panic!("expected an error")
+        };
+        let w = e.downcast_ref::<Withheld>().expect("withheld");
+        assert_eq!((w.mech.as_str(), w.user.as_str()), ("LOGIN", "bob@x"));
+        assert_eq!(
+            out,
+            "a NO password authentication not available on this endpoint\r\n"
+        );
+
+        let (r, _) = login_dialog(MechSet::default(), b"a LOGIN bob@x {3+}\r\npw1\r\n").await;
+        assert_eq!(password(r), ("bob@x".into(), "pw1".into()));
+    }
+
+    /// Malformed or oversized literal headers, a NUL in the octets and text
+    /// after a header are refused with BAD, without a continuation.
+    #[tokio::test]
+    async fn login_bad_literals() {
+        for input in [
+            &b"a LOGIN bob@x {16385}\r\n"[..],
+            b"a LOGIN bob@x {3++}\r\n",
+            b"a LOGIN bob@x {}\r\n",
+            b"a LOGIN bob@x {3} x\r\n",
+            b"a LOGIN bob@x {3+}\r\np\0w\r\n",
+        ] {
+            let (r, out) = login_dialog(BOTH, input).await;
+            assert!(r.is_err(), "{input:?}");
+            assert_eq!(out, "a BAD LOGIN arguments\r\n", "{input:?}");
+        }
     }
 
     #[tokio::test]

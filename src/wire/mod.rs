@@ -101,6 +101,17 @@ where
     }
 }
 
+/// How long closing a stream may take: a peer that no longer reads must not
+/// keep the session (and its slot) open.
+pub(crate) const CLOSE_GRACE: Duration = Duration::from_secs(2);
+
+/// End a stream the proxy closes: for TLS a close_notify, then the TCP FIN
+/// (RFC 8314 §3.4). Best effort, within `CLOSE_GRACE`.
+pub async fn close<S: tokio::io::AsyncWrite + Unpin>(s: &mut S) {
+    use tokio::io::AsyncWriteExt as _;
+    let _ = tokio::time::timeout(CLOSE_GRACE, s.shutdown()).await;
+}
+
 /// Run `fut` with a deadline, turning an elapsed timer into an error labelled
 /// with `what`.
 pub async fn deadline<F, T>(d: Duration, what: &str, fut: F) -> Result<T>

@@ -35,7 +35,7 @@ Each connection is one tokio task. Connections share only the JWKS key set, the 
 
 ## Client TLS
 
-- rustls with the aws-lc-rs provider. TLS 1.2 and TLS 1.3 use rustls' default cipher suites. There is no ALPN and no client-certificate authentication.
+- rustls with the aws-lc-rs provider. TLS 1.2 and TLS 1.3 use rustls' default cipher suites. IMAP and ManageSieve negotiate ALPN with their IANA identifiers `imap` and `managesieve`: a client that offers ALPN without that identifier is refused in the handshake (`no_application_protocol`); one that offers none is accepted. SMTP has no identifier and ignores ALPN. There is no client-certificate authentication.
 - One certificate chain (`tls.cert`, `tls.key`) is served for every SNI name. A legacy rule with `sni` is only usable if that certificate covers both the public name and the rule's names.
 - The SNI is read after the handshake and used only by the legacy rules ([legacy gate](#legacy-gate)). A client that sends no SNI matches only rules without `sni`. Clients that connect by IP address never send SNI.
 
@@ -172,7 +172,7 @@ Validation is local; the proxy makes no introspection or userinfo call. A token 
    - It failed for that issuer: the answer is retry-later (an outage, no `authresult` line), because a key rotated in while the IdP was unreachable must not look like a forged token.
 
    The `iss` is read unverified here, only to pick the refresh result. An `iss` that is not a string (an array is invalid anyway, step 4) counts as no configured issuer.
-2. Algorithm pinned to the key. The algorithm comes from the JWKS key, never from the token header. A key with `alg` is used with exactly that algorithm. A key without `alg` is used with the one algorithm its type implies (ES256 for P-256, ES384 for P-384, RS256 for RSA), or skipped when the issuer sets `infer_key_algorithm = false`. Every key therefore has exactly one algorithm (RFC 8725 §3.1). Either way only the issuer's `allowed_algorithms` count. An RSA key used with another algorithm must say so in its `alg`. Keys are skipped when their algorithm is not allowed, when `kty` is not `EC`/`RSA`, or when they declare a `use` other than `sig` (a missing `use` is accepted). `alg=none` and HS* forgeries fail.
+2. Algorithm pinned to the key. The algorithm comes from the JWKS key, never from the token header. A key with `alg` is used with exactly that algorithm. A key without `alg` is used with the one algorithm its type implies (ES256 for P-256, ES384 for P-384, RS256 for RSA), or skipped when the issuer sets `infer_key_algorithm = false`. Every key therefore has exactly one algorithm (RFC 8725 §3.1). Either way only the issuer's `allowed_algorithms` count. An RSA key used with another algorithm must say so in its `alg`. Keys are skipped when their algorithm is not allowed, when `kty` is not `EC`/`RSA`, when they declare a `use` other than `sig`, or when their `key_ops` do not include `verify` (a missing `use` or `key_ops` is accepted). `alg=none` and HS* forgeries fail.
 3. Issuer bound to the key. Each `[[oauth.issuers]]` entry pairs one `issuer` with its `jwks_url`, and each key is accepted only with the `iss` of the issuer whose JWKS published it. A realm-B key cannot sign a token that claims realm A. If several issuers publish the same `kid`, each candidate key is tried against its own issuer.
 4. Required claims: `iss`, `aud`, `exp`. `iss` must be a string (RFC 7519 §4.1.1); an array is refused. `aud` may be a string or an array and must contain one of the issuer's `audiences`.
 5. Time checks: `exp` is checked, and `nbf` when present. The leeway is `oauth.leeway_secs` (default 60 s), so a token is still accepted up to 60 s after `exp` and up to 60 s before `nbf`.
@@ -180,7 +180,7 @@ Validation is local; the proxy makes no introspection or userinfo call. A token 
    - Access tokens only, per `token_type`. `keycloak`: the claim `typ` equals `Bearer` (case-insensitive), so ID tokens (`typ=ID`) and tokens without `typ` fail. `rfc9068`: the JWT header `typ` is `at+jwt` or `application/at+jwt`. `any`: no check.
    - `email_verified` must be the JSON boolean `true` when `require_email_verified` is on (default for `identity_claim = "email"`). Missing, `false` or the string `"true"` fail.
    - With `allowed_clients` set, the `client_claim` must be one of them. It defaults to `client_id` for `token_type = "rfc9068"` (RFC 9068 §2.2) and to `azp` otherwise.
-7. Identity: the `identity_claim` (default `email`). It must be a string of at most 254 characters without whitespace or control characters; for `email` also exactly one `@` with non-empty local part and domain. It is forwarded to the backend as the login.
+7. Identity: the `identity_claim` (default `email`). It must be a string of at most 254 characters without whitespace or control characters; for `email` also exactly one `@` with non-empty local part and domain. With `identity_domains` set, it must be an address whose domain is one of them (ASCII case-insensitive, no subdomains). It is forwarded to the backend as the login.
 
 JWKS handling:
 
@@ -204,7 +204,7 @@ JWKS handling:
   - The source is the client address and the destination is the local address the client connected to. IPv4-mapped addresses are *not* canonicalised here.
   - The ManageSieve capability probe ([protocols: ManageSieve after TLS](protocols.md#managesieve-after-tls)) is the proxy's own connection and sends a PROXY v2 `LOCAL` header (no addresses).
   - The backend listener must require the header (Dovecot `haproxy = yes`); switch both settings together.
-- SMTP never sends PROXY protocol. With `submission.xclient = true` it sends `XCLIENT NAME=[UNAVAILABLE] ADDR=<ipv4>` or `ADDR=IPV6:<ipv6>` after the backend's post-TLS EHLO, but only if the backend advertises `XCLIENT`; otherwise the step is skipped silently. With `submission.xclient = false`, a backend that advertises `XCLIENT` is an outage and no credential is sent. The same applies when the `EHLO` after the proxy's `XCLIENT` still lists it, because the client's own address would then be authorized for it.
+- SMTP never sends PROXY protocol. With `submission.xclient = true` it sends `XCLIENT [HELO=<client EHLO name>] [PROTO=ESMTP|SMTP] [PORT=<client port>] NAME=[UNAVAILABLE] ADDR=<ipv4>` (or `ADDR=IPV6:<ipv6>`) after the backend's post-TLS EHLO, HELO, PROTO and PORT only where the backend lists them in its `XCLIENT` line, but only if the backend advertises `XCLIENT`; otherwise the step is skipped silently. With `submission.xclient = false`, a backend that advertises `XCLIENT` is an outage and no credential is sent. The same applies when the `EHLO` after the proxy's `XCLIENT` still lists it, because the client's own address would then be authorized for it.
 
 ## After authentication
 

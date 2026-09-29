@@ -1183,6 +1183,8 @@ pub struct Opts {
     pub ratelimit: Option<String>,
     /// The keys of the `[session]` section, if any.
     pub session: Option<String>,
+    /// The ManageSieve backend is down when the proxy starts.
+    pub sieve_down: bool,
 }
 
 impl Default for Opts {
@@ -1199,6 +1201,7 @@ impl Default for Opts {
             issuer_extra: "",
             ratelimit: None,
             session: None,
+            sieve_down: false,
         }
     }
 }
@@ -1631,6 +1634,9 @@ impl Harness {
         let imap_be = MockBackend::start(Kind::Imap, pki.backend.clone()).await;
         let smtp_be = MockBackend::start(Kind::Smtp, pki.backend.clone()).await;
         let sieve_be = MockBackend::start(Kind::Sieve, pki.backend.clone()).await;
+        if opts.sieve_down {
+            sieve_be.shutdown().await;
+        }
         let proxy = Proxy::start(&pki, &idp, [&imap_be, &smtp_be, &sieve_be], &opts).await;
         Harness {
             pki,
@@ -1903,6 +1909,23 @@ impl Client {
             .expect("TLS handshake");
     }
 
+    /// TLS offering the ALPN protocols `alpn`; returns the one the server
+    /// chose, if any.
+    pub async fn try_tls_alpn(
+        &mut self,
+        pki: &Pki,
+        sni: Sni,
+        alpn: &[&[u8]],
+    ) -> std::io::Result<Option<Vec<u8>>> {
+        let mut config = (*pki.client).clone();
+        config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+        self.try_tls_with(Arc::new(config), sni).await?;
+        let Stream::Tls(s) = &self.stream else {
+            unreachable!("TLS established");
+        };
+        Ok(s.get_ref().1.alpn_protocol().map(<[u8]>::to_vec))
+    }
+
     pub async fn try_tls(&mut self, pki: &Pki, sni: Sni) -> std::io::Result<()> {
         self.try_tls_with(pki.client.clone(), sni).await
     }
@@ -2030,6 +2053,19 @@ impl Client {
             );
         }
         self.expect_closed().await;
+    }
+
+    /// The peer ends TLS with close_notify (RFC 8314 §3.4) and sends nothing
+    /// more: the read ends cleanly, not with an unexpected EOF.
+    pub async fn expect_close_notify(&mut self) {
+        let Stream::Tls(s) = &mut self.stream else {
+            panic!("not a TLS connection");
+        };
+        let mut buf = [0u8; 4096];
+        let r = tokio::time::timeout(IO_TIMEOUT, s.read(&mut buf))
+            .await
+            .expect("connection stayed open");
+        assert!(matches!(r, Ok(0)), "expected close_notify, got {r:?}");
     }
 
     /// The peer closes without sending anything more.

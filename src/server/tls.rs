@@ -144,18 +144,33 @@ fn load_certified_key(cert: &str, key: &str, provider: &CryptoProvider) -> Resul
     Ok(CertifiedKey::from_der(certs, key, provider)?)
 }
 
-/// The TLS acceptor for clients and the store behind it (for `reload`).
-pub(super) fn load_server_tls(cert: &str, key: &str) -> Result<(TlsAcceptor, Arc<CertStore>)> {
-    let builder = rustls::ServerConfig::builder().with_no_client_auth();
-    let provider = builder.crypto_provider().clone();
-    let store = Arc::new(CertStore {
+/// The client-facing certificate store (reloadable, see `reload`).
+pub(super) fn load_server_tls(cert: &str, key: &str) -> Result<Arc<CertStore>> {
+    let provider = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .crypto_provider()
+        .clone();
+    Ok(Arc::new(CertStore {
         current: RwLock::new(in_use(load_certified_key(cert, key, &provider)?)),
         cert: cert.to_string(),
         key: key.to_string(),
         provider,
-    });
-    let cfg = builder.with_cert_resolver(store.clone());
-    Ok((TlsAcceptor::from(Arc::new(cfg)), store))
+    }))
+}
+
+/// A TLS acceptor for one listener with the certificate of `store`. `alpn`
+/// is the listener's protocol name (RFC 7301, IANA "TLS ALPN Protocol
+/// IDs"): a client that offers ALPN without it is refused in the handshake
+/// (`no_application_protocol`), so a TLS session meant for another protocol
+/// cannot be redirected to this one (RFC 9325 §3.8, ALPACA). A client that
+/// offers no ALPN is accepted. `None` for SMTP, which has no identifier:
+/// ALPN is then ignored.
+pub(super) fn acceptor(store: &Arc<CertStore>, alpn: Option<&[u8]>) -> TlsAcceptor {
+    let mut cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(store.clone());
+    cfg.alpn_protocols = alpn.map(|p| vec![p.to_vec()]).unwrap_or_default();
+    TlsAcceptor::from(Arc::new(cfg))
 }
 
 /// Trust anchors for a backend: the CAs in `ca_file` only, or the system

@@ -55,7 +55,7 @@ async fn backend_login_is_the_token_email() {
                     assert_eq!(s.proxy_header, None);
                     assert_eq!(
                         s.xclient.as_deref(),
-                        Some("XCLIENT NAME=[UNAVAILABLE] ADDR=127.0.0.2")
+                        Some("XCLIENT HELO=client.test PROTO=ESMTP NAME=[UNAVAILABLE] ADDR=127.0.0.2")
                     );
                 }
             }

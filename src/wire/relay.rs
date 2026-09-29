@@ -18,10 +18,6 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::time::Instant;
 
-/// How long closing both streams may take after a limit: a peer that no
-/// longer reads must not keep the session (and its slot) open.
-const CLOSE_GRACE: Duration = Duration::from_secs(2);
-
 const CLIENT: u8 = 1;
 const BACKEND: u8 = 2;
 
@@ -87,7 +83,7 @@ where
         _ = max => SessionEnd::MaxSession,
     };
     if matches!(end, SessionEnd::IdleLimit | SessionEnd::MaxSession) {
-        let _ = tokio::time::timeout(CLOSE_GRACE, async {
+        let _ = tokio::time::timeout(super::CLOSE_GRACE, async {
             tokio::join!(client.shutdown(), backend.shutdown())
         })
         .await;

@@ -319,6 +319,22 @@ async fn sieve_continuation_and_literals() {
     );
 }
 
+/// The backend's capabilities are probed once at startup, before any
+/// client, so the first greeting does not wait for a probe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sieve_capabilities_are_probed_at_startup() {
+    let h = Harness::start().await;
+    let probed = async {
+        while !h.sieve_be.seen().iter().any(|s| s.probe) {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), probed)
+        .await
+        .expect("no capability probe without a client");
+    assert!(h.sieve_be.sessions().is_empty());
+}
+
 /// The ManageSieve greeting must list SIEVE (RFC 5804 §1.7), also for the
 /// first clients after startup, and a cold cache is filled by one probe,
 /// however many clients arrive at once.
@@ -428,6 +444,157 @@ async fn smtp_closes_with_421_after_a_refused_auth() {
         assert_eq!(c.line().await, reply, "{cmd}");
         assert_eq!(c.line().await, closing, "{cmd}");
         c.expect_closed().await;
+    }
+}
+
+/// SMTP replies before authentication: 530 for every command but NOOP,
+/// EHLO, STARTTLS and QUIT until TLS (RFC 3207 §4); STARTTLS takes no
+/// parameters (501); after TLS 530 for every command but AUTH, EHLO, HELO,
+/// NOOP, RSET and QUIT (RFC 4954 §6); 500 for an unrecognised command (RFC
+/// 5321 §4.2.4); enhanced status codes on 250 (RFC 2034 §4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn smtp_replies_before_authentication() {
+    let h = Harness::start().await;
+    let mut c = Client::connect(h.proxy.smtp, Src::External).await;
+    c.line().await;
+    for (cmd, reply) in [
+        ("HELO client.test", "530 5.7.0 Must issue STARTTLS first"),
+        ("RSET", "530 5.7.0 Must issue STARTTLS first"),
+        ("VRFY alice", "530 5.7.0 Must issue STARTTLS first"),
+        ("NOOP", "250 2.0.0 OK"),
+        ("FOO", "500 5.5.1 Command not recognized"),
+        (
+            "STARTTLS now",
+            "501 5.5.4 Syntax error (no parameters allowed)",
+        ),
+        ("STARTTLS", "220 2.0.0 Ready to start TLS"),
+    ] {
+        c.send(cmd).await;
+        assert_eq!(c.line().await, reply, "{cmd}");
+    }
+    c.tls(&h.pki, Sni::Public).await;
+    for (cmd, reply) in [
+        ("HELO client.test", format!("250 {HOSTNAME}")),
+        ("RSET", "250 2.0.0 OK".into()),
+        ("NOOP", "250 2.0.0 OK".into()),
+        ("VRFY alice", "530 5.7.0 Authentication required".into()),
+        (
+            "MAIL FROM:<a@example.test>",
+            "530 5.7.0 Authentication required".into(),
+        ),
+        ("STARTTLS", "503 5.5.1 TLS already active".into()),
+        ("FOO", "500 5.5.1 Command not recognized".into()),
+    ] {
+        c.send(cmd).await;
+        assert_eq!(c.line().await, reply, "{cmd}");
+    }
+}
+
+/// ManageSieve announces the close with BYE when the pre-TLS command limit
+/// is reached (RFC 5804 §1.2), as after TLS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sieve_pre_tls_command_limit_says_bye() {
+    let h = Harness::start().await;
+    let mut c = Client::connect(h.proxy.sieve, Src::External).await;
+    c.sieve_response().await;
+    for _ in 0..8 {
+        c.send("NOOP").await;
+        assert_eq!(c.line().await, "OK \"NOOP completed.\"");
+    }
+    c.send("NOOP").await;
+    assert_eq!(c.line().await, "BYE \"Too many commands before STARTTLS\"");
+    c.expect_closed().await;
+}
+
+/// ALPN (RFC 7301, RFC 9325 §3.8): IMAP and ManageSieve take their IANA
+/// identifier and refuse a handshake that offers only other protocols, so a
+/// TLS session meant for another service cannot be redirected to them
+/// (ALPACA). Without ALPN the handshake works as before. SMTP has no
+/// identifier and ignores ALPN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn alpn_per_listener() {
+    let h = Harness::start().await;
+    let imap = |alpn: &'static [&'static [u8]]| {
+        let h = &h;
+        async move {
+            let mut c = Client::connect(h.proxy.imap, Src::External).await;
+            c.try_tls_alpn(&h.pki, Sni::Public, alpn).await
+        }
+    };
+    assert_eq!(
+        imap(&[b"http/1.1", b"imap"]).await.unwrap(),
+        Some(b"imap".to_vec())
+    );
+    assert_eq!(imap(&[]).await.unwrap(), None);
+    let e = imap(&[b"http/1.1"]).await.unwrap_err();
+    assert!(e.to_string().contains("NoApplicationProtocol"), "{e}");
+
+    let sieve = |alpn: &'static [&'static [u8]]| {
+        let h = &h;
+        async move {
+            let mut c = Client::connect(h.proxy.sieve, Src::External).await;
+            c.sieve_response().await;
+            c.send("STARTTLS").await;
+            assert_eq!(c.line().await, "OK \"Begin TLS negotiation now\"");
+            c.try_tls_alpn(&h.pki, Sni::Public, alpn).await
+        }
+    };
+    assert_eq!(
+        sieve(&[b"managesieve"]).await.unwrap(),
+        Some(b"managesieve".to_vec())
+    );
+    assert!(sieve(&[b"imap"]).await.is_err());
+
+    let mut c = Client::connect(h.proxy.smtp, Src::External).await;
+    c.line().await;
+    c.send("STARTTLS").await;
+    assert_eq!(c.line().await, "220 2.0.0 Ready to start TLS");
+    assert_eq!(
+        c.try_tls_alpn(&h.pki, Sni::Public, &[b"http/1.1"])
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+/// Every TLS session the proxy ends before the relay ends with close_notify
+/// (RFC 8314 §3.4): after a refused credential and after a logout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tls_sessions_end_with_close_notify() {
+    let h = Harness::start().await;
+    let token = h.idp.token(EMAIL);
+    let other = xoauth2("mallory@example.test", &token);
+    for kind in [Kind::Imap, Kind::Smtp, Kind::Sieve] {
+        let (mut c, reply) = h
+            .auth(kind, Src::External, Sni::Public, "XOAUTH2", &other)
+            .await;
+        assert!(!reply.is_empty(), "{kind:?}");
+        if kind == Kind::Smtp {
+            assert_eq!(
+                c.line().await,
+                format!("421 4.7.0 {HOSTNAME} closing connection")
+            );
+        }
+        c.expect_close_notify().await;
+
+        let mut c = h.ready(kind, Src::External, Sni::Public).await;
+        let bye = match kind {
+            Kind::Imap => {
+                c.send("a LOGOUT").await;
+                assert!(c.line().await.starts_with("* BYE"));
+                "a OK LOGOUT completed"
+            }
+            Kind::Smtp => {
+                c.send("QUIT").await;
+                "221 2.0.0 Bye"
+            }
+            Kind::Sieve => {
+                c.send("LOGOUT").await;
+                "OK \"Logout completed.\""
+            }
+        };
+        assert_eq!(c.line().await, bye, "{kind:?}");
+        c.expect_close_notify().await;
     }
 }
 

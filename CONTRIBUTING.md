@@ -100,7 +100,7 @@ cargo install cargo-fuzz --locked
 | `sasl` | `auth/sasl.rs`: XOAUTH2, OAUTHBEARER (RFC 7628), PLAIN (RFC 4616), LOGIN fields, base64 | build/parse roundtrips, token and user never span `^A` fields, the authzid rule |
 | `line` | `wire/line.rs`: the line reader, SASL cancel, `verb_is` | result equals a model; at most `MAX_LINE` bytes (the input without LFs, repeated past the limit); nothing read past the LF (STARTTLS injection, CVE-2011-0411) |
 | `proxyproto` | `wire/proxyproto.rs` (builds headers only) | the header parses back to the addresses (PROXY v2 §2.2) |
-| `imap_preauth` | `proto/imap/preauth.rs`: tag, command, LOGIN astrings, AUTHENTICATE | replies are CRLF lines; nothing read past the credential line; quoting roundtrip |
+| `imap_preauth` | `proto/imap/preauth.rs`: tag, command, LOGIN astrings (atoms, quoted strings, literals `{n}` and `{n+}`), AUTHENTICATE | replies are CRLF lines; nothing read past the credential line; quoting roundtrip |
 | `sieve_preauth` | `proto/sieve/preauth.rs`: quoted strings, literals `{n+}` (RFC 5804) | literal limit; nothing read past the credential line; quoting roundtrip |
 | `smtp` | `proto/smtp/preauth.rs` (AUTH), `proto/smtp/backend.rs` (replies, RFC 5321 §4.2) | every refusal is answered; reply line limit |
 | `token` | `auth/token.rs`: unverified `iss`, header and payload decoding, claim checks | no token without a valid signature passes; the identity is one plain address; error texts carry no control characters |

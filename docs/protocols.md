@@ -9,8 +9,8 @@ What the proxy sends and accepts on each protocol before authentication, how it 
 On connect, the proxy completes the TLS handshake (inside the pre-auth budget) and then sends a greeting:
 
 ```
-* OK [CAPABILITY IMAP4rev1 IMAP4rev2 SASL-IR ID LOGINDISABLED AUTH=XOAUTH2 AUTH=OAUTHBEARER] <hostname> ready
-* OK [CAPABILITY IMAP4rev1 IMAP4rev2 SASL-IR ID AUTH=XOAUTH2 AUTH=OAUTHBEARER AUTH=PLAIN AUTH=LOGIN] <hostname> ready   (PLAIN and LOGIN offered by a legacy rule)
+* OK [CAPABILITY IMAP4rev1 SASL-IR ID LOGINDISABLED AUTH=XOAUTH2 AUTH=OAUTHBEARER] <hostname> ready
+* OK [CAPABILITY IMAP4rev1 SASL-IR ID AUTH=XOAUTH2 AUTH=OAUTHBEARER AUTH=PLAIN AUTH=LOGIN] <hostname> ready   (PLAIN and LOGIN offered by a legacy rule)
 ```
 
 A line is split as `<tag> SP <command> [SP <rest>]`. Commands are case-insensitive, and the tag is any non-empty token.
@@ -21,8 +21,11 @@ A line is split as `<tag> SP <command> [SP <rest>]`. Commands are case-insensiti
 | `t NOOP` | `t OK NOOP completed` | stays open |
 | `t ID …` | `* ID NIL` + `t OK ID completed` | stays open |
 | `t LOGOUT` | `* BYE <hostname> signing off` + `t OK LOGOUT completed` | closed; no authlog line |
-| `t LOGIN <user> <pass>` (atom or quoted string with `\"` `\\` escapes) | goes to the credential phase | |
-| `t LOGIN` with a literal `{n}`, bad quoting or a NUL | `t BAD LOGIN arguments` | closed |
+| `t LOGIN <user> <pass>` (atom, quoted string with `\"` `\\` escapes, or literal) | goes to the credential phase | |
+| `t LOGIN … {n}` (synchronising literal, up to 16384 octets) | `+ Ready for literal data`, then the octets and the rest of the command on the next line | stays open |
+| `t LOGIN … {n+}` (non-synchronising literal) | the octets and the rest of the command follow at once | stays open |
+| `t LOGIN … {n}` on a connection that offers no LOGIN | `t NO password authentication not available on this endpoint`, no continuation | closed |
+| `t LOGIN` with bad quoting, a malformed or larger literal, or a NUL | `t BAD LOGIN arguments` | closed |
 | `t LOGIN "" x` | `t NO LOGIN empty field` | closed |
 | `t AUTHENTICATE <mech> [<ir>]` with a supported mech | SASL exchange, [below](#imap-sasl-exchange) | |
 | `t AUTHENTICATE` (no mech) | `t BAD AUTHENTICATE needs a mechanism` | closed |
@@ -131,13 +134,12 @@ The banner is `220 <hostname> ESMTP`.
 | Client sends | Proxy replies |
 |---|---|
 | `EHLO x` | `250-<hostname>` / `250 STARTTLS` |
-| `HELO x` | `250 <hostname>` |
-| `MAIL`, `RCPT`, `DATA`, `BDAT` | `530 5.7.0 Must issue STARTTLS first` |
-| `NOOP`, `RSET` | `250 OK` |
-| `AUTH …` | `530 5.7.0 Must issue STARTTLS first` |
+| `NOOP` | `250 2.0.0 OK` |
 | `STARTTLS` | `220 2.0.0 Ready to start TLS`, then TLS handshake |
+| `STARTTLS` with parameters | `501 5.5.4 Syntax error (no parameters allowed)` |
 | `QUIT` | `221 2.0.0 Bye` (closed) |
-| anything else | `502 5.5.1 Command not recognized` |
+| any other SMTP command (`HELO`, `RSET`, `MAIL`, `RCPT`, `DATA`, `BDAT`, `VRFY`, `EXPN`, `HELP`, `AUTH`) | `530 5.7.0 Must issue STARTTLS first` |
+| anything else | `500 5.5.1 Command not recognized` |
 | after the 8th command (sent unprompted) | `421 4.7.0 Too many commands before STARTTLS` (closed) |
 
 ### SMTP: after TLS
@@ -145,9 +147,11 @@ The banner is `220 <hostname> ESMTP`.
 | Client sends | Proxy replies |
 |---|---|
 | `HELO` | `250 <hostname>` |
-| `MAIL`, `RCPT`, `DATA`, `BDAT` | `530 5.7.0 Authentication required` |
+| `NOOP`, `RSET` | `250 2.0.0 OK` |
+| `STARTTLS` | `503 5.5.1 TLS already active` |
+| any other SMTP command except `AUTH` (`MAIL`, `RCPT`, `DATA`, `BDAT`, `VRFY`, `EXPN`, `HELP`) | `530 5.7.0 Authentication required` |
 | `EHLO` | `250-<hostname>`, one `250-` line per `submission.ehlo_extensions` entry (default PIPELINING, ENHANCEDSTATUSCODES, 8BITMIME, DSN, SMTPUTF8, CHUNKING), `250 AUTH XOAUTH2 OAUTHBEARER[ PLAIN LOGIN]` |
-| `NOOP`, `RSET`, `QUIT`, other | as before TLS (`STARTTLS` now gets `502`) |
+| `QUIT`, an unrecognised command | as before TLS |
 | after the 8th command (sent unprompted) | `421 4.7.0 Too many commands before AUTH` (closed) |
 | `AUTH` without mech | `501 5.5.4 Syntax: AUTH mechanism [initial-response]` |
 | `AUTH <other mech>` | `504 5.5.4 Unrecognized authentication type` |
@@ -188,7 +192,7 @@ Every failure is followed by `421 4.7.0 <hostname> closing connection`, and the 
 3. `STARTTLS`; expect `220`.
 4. TLS handshake, verified.
 5. `EHLO <hostname>`; expect `250`.
-6. (optional) `XCLIENT …`; expect `220`, then `EHLO` again and expect `250`. If the backend advertises `XCLIENT` but `submission.xclient = false`, or the `EHLO` after the proxy's `XCLIENT` still lists `XCLIENT`, the login stops here as an outage. Otherwise, once the relay starts, the authenticated client could send its own `XCLIENT LOGIN=… ADDR=…` on the proxy's authorization.
+6. (optional) `XCLIENT …` with the client's post-TLS `EHLO`/`HELO` name (`HELO=`, xtext; `[UNAVAILABLE]` if it is empty, longer than 255 characters or would push the command past 512 octets), `PROTO=ESMTP` or `SMTP`, `PORT=` the client's source port (each only if the backend lists it), then `NAME=[UNAVAILABLE]` and `ADDR=`; expect `220`, then `EHLO` again and expect `250`. If the backend advertises `XCLIENT` but `submission.xclient = false`, or the `EHLO` after the proxy's `XCLIENT` still lists `XCLIENT`, the login stops here as an outage. Otherwise, once the relay starts, the authenticated client could send its own `XCLIENT LOGIN=… ADDR=…` on the proxy's authorization.
 7. `AUTH XOAUTH2` or `AUTH PLAIN` without an initial response; expect `334`, then send the response on its own line. This keeps the AUTH command line short whatever the token size: Postfix limits command lines to `line_length_limit` (default 2048 octets) but SASL responses to 12288. An XOAUTH2 error challenge (`334 <base64 JSON>`) is answered with an empty line, after which the backend sends its final reply.
 
 Commands the client pipelines after `AUTH` in the same TLS record are kept in the buffer and reach the backend after `235`. A black-box test covers this.
@@ -221,7 +225,7 @@ sequenceDiagram
     B-->>P: 220
     P->>B: EHLO / STARTTLS / TLS / EHLO
     opt xclient = true and backend advertises XCLIENT
-        P->>B: XCLIENT NAME=[UNAVAILABLE] ADDR=<client ip>
+        P->>B: XCLIENT HELO=<client ehlo> PROTO=ESMTP NAME=[UNAVAILABLE] ADDR=<client ip>
         B-->>P: 220
         P->>B: EHLO
     end
@@ -252,7 +256,7 @@ The greeting is the same for every endpoint, including the internal one. It list
 OK "ready"
 ```
 
-The `"SIEVE"` line is the backend's, from the last successful capability probe ([after TLS](#managesieve-after-tls)) whatever its age (RFC 5804 §1.7 requires it). While no probe has succeeded since startup, the greeting waits for one: probes run one at a time, and clients that arrive together share one. A failed probe counts in `mail_auth_proxy_backend_errors_total{proto="sieve"}`, the next one waits 5 s, and in the meantime the greeting goes out without the `"SIEVE"` line ([standards: D-SIEVE-1](standards.md#d-sieve-1-sieve-missing-from-the-pre-tls-greeting-while-the-backend-is-down)). All of this runs within the pre-auth budget.
+The `"SIEVE"` line is the backend's, from the last successful capability probe ([after TLS](#managesieve-after-tls)) whatever its age (RFC 5804 §1.7 requires it). The first probe runs at startup, before any client; a failure there is logged (`WARN … sieve backend capabilities not available at startup`) and does not stop the start. While no probe has succeeded, the greeting waits for one: probes run one at a time, and clients that arrive together share one. A failed probe counts in `mail_auth_proxy_backend_errors_total{proto="sieve"}`, the next one waits 5 s, and in the meantime the greeting goes out without the `"SIEVE"` line ([standards: D-SIEVE-1](standards.md#d-sieve-1-sieve-missing-from-the-pre-tls-greeting-while-the-backend-is-down)). All of this runs within the pre-auth budget.
 
 | Client sends | Proxy replies |
 |---|---|
@@ -262,7 +266,7 @@ The `"SIEVE"` line is the backend's, from the last successful capability probe (
 | `NOOP` | `OK "NOOP completed."`; with a string argument `OK (TAG "<arg>") "Done"` (RFC 5804 §2.13); a malformed argument gets `NO "Invalid NOOP argument"` |
 | `AUTHENTICATE …` | `NO (ENCRYPT-NEEDED) "STARTTLS required"` (the connection stays open) |
 | anything else | `NO "Command not permitted before STARTTLS"` |
-| after the 8th command (sent unprompted) | `NO "Too many commands before STARTTLS"` (closed) |
+| after the 8th command (sent unprompted) | `BYE "Too many commands before STARTTLS"` (closed) |
 
 ### ManageSieve: after TLS
 
@@ -389,10 +393,10 @@ the result is `{"status":"invalid_token"}`.
 1. **One authentication attempt per connection.** Any failed or unsupported AUTH/AUTHENTICATE, and any unknown pre-auth command, closes the connection; SMTP announces the close with `421 4.7.0 <hostname> closing connection`. A client that falls back to another mechanism on the same connection, such as Python `smtplib.login()` from PLAIN to LOGIN after a 535, gets the 421 instead of a second attempt.
 2. **The client's SASL username must match the token for OAuth.** The backend login is always the token's `identity_claim` (default `email`). An XOAUTH2 `user=` (required by the mechanism) or OAUTHBEARER `a=` must be empty, the identity itself, or its local part without a domain (`alice` for `alice@example.org`), all ASCII case-insensitive; anything else, in particular another full address, fails the exchange. OAUTHBEARER is converted to XOAUTH2 for the backend.
 3. **A legacy rule with `sni` needs SNI.** Clients connecting by IP (no SNI) or with a different hostname or alias only get OAuth from such a rule, even from its networks.
-4. **IMAP:** `IMAP4rev2` is always advertised before authentication whatever the backend supports (after login the backend's real list is relayed). `STARTTLS` on the implicit-TLS port closes the connection. IMAP literals in `LOGIN` are not supported.
+4. **IMAP:** only `IMAP4rev1` is advertised before authentication; after login the backend's real list is relayed, with `IMAP4rev2` if the backend offers it. `STARTTLS` on the implicit-TLS port closes the connection.
 5. **SMTP:** the EHLO list is static (no `SIZE`; `CHUNKING`, `DSN` and `SMTPUTF8` are claimed whatever the backend supports).
-6. **ManageSieve:** before login only `CAPABILITY`, `NOOP`, `LOGOUT`, `STARTTLS` (before TLS) and `AUTHENTICATE` are accepted. There is no `LOGIN`. The plaintext greeting lists no mechanism (`"SASL" ""`); the mechanisms appear only after TLS. Client literals must be non-synchronising (`{n+}`); `{n}` is refused. Right after a start, the first greetings wait for the backend's capability probe; while no probe has succeeded and the current one fails, the plaintext greeting lacks the `"SIEVE"` line ([standards: D-SIEVE-1](standards.md#d-sieve-1-sieve-missing-from-the-pre-tls-greeting-while-the-backend-is-down)).
-7. **Password mechanisms that are not offered are refused before the password.** `AUTHENTICATE PLAIN` / `AUTH PLAIN` without an initial response, and SASL `LOGIN`, on a connection without a matching legacy rule get IMAP `NO`, SMTP `504 5.5.4` or ManageSieve `NO` at once; the client is never asked for a password the proxy would not use. A password already sent (IMAP `LOGIN`, a PLAIN initial response) is still logged with its fingerprint.
+6. **ManageSieve:** before login only `CAPABILITY`, `NOOP`, `LOGOUT`, `STARTTLS` (before TLS) and `AUTHENTICATE` are accepted. There is no `LOGIN`. The plaintext greeting lists no mechanism (`"SASL" ""`); the mechanisms appear only after TLS. Client literals must be non-synchronising (`{n+}`); `{n}` is refused. The backend's capabilities are probed at startup; while no probe has succeeded and the current one fails, the plaintext greeting lacks the `"SIEVE"` line ([standards: D-SIEVE-1](standards.md#d-sieve-1-sieve-missing-from-the-pre-tls-greeting-while-the-backend-is-down)).
+7. **Password mechanisms that are not offered are refused before the password.** `AUTHENTICATE PLAIN` / `AUTH PLAIN` without an initial response, and SASL `LOGIN`, on a connection without a matching legacy rule get IMAP `NO`, SMTP `504 5.5.4` or ManageSieve `NO` at once; the client is never asked for a password the proxy would not use, nor sent the continuation for an IMAP `LOGIN` literal. A password already sent (IMAP `LOGIN` with a quoted string or a non-synchronising literal, a PLAIN initial response) is still logged with its fingerprint.
 8. **OAUTHBEARER `host` must be the name the client connected to.** When the client sent SNI, a different `host` (another name or alias of the server) is refused like an invalid token. XOAUTH2 has no `host`; without SNI nothing is compared.
 9. **Slow IdPs and backends count against the pre-auth budget.** Token validation (including a JWKS refresh for an unknown `kid`), the legacy account check and the backend login all have to finish within `timeouts.preauth_secs` (default 60 s) from the accept. A login that runs out gets the retry-later reply, not a failure, and is not logged as a failed login.
 10. **A backend that offers `UNAUTHENTICATE` (RFC 8437) gets no logins.** IMAP (greeting or post-login capabilities) and ManageSieve (capabilities before the credential) logins then end as an outage, with a journal line that names the capability; ManageSieve clients never see the capability.

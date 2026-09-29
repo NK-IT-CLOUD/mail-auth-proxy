@@ -232,15 +232,22 @@ async fn sieve_reject_vs_outage() {
     outcomes(Kind::Sieve).await;
 }
 
-/// ManageSieve with a cold capability cache and the backend down: the
-/// greeting has no SIEVE line and the client gets BYE right after STARTTLS.
-/// The failed probe is one backend error (the second, post-TLS, is not
-/// attempted within the retry spacing); no pre-auth abort is counted, and
-/// no authresult is written.
+/// ManageSieve with the backend down from the start: the startup probe
+/// fails without stopping the start, the greeting has no SIEVE line and the
+/// client gets BYE right after STARTTLS. The failed probe is one backend
+/// error (the greeting and the post-TLS step do not probe again within the
+/// retry spacing); no pre-auth abort is counted, and no authresult is
+/// written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sieve_capability_probe_failure() {
-    let h = Harness::start().await;
-    h.sieve_be.shutdown().await;
+    let h = Harness::start_with(Opts {
+        sieve_down: true,
+        ..Opts::default()
+    })
+    .await;
+    h.proxy
+        .wait_logs("sieve backend capabilities not available at startup", 1)
+        .await;
     let mut c = Client::connect(h.proxy.sieve, Src::External).await;
     let greeting = c.sieve_response().await;
     assert!(!greeting.iter().any(|l| l.starts_with("\"SIEVE\"")));

@@ -20,6 +20,8 @@ use tokio::net::TcpStream;
 
 /// The IMAP listener's own settings.
 pub struct Imap {
+    /// TLS with ALPN `imap`.
+    pub acceptor: tokio_rustls::TlsAcceptor,
     pub backend: BackendConn,
 }
 
@@ -39,7 +41,7 @@ pub async fn handle(
     let preauth_until = tokio::time::Instant::now() + tuning.preauth;
     let mut client =
         match wire::deadline_at(preauth_until, tuning.preauth, "imap TLS handshake", async {
-            Ok(ctx.acceptor.accept(tcp).await?)
+            Ok(ctx.protocol.acceptor.accept(tcp).await?)
         })
         .await
         {
@@ -49,148 +51,156 @@ pub async fn handle(
                 return Err(e);
             }
         };
-    // Source IP + SNI (client-requested name) decide which password
-    // mechanisms the legacy gate offers on this connection; none → OAuth-only.
-    let sni = client.get_ref().1.server_name().map(|s| s.to_string());
-    let pw_mechs = ctx.password_mechs(metrics::Proto::Imap, sni.as_deref(), peer);
-    let session = auth::Session {
-        proto: metrics::Proto::Imap,
-        peer,
-        internal,
-        scope,
-        sni: sni.as_deref(),
-        pw_mechs,
-        preauth_until,
-    };
-    let (tag, mech, is_password, outcome) = match wire::deadline_at(
-        preauth_until,
-        tuning.preauth,
-        "imap pre-auth",
-        read_client_auth(&mut client, pw_mechs, ctx.hostname(), tuning),
-    )
-    .await
-    {
-        Ok(Some(auth)) => {
-            let login = backend::ImapLogin {
-                backend: &ctx.protocol.backend,
-                tuning,
-                peer,
-                local,
-                mech: &auth.mech,
-            };
-            let is_password = matches!(auth.kind, sasl::ClientAuthKind::Password { .. });
-            let host = auth.host.as_deref();
-            let outcome =
-                auth::authorize(&ctx, &session, &auth.mech, &auth.kind, host, &login).await;
-            // The credential is not needed after the login: dropping it
-            // zeroizes it before the splice, which can last for hours.
-            drop(auth.kind);
-            (auth.tag, auth.mech, is_password, outcome)
-        }
-        // LOGOUT, or a disconnect right after the greeting, before
-        // authenticating: a clean end, e.g. a monitoring probe.
-        Ok(None) => return Ok(()),
-        Err(e) => {
-            // Answered already; recorded like a blocked password.
-            if let Some(w) = e.downcast_ref::<auth::Withheld>() {
-                return Err(auth::withheld(&ctx, &session, w));
+    // The TLS session ends with close_notify whichever way the dialog
+    // ends (RFC 8314 §3.4); the relay closes its own.
+    let result: Result<()> = async {
+        // Source IP + SNI (client-requested name) decide which password
+        // mechanisms the legacy gate offers on this connection; none → OAuth-only.
+        let sni = client.get_ref().1.server_name().map(|s| s.to_string());
+        let pw_mechs = ctx.password_mechs(metrics::Proto::Imap, sni.as_deref(), peer);
+        let session = auth::Session {
+            proto: metrics::Proto::Imap,
+            peer,
+            internal,
+            scope,
+            sni: sni.as_deref(),
+            pw_mechs,
+            preauth_until,
+        };
+        let (tag, mech, is_password, outcome) = match wire::deadline_at(
+            preauth_until,
+            tuning.preauth,
+            "imap pre-auth",
+            read_client_auth(&mut client, pw_mechs, ctx.hostname(), tuning),
+        )
+        .await
+        {
+            Ok(Some(auth)) => {
+                let login = backend::ImapLogin {
+                    backend: &ctx.protocol.backend,
+                    tuning,
+                    peer,
+                    local,
+                    mech: &auth.mech,
+                };
+                let is_password = matches!(auth.kind, sasl::ClientAuthKind::Password { .. });
+                let host = auth.host.as_deref();
+                let outcome =
+                    auth::authorize(&ctx, &session, &auth.mech, &auth.kind, host, &login).await;
+                // The credential is not needed after the login: dropping it
+                // zeroizes it before the splice, which can last for hours.
+                drop(auth.kind);
+                (auth.tag, auth.mech, is_password, outcome)
             }
-            // Answered with the error result like a rejected token.
-            if let Some(d) = e.downcast_ref::<sasl::Discovery>() {
-                auth::discovery(&session, d);
-                let asked = auth::Outcome::BadToken(TokenError::Invalid(d.to_string()));
-                (d.tag.clone(), d.mech.clone(), false, asked)
-            } else {
-                // No credential was presented: a `protocol` record and a
-                // pre-auth abort, not a failed login.
-                authlog::AuthEvent {
-                    proto: metrics::Proto::Imap,
-                    scope,
-                    mech: "other",
-                    user: "",
-                    peer: peer.ip(),
-                    reason: authlog::Reason::Protocol,
-                    pwfp: "",
-                    rule: "",
+            // LOGOUT, or a disconnect right after the greeting, before
+            // authenticating: a clean end, e.g. a monitoring probe.
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                // Answered already; recorded like a blocked password.
+                if let Some(w) = e.downcast_ref::<auth::Withheld>() {
+                    return Err(auth::withheld(&ctx, &session, w));
                 }
-                .record();
-                metrics::record_preauth_abort(metrics::Proto::Imap, internal);
-                return Err(e);
+                // Answered with the error result like a rejected token.
+                if let Some(d) = e.downcast_ref::<sasl::Discovery>() {
+                    auth::discovery(&session, d);
+                    let asked = auth::Outcome::BadToken(TokenError::Invalid(d.to_string()));
+                    (d.tag.clone(), d.mech.clone(), false, asked)
+                } else {
+                    // No credential was presented: a `protocol` record and a
+                    // pre-auth abort, not a failed login.
+                    authlog::AuthEvent {
+                        proto: metrics::Proto::Imap,
+                        scope,
+                        mech: "other",
+                        user: "",
+                        peer: peer.ip(),
+                        reason: authlog::Reason::Protocol,
+                        pwfp: "",
+                        rule: "",
+                    }
+                    .record();
+                    metrics::record_preauth_abort(metrics::Proto::Imap, internal);
+                    return Err(e);
+                }
             }
-        }
-    };
-    let tag = &tag;
-    let (reply, error) = match outcome {
-        auth::Outcome::Ok {
-            conn: (mut be, logged_in),
-            ..
-        } => {
-            permit.authenticated();
-            // Relay the backend's own tagged OK under the client's tag: its
-            // CAPABILITY response code is what the client may cache for the
-            // session (RFC 9051 section 7.1), so it must list the backend's real
-            // post-login capabilities.
-            client
-                .write_all(format!("{tag} {logged_in}\r\n").as_bytes())
-                .await?;
-            wire::splice(&mut client, &mut be, metrics::Proto::Imap, tuning).await;
-            return Ok(());
-        }
-        auth::Outcome::Blocked => (
-            format!("{tag} NO password authentication not available on this endpoint"),
-            refused(format!(
-                "password auth blocked on OAuth-only endpoint (scope={scope})"
-            )),
-        ),
-        // RFC 7628 section 3.2.2: the error result as a continuation, then
-        // the failure once the client has answered it (section 3.2.3). Fixed
-        // texts: the reason stays in the journal, not on the wire. An abort
-        // (`*`) or undecodable answer is a tagged BAD (RFC 9051 section
-        // 6.2.2); anything else, and a client that does not answer, gets NO.
-        auth::Outcome::BadToken(e) => {
-            let prompt = format!("+ {}", ctx.error_challenge.base64());
-            let answer =
-                discovery::complete_line(&mut client, &prompt, &mech, preauth_until, tuning).await;
-            let reply = match answer {
-                Ok(Answer::Cancelled | Answer::Undecodable) => {
-                    format!("{tag} BAD AUTHENTICATE failed: invalid or cancelled response")
-                }
-                _ => format!("{tag} NO [AUTHENTICATIONFAILED] Authentication failed"),
-            };
-            (
-                reply,
-                refused(format!("token rejected: {e}{}", Answer::note(&answer))),
-            )
-        }
-        // RFC 5530: the credential is fine, the requested authorisation
-        // identity is not.
-        auth::Outcome::WrongAuthzid => (
-            format!("{tag} NO [AUTHORIZATIONFAILED] Authorization failed"),
-            refused("authorization identity differs from the token's identity"),
-        ),
-        // Refused by the legacy gate: the same answer as a wrong password, so
-        // the client cannot tell the cases apart.
-        auth::Outcome::Denied => (
-            format!("{tag} NO [AUTHENTICATIONFAILED] backend rejected credentials"),
-            refused("password refused by the legacy gate"),
-        ),
-        auth::Outcome::Rejected(reply) => {
-            let what = if is_password { "credentials" } else { "token" };
-            (
-                format!("{tag} NO [AUTHENTICATIONFAILED] backend rejected {what}"),
-                refused(format!("backend auth rejected: {reply}")),
-            )
-        }
-        // RFC 5530 UNAVAILABLE tells the client to retry later rather than to
-        // discard its credential.
-        auth::Outcome::Unavailable(e) => (
-            format!("{tag} NO [UNAVAILABLE] Backend temporarily unavailable"),
-            e.context("backend unavailable"),
-        ),
-    };
-    let _ = client.write_all(format!("{reply}\r\n").as_bytes()).await;
-    // rustls buffers; without a flush the answer is lost when the stream is
-    // dropped.
-    let _ = client.flush().await;
-    Err(error)
+        };
+        let tag = &tag;
+        let (reply, error) = match outcome {
+            auth::Outcome::Ok {
+                conn: (mut be, logged_in),
+                ..
+            } => {
+                permit.authenticated();
+                // Relay the backend's own tagged OK under the client's tag: its
+                // CAPABILITY response code is what the client may cache for the
+                // session (RFC 9051 section 7.1), so it must list the backend's real
+                // post-login capabilities.
+                client
+                    .write_all(format!("{tag} {logged_in}\r\n").as_bytes())
+                    .await?;
+                wire::splice(&mut client, &mut be, metrics::Proto::Imap, tuning).await;
+                return Ok(());
+            }
+            auth::Outcome::Blocked => (
+                format!("{tag} NO password authentication not available on this endpoint"),
+                refused(format!(
+                    "password auth blocked on OAuth-only endpoint (scope={scope})"
+                )),
+            ),
+            // RFC 7628 section 3.2.2: the error result as a continuation, then
+            // the failure once the client has answered it (section 3.2.3). Fixed
+            // texts: the reason stays in the journal, not on the wire. An abort
+            // (`*`) or undecodable answer is a tagged BAD (RFC 9051 section
+            // 6.2.2); anything else, and a client that does not answer, gets NO.
+            auth::Outcome::BadToken(e) => {
+                let prompt = format!("+ {}", ctx.error_challenge.base64());
+                let answer =
+                    discovery::complete_line(&mut client, &prompt, &mech, preauth_until, tuning)
+                        .await;
+                let reply = match answer {
+                    Ok(Answer::Cancelled | Answer::Undecodable) => {
+                        format!("{tag} BAD AUTHENTICATE failed: invalid or cancelled response")
+                    }
+                    _ => format!("{tag} NO [AUTHENTICATIONFAILED] Authentication failed"),
+                };
+                (
+                    reply,
+                    refused(format!("token rejected: {e}{}", Answer::note(&answer))),
+                )
+            }
+            // RFC 5530: the credential is fine, the requested authorisation
+            // identity is not.
+            auth::Outcome::WrongAuthzid => (
+                format!("{tag} NO [AUTHORIZATIONFAILED] Authorization failed"),
+                refused("authorization identity differs from the token's identity"),
+            ),
+            // Refused by the legacy gate: the same answer as a wrong password, so
+            // the client cannot tell the cases apart.
+            auth::Outcome::Denied => (
+                format!("{tag} NO [AUTHENTICATIONFAILED] backend rejected credentials"),
+                refused("password refused by the legacy gate"),
+            ),
+            auth::Outcome::Rejected(reply) => {
+                let what = if is_password { "credentials" } else { "token" };
+                (
+                    format!("{tag} NO [AUTHENTICATIONFAILED] backend rejected {what}"),
+                    refused(format!("backend auth rejected: {reply}")),
+                )
+            }
+            // RFC 5530 UNAVAILABLE tells the client to retry later rather than to
+            // discard its credential.
+            auth::Outcome::Unavailable(e) => (
+                format!("{tag} NO [UNAVAILABLE] Backend temporarily unavailable"),
+                e.context("backend unavailable"),
+            ),
+        };
+        let _ = client.write_all(format!("{reply}\r\n").as_bytes()).await;
+        // rustls buffers; without a flush the answer is lost when the stream is
+        // dropped.
+        let _ = client.flush().await;
+        Err(error)
+    }
+    .await;
+    crate::wire::close(&mut client).await;
+    result
 }

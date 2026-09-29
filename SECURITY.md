@@ -51,7 +51,7 @@ relays bytes. It never holds a master password or any other credential of its ow
 | An authenticated SMTP client sending its own `XCLIENT` to impersonate another user | the proxy never relays into a session in which the backend still offers `XCLIENT`. A backend that advertises it while `submission.xclient = false`, or still advertises it after the proxy's own `XCLIENT` with `submission.xclient = true` (the client's address is itself authorized), is treated as misconfigured, and the login fails as an outage |
 | A logged-in client returning to the unauthenticated state (`UNAUTHENTICATE`, RFC 8437) to try passwords directly at the backend | the proxy never relays into such a session: a backend that offers `UNAUTHENTICATE` gets no login (an outage), and the capability is not passed to clients |
 | Bans of legitimate users during an outage | outages are answered with retry-later and never logged as failed logins |
-| One issuer asserting identities that belong to another | **not mitigated:** all configured issuers share one identity namespace, so an account name valid at issuer A can be asserted by issuer B. Configure only issuers you trust for all your domains ([D-JWT-3](docs/standards.md#d-jwt-3-identity-namespace-across-issuers)) |
+| One issuer asserting identities that belong to another | `oauth.issuers[].identity_domains`: an issuer logs in only to addresses in its domains. Without it, all issuers share one identity namespace, so an account name valid at issuer A can be asserted by issuer B; with more than one issuer the configuration warns about each issuer without it ([D-JWT-3](docs/standards.md#d-jwt-3-identity-namespace-across-issuers)) |
 
 ### Invariants
 

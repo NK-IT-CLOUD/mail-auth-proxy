@@ -6,6 +6,60 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- IMAP `LOGIN` takes its user name and password as literals (RFC 9051 §6.2.3, §9): a
+  synchronising `{n}` after a `+ ` continuation, a non-synchronising `{n+}` at once, up
+  to 16384 octets each. A password a client sends as a literal (for example one with
+  8-bit characters) was refused with `BAD`. Where the connection offers no LOGIN, a
+  synchronising literal is refused with `NO` before the continuation.
+- XCLIENT to the submission backend carries the client's post-TLS EHLO or HELO name
+  (`HELO=`), `PROTO=ESMTP` or `SMTP` and the client's source port (`PORT=`), each where
+  the backend lists it, so its `Received:` header names the client's greeting instead
+  of the proxy's (RFC 5321 §4.4). `smtpd_helo_restrictions` on the submission service
+  now apply to the client's name.
+- `oauth.issuers[].identity_domains`: the domains an issuer may log in to. A token whose
+  identity is not an address in one of them is a `bad_token`. With more than one issuer,
+  each issuer without it gives a configuration warning: every issuer could otherwise log
+  in to every other issuer's mailboxes (OIDC Core §5.7).
+- ALPN on the IMAP and ManageSieve listeners (`imap`, `managesieve`, RFC 7301): a client
+  that offers ALPN without the listener's identifier is refused in the TLS handshake, so
+  a TLS session meant for another service cannot be redirected to them (RFC 9325 §3.8,
+  ALPACA). Clients without ALPN are unaffected; SMTP has no identifier and ignores it.
+
+### Changed
+- The ManageSieve backend's capabilities are probed once at startup, so the first
+  greetings no longer wait for a probe. A failure there is logged and counted in
+  `mail_auth_proxy_backend_errors_total{proto="sieve"}`; the start goes on.
+- IMAP advertises `IMAP4rev1` without `IMAP4rev2` before login. The proxy does not know
+  whether the backend speaks IMAP4rev2; after login the backend's own list is relayed as
+  before, with `IMAP4rev2` where the backend offers it. Dovecot enables IMAP4rev2 only
+  with `imap4rev2_enable`.
+
+### Fixed
+- Client lines are read without arming the idle timer for every byte that has already
+  arrived. A long line (a 10 KB password) took several times longer to read than to
+  receive, and under CPU load its refusal came measurably later than that of a short
+  wrong password.
+- SMTP replies before authentication: before TLS every command other than NOOP, EHLO,
+  STARTTLS and QUIT gets `530 5.7.0` (RFC 3207 §4; HELO and RSET got `250`), STARTTLS
+  with parameters `501 5.5.4`; after TLS and before AUTH `530 5.7.0` for every command
+  other than AUTH, EHLO, HELO, NOOP, RSET and QUIT (RFC 4954 §6) and `503 5.5.1` for
+  STARTTLS; an unrecognised command `500 5.5.1` instead of `502` (RFC 5321 §4.2.4);
+  `250 2.0.0 OK` with an enhanced status code for NOOP and RSET (RFC 2034 §4).
+- A JWK whose `key_ops` does not include `verify` is skipped like one with a `use` other
+  than `sig` (RFC 7517 §4.3).
+- The PROXY v2 header carries IPv4-mapped IPv6 addresses (a dual-stack listener) as
+  TCP over IPv4, so the backend logs `192.0.2.7`, not `::ffff:192.0.2.7`.
+- ManageSieve answers the pre-TLS command limit with `BYE` instead of `NO` before it
+  closes the connection (RFC 5804 §1.2), as after TLS.
+- A client and local address of different families, which cannot be put in one PROXY
+  header, fail the backend connection as an outage. The connection went ahead without
+  the header, which the backend refuses or logs with the proxy's address.
+- A TLS session the proxy ends before the relay (a refused credential, an outage, a
+  pre-authentication timeout, LOGOUT or QUIT) ends with a TLS close_notify (RFC 8314
+  §3.4). The connection was dropped without one, which clients report as a truncated
+  session.
+
 ## [0.2.1] - 2026-09-29
 
 ### Added

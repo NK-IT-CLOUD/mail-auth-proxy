@@ -222,8 +222,11 @@ encrypt` or `may`); the proxy always upgrades the backend connection. Implicit T
 ### XCLIENT
 
 List only the proxy in `smtpd_authorized_xclient_hosts`. Postfix advertises `XCLIENT`
-only to those hosts; the proxy then sends `XCLIENT NAME=[UNAVAILABLE] ADDR=<client>`, and
-Postfix logs and applies its restrictions with the client's address. If the proxy is not
+only to those hosts; the proxy then sends `XCLIENT HELO=<client's EHLO name> PROTO=ESMTP PORT=<client port>
+NAME=[UNAVAILABLE] ADDR=<client>` (HELO, PROTO and PORT as far as Postfix lists them), and
+Postfix logs and applies its restrictions with the client's address; the `Received:` header
+names the client's EHLO name. `smtpd_helo_restrictions` on the submission service now see
+the client's name, as without the proxy. If the proxy is not
 listed, Postfix does not advertise `XCLIENT`, the proxy skips the step silently and
 Postfix sees the proxy's address.
 

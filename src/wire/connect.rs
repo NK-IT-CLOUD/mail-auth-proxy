@@ -58,17 +58,20 @@ async fn send_proxy_header(
         return Ok(());
     }
     let hdr = match origin {
-        Some((client, local)) => super::proxyproto::v2_header(client, local),
-        None => Some(super::proxyproto::v2_local_header()),
+        // A backend that expects the header refuses a connection without
+        // one: an outage with its cause, not a silent omission.
+        Some((client, local)) => super::proxyproto::v2_header(client, local).ok_or_else(|| {
+            anyhow::anyhow!(
+                "PROXY header: client {client} and local {local} differ in address family"
+            )
+        })?,
+        None => super::proxyproto::v2_local_header(),
     };
-    if let Some(hdr) = hdr {
-        deadline(timeout, "backend PROXY header", async {
-            tcp.write_all(&hdr).await?;
-            Ok(())
-        })
-        .await?;
-    }
-    Ok(())
+    deadline(timeout, "backend PROXY header", async {
+        tcp.write_all(&hdr).await?;
+        Ok(())
+    })
+    .await
 }
 
 /// Split a `host:port` (or bare host) into just the host, handling bracketed
@@ -122,6 +125,36 @@ mod tests {
             "sieve backend TLS handshake timed out after 0s"
         );
         silent.abort();
+    }
+
+    /// Client and local address from different families cannot be put in
+    /// one PROXY header; the connect fails instead of going ahead without
+    /// the header the backend expects.
+    #[tokio::test]
+    async fn mixed_family_origin_is_an_error() {
+        use std::sync::Arc;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let backend = BackendConn {
+            address: listener.local_addr().unwrap().to_string(),
+            name: rustls::pki_types::ServerName::try_from("backend.test").unwrap(),
+            tls: tokio_rustls::TlsConnector::from(Arc::new(cfg)),
+            proxy_protocol: true,
+            keepalive: crate::wire::Tuning::default().keepalive,
+        };
+        let client: SocketAddr = "192.0.2.7:40000".parse().unwrap();
+        let local: SocketAddr = "[2001:db8::1]:993".parse().unwrap();
+        let e = connect(
+            &backend,
+            Some((client, local)),
+            Duration::from_secs(5),
+            "backend",
+        )
+        .await
+        .unwrap_err();
+        assert!(e.to_string().contains("address family"), "{e}");
     }
 
     #[test]

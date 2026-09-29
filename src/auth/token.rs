@@ -102,6 +102,8 @@ pub struct Policy {
     infer_key_algorithm: bool,
     allowed_clients: Vec<String>,
     client_claim: String,
+    /// Domains the identity must be in; empty: any.
+    identity_domains: Vec<String>,
 }
 
 impl Policy {
@@ -122,6 +124,7 @@ impl Policy {
             infer_key_algorithm: i.infer_key_algorithm,
             allowed_clients: i.allowed_clients.clone(),
             client_claim: i.client_claim().to_owned(),
+            identity_domains: i.identity_domains.clone(),
         })
     }
 
@@ -142,6 +145,7 @@ impl Policy {
             infer_key_algorithm: true,
             allowed_clients: Vec::new(),
             client_claim: "azp".into(),
+            identity_domains: Vec::new(),
         }
     }
 }
@@ -452,6 +456,13 @@ impl Validator {
                     continue;
                 }
             }
+            // RFC 7517 §4.3: `key_ops` is optional as well; a key that lists
+            // its operations without "verify" is not for checking signatures.
+            match &k["key_ops"] {
+                Value::Null => {}
+                Value::Array(ops) if ops.iter().any(|o| o.as_str() == Some("verify")) => {}
+                _ => continue,
+            }
             let kid = k["kid"].as_str().unwrap_or("default").to_string();
             let kty = k["kty"].as_str();
             let candidates: Vec<Algorithm> = match k["alg"].as_str() {
@@ -715,6 +726,19 @@ pub(crate) fn check_claims(
     if !plausible {
         return Err(invalid!("identity claim is not a plain login"));
     }
+    // OIDC Core §5.7: one issuer's claim value says nothing about another
+    // issuer's users; the domains bound what this issuer may log in to.
+    if !policy.identity_domains.is_empty()
+        && !id.rsplit_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty()
+                && policy
+                    .identity_domains
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case(domain))
+        })
+    {
+        return Err(invalid!("identity outside the issuer's identity_domains"));
+    }
     Ok(id.to_string())
 }
 
@@ -931,6 +955,32 @@ mod tests {
         let (_pem, mut jwks) = test_es256_keypair("kid1");
         jwks["keys"][0]["use"] = json!("enc");
         assert!(Validator::from_jwks_values(&[(jwks, ISS_A)], "dovecot").is_err());
+    }
+
+    /// RFC 7517 §4.3: a key whose `key_ops` do not include "verify" is not
+    /// used; one that includes it is.
+    #[test]
+    fn key_ops_without_verify_is_skipped() {
+        for (ops, usable) in [
+            (json!(["verify"]), true),
+            (json!(["sign", "verify"]), true),
+            (json!(["encrypt"]), false),
+            (json!([]), false),
+            (json!("verify"), false),
+        ] {
+            let (priv_pem, mut jwks) = test_es256_keypair("kid1");
+            jwks["keys"][0]["key_ops"] = ops.clone();
+            let v = Validator::from_jwks_values(&[(jwks, ISS_A)], "dovecot");
+            assert_eq!(v.is_ok(), usable, "{ops}");
+            if let Ok(v) = v {
+                let tok = mint(
+                    &priv_pem,
+                    "kid1",
+                    json!({"iss":ISS_A,"aud":"dovecot","exp":4102444800usize,"email":"nk@x"}),
+                );
+                assert_eq!(v.validate(&tok).unwrap(), "nk@x");
+            }
+        }
     }
 
     #[test]
@@ -1468,6 +1518,52 @@ mod tests {
             v.validate(&mint_raw(&priv_pem, "kid1", &c)).unwrap(),
             "nk@x"
         );
+    }
+
+    /// With `identity_domains` an issuer vouches only for identities in its
+    /// domains (ASCII case-insensitive); another issuer's domain, a login
+    /// without a domain or a lookalike suffix is a bad token.
+    #[test]
+    fn identity_domains_bound_the_issuer() {
+        let (priv_pem, jwks) = test_es256_keypair("kid1");
+        let mut p = policy(ISS_A);
+        p.identity_domains = vec!["example.org".into(), "Example.NET".into()];
+        let v = Validator::from_parts(vec![(jwks, p)]).unwrap();
+        let tok = |email: &str| {
+            mint(
+                &priv_pem,
+                "kid1",
+                json!({"iss":ISS_A,"aud":"dovecot","exp":4102444800usize,"email":email}),
+            )
+        };
+        assert_eq!(
+            v.validate(&tok("alice@example.org")).unwrap(),
+            "alice@example.org"
+        );
+        assert_eq!(
+            v.validate(&tok("bob@EXAMPLE.net")).unwrap(),
+            "bob@EXAMPLE.net"
+        );
+        for other in [
+            "carol@example.com",
+            "dave@sub.example.org",
+            "eve@notexample.org",
+        ] {
+            let e = v.validate(&tok(other)).unwrap_err().to_string();
+            assert!(e.contains("identity_domains"), "{other}: {e}");
+        }
+        let mut p = policy(ISS_A);
+        p.identity_claim = "preferred_username".into();
+        p.require_email_verified = false;
+        p.identity_domains = vec!["example.org".into()];
+        let (priv_pem, jwks) = test_es256_keypair("kid2");
+        let v = Validator::from_parts(vec![(jwks, p)]).unwrap();
+        let bare = mint(
+            &priv_pem,
+            "kid2",
+            json!({"iss":ISS_A,"aud":"dovecot","exp":4102444800usize,"preferred_username":"alice"}),
+        );
+        assert!(v.validate(&bare).is_err(), "no domain");
     }
 
     /// Another identity claim, no email_verified requirement, client allowlist.
