@@ -242,7 +242,7 @@ const MAX_REPLY_LINES: usize = 64;
 
 /// Reads an SMTP reply that may span multiple `NNN-...` lines ending with
 /// `NNN ...`; more than `MAX_REPLY_LINES` lines are an error.
-async fn read_smtp_reply<S: AsyncRead + Unpin>(
+pub(crate) async fn read_smtp_reply<S: AsyncRead + Unpin>(
     s: &mut S,
     idle: Duration,
 ) -> Result<(u16, Vec<String>)> {

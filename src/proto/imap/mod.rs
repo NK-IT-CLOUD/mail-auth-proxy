@@ -2,7 +2,7 @@
 //! backend login, then a byte relay.
 
 mod backend;
-mod preauth;
+pub(crate) mod preauth;
 
 use crate::auth::discovery::{self, Answer};
 use crate::auth::{self, refused, sasl};

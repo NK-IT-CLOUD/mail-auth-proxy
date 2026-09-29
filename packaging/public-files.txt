@@ -11,6 +11,7 @@ src/
 tests/
 examples/
 contrib/
+fuzz/
 packaging/
 docs/README.md
 docs/architecture.md

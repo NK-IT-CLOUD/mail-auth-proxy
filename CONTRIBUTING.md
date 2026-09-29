@@ -48,6 +48,7 @@ A single crate with a library (`src/lib.rs`) and a thin binary (`src/main.rs`).
 | `packaging/` | systemd unit, sysusers.d, nfpm manifest, maintainer scripts, hermetic build, package smoke test and systemd start test |
 | `packaging/public-files.txt`, `public-tree.sh`, `leak-gate*.sh` | release tooling: the list of public paths, the script that builds the public tree from it, and the leak gate (with its self-test) that checks a tree or commit range before publication |
 | `contrib/crowdsec/` | CrowdSec parser and scenarios with `cscli hubtest` cases |
+| `fuzz/` | cargo-fuzz targets for the pre-auth parsers, their seed corpus and dictionaries (a crate of its own, see [Fuzzing](#fuzzing)) |
 | `docs/` | user documentation ([index](docs/README.md)) |
 
 ## Building and testing
@@ -77,6 +78,54 @@ each test.
 If you change `contrib/crowdsec/`, run its hubtest cases as described in
 [contrib/crowdsec/README.md](contrib/crowdsec/README.md#tests). Release packages are built by
 `packaging/build.sh` in a digest-pinned container; you do not need it for a change.
+
+## Fuzzing
+
+`fuzz/` holds [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz) (libFuzzer) targets
+for everything that parses bytes from a client or backend before a login. It is a crate
+of its own with its own `Cargo.lock` and workspace: `cargo build`, `cargo test`,
+`cargo deny` and the main `Cargo.lock` never include it. cargo-fuzz builds the library
+with `--cfg fuzzing`, which compiles `src/fuzz_api.rs`, a set of thin wrappers that make
+the internal parsers reachable; a normal build does not contain it.
+
+Setup (cargo-fuzz needs a nightly compiler; `rust-toolchain.toml` stays as it is):
+
+```bash
+rustup toolchain install nightly --profile minimal
+cargo install cargo-fuzz --locked
+```
+
+| Target | Code | Checked besides "no panic" |
+|---|---|---|
+| `sasl` | `auth/sasl.rs`: XOAUTH2, OAUTHBEARER (RFC 7628), PLAIN (RFC 4616), LOGIN fields, base64 | build/parse roundtrips, token and user never span `^A` fields, the authzid rule |
+| `line` | `wire/line.rs`: the line reader, SASL cancel, `verb_is` | result equals a model; at most `MAX_LINE` bytes (the input without LFs, repeated past the limit); nothing read past the LF (STARTTLS injection, CVE-2011-0411) |
+| `proxyproto` | `wire/proxyproto.rs` (builds headers only) | the header parses back to the addresses (PROXY v2 §2.2) |
+| `imap_preauth` | `proto/imap/preauth.rs`: tag, command, LOGIN astrings, AUTHENTICATE | replies are CRLF lines; nothing read past the credential line; quoting roundtrip |
+| `sieve_preauth` | `proto/sieve/preauth.rs`: quoted strings, literals `{n+}` (RFC 5804) | literal limit; nothing read past the credential line; quoting roundtrip |
+| `smtp` | `proto/smtp/preauth.rs` (AUTH), `proto/smtp/backend.rs` (replies, RFC 5321 §4.2) | every refusal is answered; reply line limit |
+| `token` | `auth/token.rs`: unverified `iss`, header and payload decoding, claim checks | no token without a valid signature passes; the identity is one plain address; error texts carry no control characters |
+| `config` | `config::parse` | a valid configuration printed with `--print-config` parses again and is valid |
+| `tls_not_after` | `server/tls.rs`: the DER walk to a certificate's `notAfter` (RFC 5280 §4.1) | on raw bytes and as the time value in a certificate skeleton: never a time past year 9999, every well-formed time from 1970 on parses |
+
+Run a target from `fuzz/`. New inputs go to the first directory; keep it outside the
+repository so the checked-in seed corpus stays small:
+
+```bash
+cd fuzz
+cargo +nightly fuzz run sasl /tmp/corpus-sasl corpus/sasl -- \
+    -dict=dict/sasl.dict -max_total_time=600 -rss_limit_mb=1024
+```
+
+`proxyproto` has no dictionary. The workflow `.github/workflows/fuzz.yml` runs every
+target for 60 seconds once a week (Saturday 03:00 UTC) and on manual start; it is not
+part of the CI of pushes and pull requests. A crash is written to
+`fuzz/artifacts/<target>/`; `cargo +nightly fuzz tmin <target> <file>` minimises it.
+Every crash becomes a normal regression test in `src/` or `tests/` before it is fixed.
+
+`fuzz/corpus/<target>/` holds a few seed inputs derived from the unit tests (only
+`example.org` names and documentation addresses); `fuzz/dict/` the protocol keywords.
+Add a seed when a new syntax is supported. `fuzz/target`, `fuzz/artifacts` and
+`fuzz/coverage` are not checked in.
 
 ## Rules for changes
 

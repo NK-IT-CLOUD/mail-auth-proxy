@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 /// Parse `AUTH <MECH> [<IR>]` (already-read line) and gather the credential.
 /// Returns the mechanism name and a classified `ClientAuthKind`. Never logs
 /// secrets. Every error path answers the client (501/504) before returning.
-pub(super) async fn read_smtp_auth<S>(
+pub(crate) async fn read_smtp_auth<S>(
     line: &str,
     stream: &mut S,
     idle: Duration,

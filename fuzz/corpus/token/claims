@@ -1,0 +1,1 @@
+{"iss": "https://sso.example.org", "aud": "mail", "exp": 4102444800, "typ": "Bearer", "email": "alice@example.org", "email_verified": true, "azp": "mail"}

@@ -1,0 +1,4 @@
+3E1 CAPABILITY
+E0 NOOP
+E9 ID ("name" "x")
+E2 LOGIN user@example.org "p\"a ss\\w"

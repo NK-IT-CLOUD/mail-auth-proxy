@@ -1,0 +1,6 @@
+1220 mail.example.org ESMTP
+250-mail.example.org
+250-PIPELINING
+250-STARTTLS
+250 AUTH PLAIN XOAUTH2
+235 2.7.0 Authentication successful

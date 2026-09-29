@@ -1,0 +1,89 @@
+# Fuzz targets for the pre-auth parsers (cargo-fuzz, libFuzzer). A crate of
+# its own with its own lock file and workspace: the main build, its
+# Cargo.lock and cargo-deny never see it. See CONTRIBUTING.md, "Fuzzing".
+[package]
+name = "mail-auth-proxy-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mail-auth-proxy = { path = ".." }
+tokio = { version = "1", features = ["rt", "io-util", "time"] }
+base64 = "0.23"
+serde_json = "1"
+toml = "1"
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "sasl"
+path = "fuzz_targets/sasl.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "line"
+path = "fuzz_targets/line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxyproto"
+path = "fuzz_targets/proxyproto.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "imap_preauth"
+path = "fuzz_targets/imap_preauth.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sieve_preauth"
+path = "fuzz_targets/sieve_preauth.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "smtp"
+path = "fuzz_targets/smtp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "token"
+path = "fuzz_targets/token.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config"
+path = "fuzz_targets/config.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls_not_after"
+path = "fuzz_targets/tls_not_after.rs"
+test = false
+doc = false
+bench = false

@@ -16,7 +16,7 @@ use zeroize::Zeroizing;
 /// The MECH is unquoted from the first quoted-string token.
 /// The IR is unquoted from the second token (quoted or literal); it carries
 /// the credential and is zeroized on drop.
-pub(super) async fn parse_authenticate_line<S>(
+pub(crate) async fn parse_authenticate_line<S>(
     line: &str,
     stream: &mut S,
     idle: Duration,
@@ -101,7 +101,7 @@ where
 /// Read a SASL client response: one string on its own line, quoted or a
 /// literal (RFC 5804 section 2.1). A bare line is taken as it is. The
 /// response can carry a credential and is zeroized on drop.
-pub(super) async fn read_sasl_string<S>(stream: &mut S, idle: Duration) -> Result<Zeroizing<String>>
+pub(crate) async fn read_sasl_string<S>(stream: &mut S, idle: Duration) -> Result<Zeroizing<String>>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
@@ -128,7 +128,7 @@ where
 /// `out` is sized for all of `s` so that it never reallocates and leaves a
 /// partial copy behind, and zeroized if the string is unterminated (the
 /// caller zeroizes the result).
-fn unquote_string(s: &str) -> Option<(String, &str)> {
+pub(crate) fn unquote_string(s: &str) -> Option<(String, &str)> {
     let s = s.strip_prefix('"')?;
     let mut out = Zeroizing::new(String::with_capacity(s.len()));
     let mut chars = s.char_indices();

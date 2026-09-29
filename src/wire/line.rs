@@ -6,7 +6,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use zeroize::{Zeroize as _, Zeroizing};
 
 /// Longest accepted protocol line.
-const MAX_LINE: usize = 16384;
+pub(crate) const MAX_LINE: usize = 16384;
 
 /// True if the command verb of `line` (its first space-separated word) is
 /// `verb`, ignoring case. `STARTTLSX` is not `STARTTLS`.

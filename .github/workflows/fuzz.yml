@@ -1,0 +1,50 @@
+# Weekly fuzzing: every fuzz target for 60 s from the seed corpus (fuzz/,
+# CONTRIBUTING.md "Fuzzing"). Scheduled runs only on the maintainer's Gitea
+# (repository variable CI_RUNNER); elsewhere only when started by hand, as the
+# job is not tested on GitHub-hosted runners. Nightly and cargo-fuzz are
+# pinned; new inputs stay in the runner's temp directory.
+name: Fuzz
+on:
+  schedule:
+    - cron: "0 3 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  fuzz:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    if: vars.CI_RUNNER != '' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 30
+    env:
+      FUZZ_TOOLCHAIN: nightly-2026-09-28
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Toolchain
+        run: |
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          "$HOME/.cargo/bin/rustup" toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+          "$HOME/.cargo/bin/cargo" "+$FUZZ_TOOLCHAIN" install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Run targets
+        working-directory: fuzz
+        run: |
+          set -euo pipefail
+          cargo "+$FUZZ_TOOLCHAIN" fuzz build -O
+          for t in $(cargo "+$FUZZ_TOOLCHAIN" fuzz list); do
+            args=(-max_total_time=60 -rss_limit_mb=1024)
+            [ ! -f "dict/$t.dict" ] || args+=("-dict=dict/$t.dict")
+            mkdir -p "$RUNNER_TEMP/corpus/$t"
+            cargo "+$FUZZ_TOOLCHAIN" fuzz run -O "$t" "$RUNNER_TEMP/corpus/$t" "corpus/$t" -- "${args[@]}"
+          done

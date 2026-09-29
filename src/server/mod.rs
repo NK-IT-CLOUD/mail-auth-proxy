@@ -2,7 +2,7 @@
 
 mod listener;
 mod notify;
-mod tls;
+pub(crate) mod tls;
 
 pub(crate) use listener::ACCEPT_BACKOFF;
 

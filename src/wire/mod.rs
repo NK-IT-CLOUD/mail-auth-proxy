@@ -36,8 +36,8 @@ pub struct Tuning {
     pub max_session: Option<Duration>,
 }
 
-/// The configuration defaults, for unit tests.
-#[cfg(test)]
+/// The configuration defaults, for unit tests and fuzz targets.
+#[cfg(any(test, fuzzing))]
 impl Default for Tuning {
     fn default() -> Self {
         Tuning {

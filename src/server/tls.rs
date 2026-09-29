@@ -60,7 +60,7 @@ fn der_element(b: &[u8]) -> Option<(u8, &[u8], &[u8])> {
 /// `notAfter` of an X.509 certificate as Unix seconds (RFC 5280 §4.1:
 /// Certificate → tbsCertificate → [version], serialNumber, signature,
 /// issuer, validity → notBefore, notAfter). `None` if it does not parse.
-fn not_after(der: &[u8]) -> Option<u64> {
+pub(crate) fn not_after(der: &[u8]) -> Option<u64> {
     let (0x30, cert, _) = der_element(der)? else {
         return None;
     };

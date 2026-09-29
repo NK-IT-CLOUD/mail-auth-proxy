@@ -232,7 +232,7 @@ async fn read_sasl_credential<S: AsyncRead + AsyncWrite + Unpin>(
 /// not supported. The second argument is the password: both are built in
 /// buffers sized for the whole line (no reallocation leaves a partial copy)
 /// and zeroized on drop, also on a parse error.
-fn parse_two_astrings(rest: &str) -> Result<(String, Zeroizing<String>)> {
+pub(crate) fn parse_two_astrings(rest: &str) -> Result<(String, Zeroizing<String>)> {
     let mut chars = rest.trim().chars().peekable();
     let mut out: Vec<Zeroizing<String>> = Vec::with_capacity(2);
     while out.len() < 2 {

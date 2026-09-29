@@ -52,6 +52,10 @@ tempfile = "3.27.0"
 # Paused clock for the relay's session limits (30 minutes and more).
 tokio = { version = "1", features = ["test-util"] }
 
+# `fuzzing` is set by cargo-fuzz (fuzz/): it compiles `src/fuzz_api.rs`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

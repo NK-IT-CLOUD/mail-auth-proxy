@@ -4,6 +4,9 @@
 
 mod auth;
 pub mod config;
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzz_api;
 mod limits;
 mod obs;
 mod proto;

@@ -126,8 +126,8 @@ impl Policy {
     }
 
     /// Keycloak rules for `issuer` with one audience.
-    #[cfg(test)]
-    fn keycloak(issuer: &str, audience: &str) -> Policy {
+    #[cfg(any(test, fuzzing))]
+    pub(crate) fn keycloak(issuer: &str, audience: &str) -> Policy {
         Policy {
             issuer: issuer.into(),
             jwks_url: String::new(),
@@ -472,8 +472,8 @@ impl Validator {
     }
 
     /// Build a Validator from already-parsed JWKS values. Used in tests.
-    #[cfg(test)]
-    fn from_parts(parts: Vec<(Value, Policy)>) -> Result<Validator> {
+    #[cfg(any(test, fuzzing))]
+    pub(crate) fn from_parts(parts: Vec<(Value, Policy)>) -> Result<Validator> {
         let mut keys = HashMap::new();
         let mut policies = Vec::new();
         for (v, policy) in parts {
@@ -592,7 +592,7 @@ impl Validator {
 /// the string, or every string in an array; empty if the payload does not
 /// decode or has no such claim. Only for choosing whose refresh result
 /// applies to an unknown kid; never for trusting the token.
-fn unverified_iss(token: &str) -> Vec<String> {
+pub(crate) fn unverified_iss(token: &str) -> Vec<String> {
     use base64::Engine as _;
     let claims: Option<Value> = token.split('.').nth(1).and_then(|payload| {
         let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -623,7 +623,7 @@ fn error_kind(k: &jsonwebtoken::errors::ErrorKind) -> String {
 
 /// The issuer's rules on a correctly signed token that jsonwebtoken does not
 /// check itself. Returns the identity forwarded to the backend.
-fn check_claims(
+pub(crate) fn check_claims(
     claims: &Map<String, Value>,
     header: &Header,
     policy: &Policy,

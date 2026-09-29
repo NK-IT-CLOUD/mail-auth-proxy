@@ -3,7 +3,7 @@
 //! a byte relay.
 
 mod backend;
-mod preauth;
+pub(crate) mod preauth;
 
 pub use backend::CapsCache;
 
