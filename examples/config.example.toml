@@ -126,6 +126,14 @@ preauth_secs = 60                          # accept to credential, in total
 idle_secs = 30                             # silence on any single read
 connect_secs = 10                          # backend connect / TLS / PROXY header
 
+[session]                                  # optional: defaults shown
+keepalive_idle_secs = 600                  # TCP keepalive, client and backend side:
+keepalive_interval_secs = 60               # a dead peer is dropped after at most
+keepalive_count = 5                        # 600 + 5 x 60 s of silence
+# idle_limit_secs = 3600                   # after login, no byte either way; off by default,
+#                                          # warning below 1800 (RFC 9051 section 5.4)
+# max_session_secs = 86400                 # after login, hard cap; off by default
+
 [metrics]                                  # optional feature, off by default
 enabled = false
 # listen = "127.0.0.1:9102"                # required when enabled; no authentication

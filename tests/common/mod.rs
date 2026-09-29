@@ -15,7 +15,8 @@
 //!   verdict is chosen by the login: `reject…` → rejected, `slowreject…` →
 //!   rejected after `SLOW_REJECT`, `unavail…` →
 //!   temporary failure, `garbled…` → SMTP `501` / IMAP `BAD`, anything else →
-//!   accepted, then every line is echoed as `ECHO <line>`. A rejected XOAUTH2
+//!   accepted, then every line is echoed as `ECHO <line>` until the line
+//!   `BACKEND-CLOSE`, on which the backend drops the connection. A rejected XOAUTH2
 //!   login first gets an error challenge (IMAP `+ <json>`, SMTP `334 <json>`)
 //!   that must be answered with an empty line.
 //! - `MockDoveadm`: the doveadm HTTP API `user` command (exists / EX_NOUSER
@@ -658,10 +659,15 @@ fn decode_ir(rec: &Rec, mech: &str, ir: &str) -> String {
     login
 }
 
-/// After a successful login: record and echo every line as `ECHO <line>`.
+/// After a successful login: record and echo every line as `ECHO <line>`;
+/// `BACKEND-CLOSE` drops the connection (no TLS close_notify), as a backend
+/// that ends the session.
 async fn echo<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S, rec: &Rec) {
     while let Some(l) = read_line_raw(s).await {
         rec.update(|r| r.relayed.push(l.clone()));
+        if l == "BACKEND-CLOSE" {
+            return;
+        }
         if s.write_all(format!("ECHO {l}\r\n").as_bytes())
             .await
             .is_err()
@@ -1071,6 +1077,8 @@ pub struct Opts {
     /// Keys of the `[auth_ratelimit]` section; `None`: the defaults (the
     /// harness sources are loopback, which the defaults exempt).
     pub ratelimit: Option<String>,
+    /// The keys of the `[session]` section, if any.
+    pub session: Option<String>,
 }
 
 impl Default for Opts {
@@ -1086,6 +1094,7 @@ impl Default for Opts {
             smtp_xclient: true,
             issuer_extra: "",
             ratelimit: None,
+            session: None,
         }
     }
 }
@@ -1194,6 +1203,7 @@ preauth_secs = {preauth}
 idle_secs = {idle}
 connect_secs = 3
 
+{session}
 {metrics}
 
 {ratelimit}
@@ -1210,6 +1220,11 @@ connect_secs = 3
             preauth = opts.preauth_secs,
             idle = opts.idle_secs,
             legacy = opts.legacy.clone().unwrap_or_else(default_password_gate),
+            session = opts
+                .session
+                .as_ref()
+                .map(|s| format!("[session]\n{s}\n"))
+                .unwrap_or_default(),
             metrics = if opts.metrics {
                 format!("[metrics]\nlisten = \"{METRICS_IP}:0\"")
             } else {

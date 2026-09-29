@@ -89,6 +89,7 @@ by that group and by nobody else, for example `root:mail-auth-proxy` mode `0640`
 | `[limits]`, `[timeouts]` | connection limits and pre-authentication deadlines |
 | `[metrics]` | optional Prometheus endpoint |
 | `[auth_ratelimit]` | blocking of source addresses with too many failed logins (on by default) |
+| `[session]` | TCP keepalive of every connection; optional idle and lifetime limits after login |
 
 ## Keys
 
@@ -163,6 +164,11 @@ backend `.…` keys below, written inline (`backend = { address = "…" }`) or a
 | `auth_ratelimit.max_block_secs` | integer | 86400 | each further block of the same source doubles up to this; `block_secs` to 604800. Equal to `block_secs`: no escalation |
 | `auth_ratelimit.exempt_internal` | bool | `false` | never count sources in `scope.internal_networks` |
 | `auth_ratelimit.exempt_networks` | array of CIDR | `["127.0.0.0/8", "::1/128"]` | sources that are never counted, e.g. a webmail server or a NAT gateway through which many users log in; a public network gives a warning. An empty list exempts nothing, not even loopback |
+| `session.keepalive_idle_secs` | integer | 600 | TCP keepalive on every client and backend connection, from accept or connect: silence before the first probe; 1-32767 (the Linux maximum) |
+| `session.keepalive_interval_secs` | integer | 60 | time between unanswered probes; 1-32767 |
+| `session.keepalive_count` | integer | 5 | unanswered probes before the kernel drops the connection; 2-127 (RFC 9293 §3.8.4: one lost probe must not end a connection). With the defaults a dead peer is dropped after at most 15 minutes of silence |
+| `session.idle_limit_secs` | integer | off | after login: close the session after this long without a byte in either direction; 1-2592000. Below 1800 gives a warning: IMAP and ManageSieve clients may rely on at least 30 minutes (RFC 9051 §5.4, RFC 5804 §1.2), and IDLE clients re-issue IDLE only every 29 minutes (RFC 9051 §6.3.13) |
+| `session.max_session_secs` | integer | off | after login: close the session this long after the login, busy or not; 1-2592000; below 1800 gives the same warning |
 
 Environment: `RUST_LOG` (log filter, default `info`; see [operations.md](operations.md#logging)).
 

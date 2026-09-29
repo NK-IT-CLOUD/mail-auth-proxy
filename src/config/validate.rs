@@ -1,7 +1,9 @@
 //! Validation: every check serde cannot express, and the normalisation of
 //! the short forms into what the rest of the program reads.
 
-use super::{AccountCheck, AuthRateLimit, Config, Legacy, Rule, TokenType, PASSWORD_GATE_RULE};
+use super::{
+    AccountCheck, AuthRateLimit, Config, Legacy, Rule, Session, TokenType, PASSWORD_GATE_RULE,
+};
 use std::net::{IpAddr, SocketAddr};
 
 /// Upper bound of `oauth.leeway_secs`. The leeway is added to `exp` and
@@ -288,6 +290,7 @@ impl Config {
             },
             (None, false) => {}
         }
+        self.session.check(&mut err, warnings);
     }
 
     /// Replace the short forms by what they mean, so the rest of the program
@@ -532,6 +535,67 @@ impl Legacy {
                         public_nets.join(", ")
                     ));
                 }
+            }
+        }
+    }
+}
+
+// ── [session] ───────────────────────────────────────────────────────────────
+
+/// Upper bound of `keepalive_idle_secs` and `keepalive_interval_secs`: the
+/// largest value Linux accepts for TCP_KEEPIDLE and TCP_KEEPINTVL
+/// (`MAX_TCP_KEEPIDLE`, `MAX_TCP_KEEPINTVL`).
+const MAX_KEEPALIVE_SECS: u64 = 32_767;
+
+/// Upper bound of `keepalive_count`: the largest TCP_KEEPCNT Linux accepts
+/// (`MAX_TCP_KEEPCNT`).
+const MAX_KEEPALIVE_COUNT: u32 = 127;
+
+/// Shortest post-login inactivity limit that IMAP and ManageSieve clients
+/// may rely on: RFC 9051 section 5.4 and RFC 5804 section 1.2 require an
+/// autologout timer of at least 30 minutes, and IDLE clients re-issue IDLE
+/// only every 29 minutes (RFC 9051 section 6.3.13, RFC 2177). A shorter
+/// limit breaks such clients but weakens nothing, so it is a warning, not
+/// an error.
+const MIN_RFC_SESSION_SECS: u64 = 1800;
+
+/// Upper bound of `idle_limit_secs` and `max_session_secs`: 30 days. Longer
+/// is the same as off, and past 2^63 seconds the deadline overflows the
+/// clock.
+const MAX_SESSION_SECS: u64 = 30 * 86_400;
+
+impl Session {
+    fn check(&self, err: &mut impl FnMut(String), warnings: &mut Vec<String>) {
+        for (name, secs) in [
+            ("keepalive_idle_secs", self.keepalive_idle_secs),
+            ("keepalive_interval_secs", self.keepalive_interval_secs),
+        ] {
+            if !(1..=MAX_KEEPALIVE_SECS).contains(&secs) {
+                err(format!(
+                    "session.{name} must be between 1 and {MAX_KEEPALIVE_SECS} seconds"
+                ));
+            }
+        }
+        // RFC 9293 section 3.8.4 (MUST-29): one unanswered probe does not
+        // mean a dead connection; probes are bare ACKs and can be lost.
+        if !(2..=MAX_KEEPALIVE_COUNT).contains(&self.keepalive_count) {
+            err(format!(
+                "session.keepalive_count must be between 2 and {MAX_KEEPALIVE_COUNT} (one lost probe must not end a connection; RFC 9293 section 3.8.4)"
+            ));
+        }
+        for (name, secs) in [
+            ("idle_limit_secs", self.idle_limit_secs),
+            ("max_session_secs", self.max_session_secs),
+        ] {
+            let Some(secs) = secs else { continue };
+            if !(1..=MAX_SESSION_SECS).contains(&secs) {
+                err(format!(
+                    "session.{name} must be between 1 and {MAX_SESSION_SECS} seconds; leave it out to turn it off"
+                ));
+            } else if secs < MIN_RFC_SESSION_SECS {
+                warnings.push(format!(
+                    "session.{name} = {secs} is below 30 minutes: IMAP and ManageSieve clients may count on at least 30 minutes of inactivity after login (RFC 9051 section 5.4, RFC 5804 section 1.2), and IDLE clients re-issue IDLE only every 29 minutes (RFC 9051 section 6.3.13); such sessions are cut"
+                ));
             }
         }
     }
@@ -1204,5 +1268,63 @@ mod tests {
             "{V2}[password_gate]\ninternal_networks = [\"nonsense\"]\n"
         ))
         .is_err());
+    }
+
+    /// `[session]`: keepalive on with its defaults, both limits off; the
+    /// kernel's ranges and RFC 9293's "not one probe" are errors, limits
+    /// below the RFC autologout floor a warning.
+    #[test]
+    fn session_defaults_bounds_and_rfc_floor() {
+        let l = parse(V2).unwrap();
+        let s = &l.config.session;
+        assert_eq!(
+            (
+                s.keepalive_idle_secs,
+                s.keepalive_interval_secs,
+                s.keepalive_count
+            ),
+            (600, 60, 5)
+        );
+        assert!(s.idle_limit_secs.is_none() && s.max_session_secs.is_none());
+        assert!(!toml::to_string(&l.config).unwrap().contains("idle_limit"));
+
+        for (extra, needle) in [
+            (
+                "keepalive_idle_secs = 0",
+                "keepalive_idle_secs must be between 1 and 32767",
+            ),
+            (
+                "keepalive_interval_secs = 32768",
+                "keepalive_interval_secs must be between 1 and 32767",
+            ),
+            ("keepalive_count = 1", "RFC 9293"),
+            (
+                "keepalive_count = 128",
+                "keepalive_count must be between 2 and 127",
+            ),
+            ("idle_limit_secs = 0", "idle_limit_secs must be between 1"),
+            (
+                "max_session_secs = 2592001",
+                "max_session_secs must be between 1",
+            ),
+        ] {
+            let e = errors_with(&format!("[session]\n{extra}\n"));
+            assert!(e.contains(needle), "{extra}: {e}");
+        }
+
+        let l = parse(&format!(
+            "{V2}[session]\nidle_limit_secs = 1800\nmax_session_secs = 86400\n"
+        ))
+        .unwrap();
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        let l = parse(&format!(
+            "{V2}[session]\nidle_limit_secs = 1799\nmax_session_secs = 600\n"
+        ))
+        .unwrap();
+        assert_eq!(l.warnings.len(), 2, "{:?}", l.warnings);
+        assert!(l
+            .warnings
+            .iter()
+            .all(|w| w.contains("RFC 9051 section 5.4")));
     }
 }

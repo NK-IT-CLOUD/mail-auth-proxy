@@ -256,7 +256,8 @@ The full index is [docs/README.md](docs/README.md).
 ## Known limitations
 
 - One authentication attempt per connection; a failed attempt closes it.
-- No idle limit after login: session lifetime is up to client and backend.
+- After login the idle limit and the session lifetime limit are off by default
+  (`[session]`); TCP keepalive is on. A session does not end when its token expires.
 - IMAP `LOGIN` with literals and ManageSieve `LOGIN` are not supported.
 - The SMTP `EHLO` list is static (`submission.ehlo_extensions`); `SIZE` is not advertised by
   default.

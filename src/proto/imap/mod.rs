@@ -125,7 +125,7 @@ pub async fn handle(
             client
                 .write_all(format!("{tag} {logged_in}\r\n").as_bytes())
                 .await?;
-            wire::splice(&mut client, &mut be).await;
+            wire::splice(&mut client, &mut be, metrics::Proto::Imap, tuning).await;
             return Ok(());
         }
         auth::Outcome::Blocked => (

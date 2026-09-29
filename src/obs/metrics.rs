@@ -218,6 +218,59 @@ pub fn record_upstream_forward(proto: Proto) {
     UPSTREAM_FORWARD[proto.idx()].fetch_add(1, Ordering::Relaxed);
 }
 
+/// Why a logged-in session ended: the `reason` label of
+/// `mail_auth_proxy_sessions_ended_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionEnd {
+    /// The client closed its side first (with or without TLS close_notify).
+    ClientClose,
+    /// The backend closed its side first (LOGOUT, QUIT, autologout).
+    BackendClose,
+    /// `session.idle_limit_secs` passed without a byte either way.
+    IdleLimit,
+    /// `session.max_session_secs` passed since the login.
+    MaxSession,
+    /// A read or write failed: reset, or a peer dropped by TCP keepalive or
+    /// the retransmission timeout.
+    Error,
+}
+
+const SESSION_ENDS: [SessionEnd; 5] = [
+    SessionEnd::ClientClose,
+    SessionEnd::BackendClose,
+    SessionEnd::IdleLimit,
+    SessionEnd::MaxSession,
+    SessionEnd::Error,
+];
+
+impl SessionEnd {
+    /// The `reason` label.
+    pub fn label(self) -> &'static str {
+        match self {
+            SessionEnd::ClientClose => "client_close",
+            SessionEnd::BackendClose => "backend_close",
+            SessionEnd::IdleLimit => "idle_limit",
+            SessionEnd::MaxSession => "max_session",
+            SessionEnd::Error => "error",
+        }
+    }
+
+    #[inline]
+    fn idx(self) -> usize {
+        self as usize
+    }
+}
+
+// sessions_ended[proto][reason]: logged-in sessions whose relay ended.
+static SESSIONS_ENDED: [[AtomicU64; SESSION_ENDS.len()]; N_PROTO] =
+    [const { [const { AtomicU64::new(0) }; SESSION_ENDS.len()] }; N_PROTO];
+
+/// Record the end of a logged-in session of `proto`.
+#[inline]
+pub fn record_session_end(proto: Proto, why: SessionEnd) {
+    SESSIONS_ENDED[proto.idx()][why.idx()].fetch_add(1, Ordering::Relaxed);
+}
+
 /// `le` label values of the latency histogram and the same bounds in
 /// microseconds: from a local backend (a few ms) up to the connect timeout.
 const LATENCY_LE: [&str; 11] = [
@@ -535,6 +588,18 @@ fn render() -> String {
         o.push_str(&format!(
             "mail_auth_proxy_upstream_forward_total{{proto=\"{plabel}\"}} {v}\n"
         ));
+    }
+
+    o.push_str("# HELP mail_auth_proxy_sessions_ended_total Logged-in sessions ended, by who or what ended them.\n");
+    o.push_str("# TYPE mail_auth_proxy_sessions_ended_total counter\n");
+    for (p, plabel) in PROTO_LABELS.iter().enumerate() {
+        for why in SESSION_ENDS {
+            let v = SESSIONS_ENDED[p][why.idx()].load(Ordering::Relaxed);
+            o.push_str(&format!(
+                "mail_auth_proxy_sessions_ended_total{{proto=\"{plabel}\",reason=\"{}\"}} {v}\n",
+                why.label()
+            ));
+        }
     }
 
     o.push_str("# HELP mail_auth_proxy_tls_cert_expiry_timestamp_seconds Unix time the served certificate expires (notAfter); 0 if unreadable.\n");
@@ -981,6 +1046,26 @@ mod tests {
             "mail_auth_proxy_auth_refusals_total{proto=\"imap\",reason=\"authzid_mismatch\"} "
         ));
         assert!(!out.contains("reason=\"ok\"") && !out.contains("reason=\"protocol\""));
+    }
+
+    /// Every proto/reason pair of the session ends is exported from the
+    /// start; only this test records `idle_limit` for SMTP.
+    #[test]
+    fn session_ends_by_reason() {
+        let out = render();
+        for p in PROTO_LABELS {
+            for why in SESSION_ENDS {
+                let key = format!(
+                    "mail_auth_proxy_sessions_ended_total{{proto=\"{p}\",reason=\"{}\"}} ",
+                    why.label()
+                );
+                assert!(out.contains(&key), "{key}");
+            }
+        }
+        record_session_end(Proto::Smtp, SessionEnd::IdleLimit);
+        assert!(render().contains(
+            "mail_auth_proxy_sessions_ended_total{proto=\"smtp\",reason=\"idle_limit\"} 1\n"
+        ));
     }
 
     /// The connection gauge goes back down when the session task panics or

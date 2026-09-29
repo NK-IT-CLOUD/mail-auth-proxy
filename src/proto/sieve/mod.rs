@@ -333,7 +333,7 @@ pub async fn handle(
             client_tls.write_all(be_reply.as_bytes()).await?;
             client_tls.write_all(b"\r\n").await?;
             tracing::info!(target: crate::obs::target::SIEVE, user=%crate::obs::authlog::sanitize(&identity), mech=%mech, "sieve auth ok; splicing");
-            crate::wire::splice(&mut client_tls, &mut be).await;
+            crate::wire::splice(&mut client_tls, &mut be, Proto::Sieve, &ctx.tuning).await;
             return Ok(());
         }
         auth::Outcome::Blocked => (

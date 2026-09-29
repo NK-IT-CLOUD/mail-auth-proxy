@@ -31,6 +31,14 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   target; metrics `mail_auth_proxy_ratelimit_blocks_total`, `…_bans_total`,
   `…_active_blocks` and `…_evictions_total`. See
   [architecture: failed-login rate limit](docs/architecture.md#failed-login-rate-limit).
+- `[session]` section. `idle_limit_secs` closes a logged-in session after that long
+  without a byte in either direction; `max_session_secs` closes it that long after the
+  login, which bounds how long a session outlives a revoked token or a locked account.
+  Both are off by default and warn below 30 minutes (RFC 9051 §5.4, RFC 5804 §1.2). The
+  connection is closed without `BYE`/`421`, since the relay cannot tell where a
+  response ends.
+- Metric `mail_auth_proxy_sessions_ended_total{proto,reason}`: why logged-in sessions
+  ended (`client_close`, `backend_close`, `idle_limit`, `max_session`, `error`).
 
 ### Changed
 - A token that fails validation (`bad_token`) is no longer refused at once, also
@@ -81,6 +89,10 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `doveadm_ca_file` passed validation and failed only as a file error at start, and the
   other three were reported twice (validation and file error); `tls.cert and tls.key are
   required` is now one message per key.
+- TCP keepalive is on for every client and backend connection (`session.keepalive_*`,
+  default 600 s idle, 60 s interval, 5 probes). A peer that vanished without closing
+  (a phone that left the network) now frees its `max_connections` slot after at most
+  15 minutes of silence instead of holding it until the backend ends the session.
 
 ### Security
 - `oauth.leeway_secs` had no upper bound, so a large value kept expired tokens valid.

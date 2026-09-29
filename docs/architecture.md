@@ -199,7 +199,16 @@ JWKS handling:
 
 ## After authentication
 
-Once the backend accepts the credential, the proxy relays bytes both ways with `tokio::io::copy_bidirectional` until either side closes. In this phase there is **no idle timeout, no TCP keepalive, and no per-user or per-IP session limit**. Session lifetime is up to the client and the backend (for example, Dovecot's autologout).
+Once the backend accepts the credential, the proxy relays bytes both ways with `tokio::io::copy_bidirectional` until either side closes, without interpreting them. The credential is dropped (and zeroized) before the relay starts.
+
+- **TCP keepalive** is on for every client connection from `accept()` and every backend connection from `connect()`: after `session.keepalive_idle_secs` (600 s) of silence the kernel probes every `session.keepalive_interval_secs` (60 s) and drops the connection after `session.keepalive_count` (5) unanswered probes. A peer that vanished without a FIN or RST (a phone that left the network, a crashed host) is found after at most 15 minutes of silence; the failed read ends the relay and frees the `max_connections` slot. A connection with unacknowledged data is not probed; it ends by the kernel's retransmission timeout instead.
+- **`session.idle_limit_secs`** (off by default) closes a session after that long without a byte in either direction. Reads and writes both count, so a client that slowly drains a large response is not idle, and neither is an IDLE session whose client re-issues IDLE or whose backend sends updates. Below 30 minutes `--check-config` warns: RFC 9051 §5.4 and RFC 5804 §1.2 let clients rely on 30 minutes of post-login inactivity, and IDLE clients re-issue IDLE only every 29 minutes (RFC 9051 §6.3.13). SMTP's 5-minute server timeout (RFC 5321 §4.5.3.2.7) is lower, and Postfix enforces its own.
+- **`session.max_session_secs`** (off by default) closes a session that long after the login, busy or not. It bounds how long a session outlives the credential it was opened with, for example after the account was locked in the directory or the IdP.
+- When a limit ends a session, the proxy closes both TLS streams (close_notify, then FIN), within 2 s. It sends no `* BYE`, `BYE` or `421` of its own: the relay does not know where a response ends (an IMAP or ManageSieve literal, an SMTP multi-line reply), and a line injected into a literal would become part of the client's data. Clients see a closed connection and reconnect ([standards: D-GEN-3](standards.md#d-gen-3-no-bye-or-421-when-a-session-limit-ends-a-session)).
+- The session does not end at the token's `exp`. IMAP, SMTP and ManageSieve have no re-authentication within a session (IMAP AUTHENTICATE only in the Not Authenticated state, RFC 9051 §6.2.2; a second SMTP AUTH is refused, RFC 4954 §4), so an access token that lives a few minutes would cut every IDLE session that often, below the 30-minute floor above, and a password session has no `exp` at all. `session.max_session_secs` is the bound for both kinds of credential.
+- Each end is counted in `mail_auth_proxy_sessions_ended_total{proto,reason}` ([operations](operations.md#prometheus-metrics)).
+
+There is no per-user or per-IP limit on logged-in sessions.
 
 ## Connection limits
 
@@ -248,6 +257,10 @@ To keep observing attacks on a legacy rule open to public networks, as a honeypo
 | `sieve.capability_cache_secs` | 600 s | backend post-TLS capabilities |
 | metrics scrape (fixed) | 10 s, 4 at a time | the whole request head, and the response, each; a fifth connection is closed at accept |
 | backend auth reply (fixed) | at most 32 lines | IMAP `P1` reply; each line within the idle timeout |
+| `session.keepalive_idle_secs`, `_interval_secs`, `_count` | 600 s, 60 s, 5 | TCP keepalive of every client and backend connection, from accept or connect ([after authentication](#after-authentication)) |
+| `session.idle_limit_secs` | off | after login: no byte in either direction |
+| `session.max_session_secs` | off | after login: time since the login |
+| session close (fixed) | 2 s | closing both TLS streams after a session limit |
 | shutdown drain (fixed) | 10 s | after SIGTERM/SIGINT, how long open sessions may continue ([operations: signals](operations.md#signals-and-service-manager)) |
 
 The pre-auth budget does not cover the backend phase (connect, greeting, AUTH verdict); the connect and idle timeouts bound each of its steps.

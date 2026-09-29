@@ -31,10 +31,12 @@ pub struct BackendConn {
     pub name: ServerName<'static>,
     pub tls: TlsConnector,
     pub proxy_protocol: bool,
+    /// TCP keepalive of every connection to this backend.
+    pub keepalive: crate::wire::Keepalive,
 }
 
 impl BackendConn {
-    fn new(b: &config::Backend) -> Result<BackendConn> {
+    fn new(b: &config::Backend, keepalive: crate::wire::Keepalive) -> Result<BackendConn> {
         let name = b
             .verify_name
             .clone()
@@ -46,6 +48,7 @@ impl BackendConn {
             name,
             tls: tls::backend_connector(b.ca_file.as_deref())?,
             proxy_protocol: b.proxy_protocol,
+            keepalive,
         })
     }
 }
@@ -127,15 +130,16 @@ fn build_local(cfg: &config::Config) -> Result<Local> {
         &cfg.legacy,
         std::time::Duration::from_secs(cfg.timeouts.connect_secs),
     )?;
+    let keepalive = keepalive(&cfg.session);
     let imap = Imap {
-        backend: BackendConn::new(&cfg.imap.backend)?,
+        backend: BackendConn::new(&cfg.imap.backend, keepalive)?,
     };
     let submission = cfg
         .submission
         .as_ref()
         .map(|s| -> Result<Submission> {
             Ok(Submission {
-                backend: BackendConn::new(&s.backend)?,
+                backend: BackendConn::new(&s.backend, keepalive)?,
                 xclient: s.xclient,
                 ehlo_extensions: s.ehlo_extensions.clone(),
             })
@@ -146,7 +150,7 @@ fn build_local(cfg: &config::Config) -> Result<Local> {
         .as_ref()
         .map(|s| -> Result<Sieve> {
             Ok(Sieve {
-                backend: BackendConn::new(&s.backend)?,
+                backend: BackendConn::new(&s.backend, keepalive)?,
                 caps: CapsCache::default(),
                 caps_ttl: std::time::Duration::from_secs(s.capability_cache_secs),
             })
@@ -161,6 +165,15 @@ fn build_local(cfg: &config::Config) -> Result<Local> {
         submission,
         sieve,
     })
+}
+
+/// `[session]` keepalive, for client and backend connections alike.
+fn keepalive(s: &config::Session) -> crate::wire::Keepalive {
+    crate::wire::Keepalive {
+        idle: std::time::Duration::from_secs(s.keepalive_idle_secs),
+        interval: std::time::Duration::from_secs(s.keepalive_interval_secs),
+        count: s.keepalive_count,
+    }
 }
 
 /// Problems with the files the configuration names (certificate, key, CA
@@ -306,6 +319,15 @@ pub async fn run(cfg: config::Config) -> Result<()> {
             connect: std::time::Duration::from_secs(cfg.timeouts.connect_secs),
             preauth: std::time::Duration::from_secs(cfg.timeouts.preauth_secs),
             max_preauth_commands: cfg.limits.max_preauth_commands,
+            keepalive: keepalive(&cfg.session),
+            session_idle: cfg
+                .session
+                .idle_limit_secs
+                .map(std::time::Duration::from_secs),
+            max_session: cfg
+                .session
+                .max_session_secs
+                .map(std::time::Duration::from_secs),
         },
     });
 

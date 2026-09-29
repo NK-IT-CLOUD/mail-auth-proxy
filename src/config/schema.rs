@@ -56,6 +56,8 @@ pub struct Config {
     pub metrics: Metrics,
     #[serde(default)]
     pub auth_ratelimit: AuthRateLimit,
+    #[serde(default)]
+    pub session: Session,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -608,6 +610,61 @@ fn default_ratelimit_max_block_secs() -> u64 {
 /// Loopback: a local webmail or relay logs in for many users.
 fn default_ratelimit_exempt_networks() -> Vec<String> {
     vec!["127.0.0.0/8".into(), "::1/128".into()]
+}
+
+// ── [session]: the connection after authentication ─────────────────────────
+
+/// TCP keepalive on every client and backend connection, and the optional
+/// limits of a logged-in session.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Session {
+    /// Silence on a connection before the first keepalive probe.
+    #[serde(default = "default_keepalive_idle_secs")]
+    pub keepalive_idle_secs: u64,
+    /// Time between unanswered probes.
+    #[serde(default = "default_keepalive_interval_secs")]
+    pub keepalive_interval_secs: u64,
+    /// Unanswered probes before the connection is dropped as dead.
+    #[serde(default = "default_keepalive_count")]
+    pub keepalive_count: u32,
+    /// End a logged-in session after this long without a byte in either
+    /// direction. Off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_limit_secs: Option<u64>,
+    /// End a logged-in session this long after the login, whatever it does.
+    /// Off when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_session_secs: Option<u64>,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Session {
+            keepalive_idle_secs: default_keepalive_idle_secs(),
+            keepalive_interval_secs: default_keepalive_interval_secs(),
+            keepalive_count: default_keepalive_count(),
+            idle_limit_secs: None,
+            max_session_secs: None,
+        }
+    }
+}
+
+/// 10 minutes of silence, then 5 probes a minute apart: a dead peer (a phone
+/// that left the network, a crashed host) frees its slot after at most 15
+/// minutes, half the 30-minute autologout floor of RFC 9051 section 5.4, so
+/// it is gone long before a session limit would be needed. The stack default
+/// (Linux: 2 h + 9 x 75 s) holds such a slot for over two hours.
+fn default_keepalive_idle_secs() -> u64 {
+    600
+}
+
+fn default_keepalive_interval_secs() -> u64 {
+    60
+}
+
+fn default_keepalive_count() -> u32 {
+    5
 }
 
 #[cfg(test)]

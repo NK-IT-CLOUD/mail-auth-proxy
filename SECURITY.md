@@ -148,10 +148,12 @@ relays bytes. It never holds a master password or any other credential of its ow
   /64). Everyone behind one NAT, webmail server or IPv6 /64 shares that count, so one
   guesser there can block the others. Put such relays you trust into
   `auth_ratelimit.exempt_networks`; the default exempts only loopback.
-- **Session lifetime.** After a successful login the proxy relays bytes with no idle
-  limit, no keepalive and no per-user session limit. Session lifetime is up to the client
-  and the backend (for example Dovecot's autologout); a revoked token does not end an open
-  session.
+- **Session lifetime.** A revoked token, or an account locked in the directory or the
+  IdP, does not end an open session: the credential is checked once, at login. Set
+  `session.max_session_secs` to bound how long such a session lives on (off by default),
+  or end it at the backend (for example `doveadm kick`). TCP keepalive frees the slots
+  of dead peers; `session.idle_limit_secs` is off by default. There is no per-user
+  session limit.
 - **Trust store.** JWKS fetches trust the system CA store (backends use it too unless
   `ca_file` is set). Keep it limited to CAs you trust to vouch for your identity
   provider.

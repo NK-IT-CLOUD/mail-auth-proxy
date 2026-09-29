@@ -38,6 +38,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Clears passwords, tokens and the lines carrying them on drop; already in the
 # tree through rustls-pki-types and aws-lc-rs.
 zeroize = "1.9"
+# TCP keepalive idle/interval/count per socket (tokio sets only on/off);
+# already in the tree through tokio, with the same features.
+socket2 = { version = "0.6", features = ["all"] }
 
 [dev-dependencies]
 # Black-box harness (tests/): certificates for the proxy and the mock
@@ -46,6 +49,8 @@ zeroize = "1.9"
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem"] }
 regex = "1.13.1"
 tempfile = "3.27.0"
+# Paused clock for the relay's session limits (30 minutes and more).
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.release]
 lto = "thin"

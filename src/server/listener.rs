@@ -61,6 +61,11 @@ pub(super) fn spawn_listener<P, F, Fut>(
                         tracing::debug!(target: crate::obs::target::MAIN, %peer, "{ended}: connection limit reached, closing");
                         continue;
                     };
+                    // From the accept on, so a client that vanishes during
+                    // the pre-auth dialog is found as well.
+                    if let Err(e) = ctx.tuning.keepalive.apply(&tcp) {
+                        tracing::warn!(target: crate::obs::target::MAIN, %peer, error=%e, "{ended}: TCP keepalive not set");
+                    }
                     let ctx = ctx.clone();
                     let alive = alive.clone();
                     tokio::spawn(async move {

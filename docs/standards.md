@@ -176,6 +176,10 @@ Bearer tokens are validated locally as signed JWTs (JWS compact serialisation) a
 | IMAP client: initial response only if the backend advertises SASL-IR | MUST | RFC 4959 §3 | Deviation | Not checked. D-IMAP-4. |
 | XOAUTH2 error challenge answered with an empty response (IMAP and SMTP client) | | Google XOAUTH2 "Error response" | Yes | The following `NO` / `5xx` is a rejection |
 | EHLO domain is a resolvable FQDN or an address literal | MUST | RFC 5321 §2.3.5, §4.1.4 | Depends on configuration | The configured server name is used. Its syntax is checked (D-SMTP-4); whether it resolves is not |
+| TCP keepalive switched on per connection by the application; interval configurable | MUST (of the TCP stack) | RFC 9293 §3.8.4 (MUST-24, MUST-27) | Yes | On for client and backend connections (`session.keepalive_*`, default 600 s / 60 s / 5). The stack's 2-hour default (MUST-28) is for connections the application leaves alone. |
+| One unanswered keepalive probe does not mean a dead connection | MUST | RFC 9293 §3.8.4 (MUST-29) | Yes | `session.keepalive_count` must be at least 2 |
+| Post-login autologout at least 30 minutes | MUST | RFC 9051 §5.4, RFC 5804 §1.2 | Depends on configuration | No autologout by default. `session.idle_limit_secs` and `session.max_session_secs` below 1800 give a warning. |
+| BYE / 421 before the server closes | SHOULD | RFC 9051 §3.4, RFC 5804 §1.2, RFC 5321 §3.8 | Deviation | Not sent when a session limit closes a logged-in session. D-GEN-3. |
 
 ## 8. Metrics
 
@@ -194,6 +198,7 @@ Metric names follow the Prometheus naming guidelines: an application prefix (`ma
 | `mail_auth_proxy_legacy_list_errors_total{list}` | counter |
 | `mail_auth_proxy_active_connections{proto}` | gauge |
 | `mail_auth_proxy_upstream_forward_total{proto}` | counter |
+| `mail_auth_proxy_sessions_ended_total{proto,reason}` | counter |
 
 ## Known deviations
 
@@ -211,6 +216,15 @@ Metric names follow the Prometheus naming guidelines: an application prefix (`ma
 - RFC 9051 §5.4 and RFC 5804 §1.2 allow short pre-authentication timers. RFC 5321 §4.5.3.2.7 recommends at least 5 minutes, and RFC 3501 §5.4 required ≥ 30 minutes for any autologout timer.
 - Timeouts, and connections refused by limits, close without `421` or `BYE`.
 - Rationale: denial-of-service resistance on a public endpoint.
+
+### D-GEN-3: no BYE or 421 when a session limit ends a session
+
+- Behaviour: when `session.idle_limit_secs` or `session.max_session_secs` ends a logged-in session, the proxy closes both TLS streams (close_notify, then FIN) without a protocol message of its own. Both limits are off by default.
+- What the specifications say:
+  - IMAP: a server SHOULD NOT close the connection without an untagged `BYE` (RFC 9051 §3.4); a post-login autologout timer MUST be at least 30 minutes (RFC 9051 §5.4).
+  - ManageSieve: `BYE` SHOULD be used when the server closes the connection; an autologout timer MUST be at least 30 minutes after authentication (RFC 5804 §1.2).
+  - SMTP: a server closes only after QUIT, after a `421`, or after a timeout (RFC 5321 §3.8); a client treats an unexpected close as a temporary failure.
+- Rationale: after login the proxy relays bytes without parsing them, so it cannot tell whether the client is in the middle of a response. A `BYE` or `421` written into an IMAP or ManageSieve literal, or between the lines of an SMTP multi-line reply, would corrupt the client's data. A closed connection is something every client already handles. The idle limit counts traffic in both directions, which is at least as lenient as the RFC 9051 timer (reset by client commands); `--check-config` warns about either limit below 30 minutes. `max_session_secs` ends sessions that are not idle, which none of the three protocols foresees; it exists to bound how long a session outlives its credential.
 
 ### D-AUTH-1: password mechanisms are a policy decision
 
@@ -312,6 +326,7 @@ At startup the proxy then refuses to start; on refresh the issuer keeps its prev
 ## References
 
 - RFC 2034 SMTP Enhanced Error Codes: https://www.rfc-editor.org/rfc/rfc2034.html#section-4
+- RFC 2177 IMAP4 IDLE: https://www.rfc-editor.org/rfc/rfc2177.html#section-3
 - RFC 2920 SMTP Pipelining: https://www.rfc-editor.org/rfc/rfc2920.html#section-3.2
 - RFC 2971 IMAP4 ID extension: https://www.rfc-editor.org/rfc/rfc2971.html#section-3
 - RFC 3207 SMTP STARTTLS: https://www.rfc-editor.org/rfc/rfc3207.html#section-4
@@ -324,7 +339,7 @@ At startup the proxy then refuses to start; on refresh the issuer keeps its prev
 - RFC 5321 SMTP: https://www.rfc-editor.org/rfc/rfc5321.html#section-3.8 , #section-4.2.4 , #section-4.5.3.1.4 , #section-4.5.3.2.7
 - RFC 5530 IMAP Response Codes: https://www.rfc-editor.org/rfc/rfc5530.html#section-3
 - RFC 5801 GS2: https://www.rfc-editor.org/rfc/rfc5801.html#section-4
-- RFC 5804 ManageSieve: https://www.rfc-editor.org/rfc/rfc5804.html#section-1.7 , #section-2.1 , #section-2.2 , #section-4 (errata 2655, 7825)
+- RFC 5804 ManageSieve: https://www.rfc-editor.org/rfc/rfc5804.html#section-1.2 , #section-1.7 , #section-2.1 , #section-2.2 , #section-4 (errata 2655, 7825)
 - RFC 6066 TLS Extensions (SNI): https://www.rfc-editor.org/rfc/rfc6066.html#section-3
 - RFC 6409 Message Submission: https://www.rfc-editor.org/rfc/rfc6409.html#section-7
 - RFC 7301 ALPN: https://www.rfc-editor.org/rfc/rfc7301.html#section-3.2
@@ -336,9 +351,10 @@ At startup the proxy then refuses to start; on refresh the issuer keeps its prev
 - RFC 8314 Cleartext Considered Obsolete: https://www.rfc-editor.org/rfc/rfc8314.html#section-3
 - RFC 8446 TLS 1.3: https://www.rfc-editor.org/rfc/rfc8446.html
 - RFC 8725 JWT BCP: https://www.rfc-editor.org/rfc/rfc8725.html#section-3
-- RFC 9051 IMAP4rev2: https://www.rfc-editor.org/rfc/rfc9051.html#section-6.1.1 , #section-6.2.2 , #section-6.2.3 , #section-5.4
+- RFC 9051 IMAP4rev2: https://www.rfc-editor.org/rfc/rfc9051.html#section-6.1.1 , #section-6.2.2 , #section-6.2.3 , #section-5.4 , #section-3.4 , #section-6.3.13
 - RFC 9068 JWT Access Tokens: https://www.rfc-editor.org/rfc/rfc9068.html#section-4
 - RFC 9110 HTTP Semantics (auth-scheme): https://www.rfc-editor.org/rfc/rfc9110.html#section-11.1
+- RFC 9293 TCP: https://www.rfc-editor.org/rfc/rfc9293.html#section-3.8.4
 - RFC 9325 TLS BCP: https://www.rfc-editor.org/rfc/rfc9325.html#section-3
 - draft-murchison-sasl-login-00: https://datatracker.ietf.org/doc/html/draft-murchison-sasl-login-00
 - Google XOAUTH2: https://developers.google.com/workspace/gmail/imap/xoauth2-protocol

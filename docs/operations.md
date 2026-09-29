@@ -52,6 +52,7 @@ When a `protocol` record is written:
   - `password auth; forwarding to backend peer=… user=<login> mech=…` (IMAP)
   - `submission auth ok; splicing user=… mech=…`
   - `sieve auth ok; splicing user=… mech=…`
+  - `session closed by limit proto=… reason="idle_limit"|"max_session" secs=…` when a `[session]` limit ended a logged-in session
 - Startup, at `INFO`:
   - `legacy password rule rule=<name> networks=[…] sni=… users=… users_file=… protocols=… mechanisms=…` per rule and `legacy password gate domain_gate=… account_check=… throttle=… failure_delay_ms=…`, or `password auth disabled: OAuth only`.
   - `auth rate limit failures=… window_secs=… block_secs=… max_block_secs=… exempt_internal=… exempt_networks=[…]`, or `auth rate limit disabled`.
@@ -62,7 +63,8 @@ When a `protocol` record is written:
   - `metrics endpoint up`
 - `WARN`:
   - `authlog: ratelimit action="block" proto="<proto>" scope="<internal|external>" peer=<ip> source=<cidr> failures=<n> block_secs=<n> strikes=<n>` when a source is blocked ([architecture.md](architecture.md#failed-login-rate-limit)): `proto`, `scope` and `peer` of the failure that reached the threshold, `source` the blocked address or /64 (`198.51.100.7/32`, `2001:db8:1:2::/64`), `failures` the counted failures, `block_secs` the length of this block, `strikes` the number of blocks in a row (1 for the first). One line per block, on the `authlog` target like the `authresult` line, but not an `authresult` line: parsers anchored on `authresult result=` do not see it. The connections closed during the block are counted in `mail_auth_proxy_ratelimit_blocks_total` and logged only at `DEBUG`, so a blocked source cannot fill the journal.
-  - `config: …` at startup and with `--check-config`, one line per warning: `token_type = "any"`; `require_email_verified` with an `identity_claim` other than `email`; a public network in `[password_gate]` (one line each); `[password_gate]` disabled but `sni` set; a legacy rule that accepts every user from public networks; `[legacy]` settings without any rule; `failure_delay_ms = 0`; `metrics.listen` not on loopback; a public network in `auth_ratelimit.exempt_networks`.
+  - `config: …` at startup and with `--check-config`, one line per warning: `token_type = "any"`; `require_email_verified` with an `identity_claim` other than `email`; a public network in `[password_gate]` (one line each); `[password_gate]` disabled but `sni` set; a legacy rule that accepts every user from public networks; `[legacy]` settings without any rule; `failure_delay_ms = 0`; `metrics.listen` not on loopback; a public network in `auth_ratelimit.exempt_networks`; `session.idle_limit_secs` or `session.max_session_secs` below 30 minutes.
+  - `…: TCP keepalive not set` (client, with `peer=`) or `… backend: TCP keepalive not set` (with `backend=`): the socket option was refused; the connection continues without keepalive.
   - `fetching JWKS …`, `parsing JWKS …`, `JWKS has no usable signing keys`, `JWKS refresh failed; keeping previous keys`, `JWKS refresh for unknown kid` (the refresh an unknown `kid` triggered failed)
   - `loading system CA certificates`
   - `metrics accept error`
@@ -102,6 +104,7 @@ Metrics are off by default. They are on with `metrics.enabled = true` or when on
 | `mail_auth_proxy_jwks_last_success_timestamp_seconds` | gauge | `issuer` (each `oauth.issuers` entry) | Unix time of the last JWKS fetch of the issuer that produced usable keys: at startup, periodic, on `SIGHUP`, or for an unknown `kid`. Alert when it is older than a few `oauth.refresh_secs`: the proxy still validates with the previous keys, but misses a key rotation. |
 | `mail_auth_proxy_jwks_refresh_failures_total` | counter | `issuer` | JWKS fetches of the issuer that failed (unreachable, HTTP error, oversized, not parsable) or had no usable signing key |
 | `mail_auth_proxy_upstream_forward_total` | counter | `proto` | sessions spliced to a backend |
+| `mail_auth_proxy_sessions_ended_total` | counter | `proto`, `reason` (`client_close`, `backend_close`, `idle_limit`, `max_session`, `error`) | a logged-in session ended. `client_close` and `backend_close`: that side closed first, with or without TLS close_notify (LOGOUT, QUIT, Dovecot's autologout, a client going away). `idle_limit`, `max_session`: `[session]` ended it. `error`: a read or write failed, e.g. a reset or a peer dropped by TCP keepalive or the retransmission timeout. The sum over `reason` catches up with `upstream_forward_total` as sessions end. |
 | `mail_auth_proxy_backend_login_duration_seconds` | histogram | `proto`, `le` (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, +Inf) | time of each successful backend login, from the start of the backend connection (TCP, TLS, PROXY header or XCLIENT) to the backend's OK. Rejected logins are not included: their time includes the backend's own failure delay. |
 
 ## Signals and service manager

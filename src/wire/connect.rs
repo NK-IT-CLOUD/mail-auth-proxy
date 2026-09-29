@@ -23,6 +23,9 @@ pub async fn connect(
         Ok(TcpStream::connect(&backend.address).await?)
     })
     .await?;
+    if let Err(e) = backend.keepalive.apply(&tcp) {
+        tracing::warn!(target: crate::obs::target::MAIN, backend=%backend.address, error=%e, "{what}: TCP keepalive not set");
+    }
     send_proxy_header(backend, &mut tcp, origin, timeout).await?;
     Ok(tcp)
 }
@@ -108,6 +111,7 @@ mod tests {
             name: rustls::pki_types::ServerName::try_from("backend.test").unwrap(),
             tls: tokio_rustls::TlsConnector::from(Arc::new(cfg)),
             proxy_protocol: false,
+            keepalive: crate::wire::Tuning::default().keepalive,
         };
         let tcp = connect(&backend, None, Duration::from_secs(5), "sieve backend")
             .await

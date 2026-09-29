@@ -262,7 +262,7 @@ pub async fn handle(
                 .write_all(b"235 2.7.0 Authentication successful\r\n")
                 .await?;
             tracing::info!(target: crate::obs::target::SUBMISSION, user=%crate::obs::authlog::sanitize(&identity), mech=%mech, "submission auth ok; splicing");
-            crate::wire::splice(&mut client_tls, &mut be).await;
+            crate::wire::splice(&mut client_tls, &mut be, Proto::Smtp, &ctx.tuning).await;
             return Ok(());
         }
         auth::Outcome::Blocked => (
