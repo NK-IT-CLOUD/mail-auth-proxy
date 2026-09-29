@@ -60,7 +60,7 @@ fn mechanism(mech: &str) -> Option<Mechanism> {
 /// servers to accept at least 255 octets).
 const MAX_LOGIN: usize = 255;
 
-/// Backend-rejection latencies kept per protocol for refusal timing.
+/// Backend-rejection latencies kept per backend for refusal timing.
 const LATENCY_SAMPLES: usize = 32;
 /// Upper bound of the learned refusal time (a slow or stuck backend must not
 /// make every refusal wait longer).
@@ -454,14 +454,40 @@ impl Drop for Turn<'_> {
     }
 }
 
+/// The recent rejection latencies of one backend.
+struct Latencies {
+    /// `proto_index` of the protocol the backend serves.
+    proto: usize,
+    /// The backend's name (`auth::backend_name`).
+    backend: String,
+    samples: Arc<Mutex<std::collections::VecDeque<Duration>>>,
+}
+
+impl Latencies {
+    fn median(&self) -> Duration {
+        let samples = self.samples.lock().unwrap_or_else(|p| p.into_inner());
+        let mut v: Vec<Duration> = samples.iter().copied().collect();
+        drop(samples);
+        v.sort_unstable();
+        v.get(v.len() / 2).copied().unwrap_or_default()
+    }
+}
+
 /// The gate's verdict on one password attempt.
 pub enum Verdict<'a> {
     /// Forward the password; `rule` let it through. Keep `turn` until the
     /// backend verdict is reported with `backend_accepted`/`backend_rejected`.
     Pass { rule: &'a str, turn: Turn<'a> },
     /// Refused before the backend. `rule` is the matching rule, or empty
-    /// when no rule allows this user.
-    Deny { reason: Reason, rule: &'a str },
+    /// when no rule allows this user. `for_backend`: refused by a step that
+    /// runs for the backend the login goes to (the account check, the
+    /// throttle), so the refusal is padded like that backend's rejections;
+    /// the earlier steps (login, rule, domain) do not depend on it.
+    Deny {
+        reason: Reason,
+        rule: &'a str,
+        for_backend: bool,
+    },
     /// The account check could not answer: an outage, not a refusal.
     Unavailable(anyhow::Error),
 }
@@ -473,8 +499,9 @@ pub struct Gate {
     domains: Option<(HashSet<String>, Option<Arc<ListFile>>)>,
     /// Every list file, for the reload task.
     files: Vec<Arc<ListFile>>,
-    /// Recent backend-rejection latencies per protocol, for refusal timing.
-    reject_latency: Arc<[Mutex<std::collections::VecDeque<Duration>>; 3]>,
+    /// Recent rejection latencies of each backend, for refusal timing
+    /// (`with_backends`).
+    reject_latency: Vec<Latencies>,
     account: Option<Doveadm>,
     throttle: Option<Throttle>,
     /// Minimum time from the credential to the reply of a failed legacy login.
@@ -535,7 +562,7 @@ impl Gate {
             rules,
             domains,
             files,
-            reject_latency: Default::default(),
+            reject_latency: Vec::new(),
             account,
             throttle: cfg.throttle.as_ref().map(|t| Throttle {
                 failures: t.failures,
@@ -547,15 +574,40 @@ impl Gate {
         })
     }
 
+    /// The backends whose rejections the refusal timing learns, by protocol
+    /// and backend name: one sample pool each.
+    pub fn with_backends<'n>(
+        mut self,
+        backends: impl IntoIterator<Item = (Proto, &'n str)>,
+    ) -> Gate {
+        self.reject_latency = backends
+            .into_iter()
+            .map(|(proto, backend)| Latencies {
+                proto: proto_index(proto),
+                backend: backend.to_owned(),
+                samples: Arc::default(),
+            })
+            .collect();
+        self
+    }
+
     /// Take over the running state of the gate `old` (a configuration
     /// reload): the throttle's failure counts and turns, when both gates
-    /// throttle, and the learned refusal timing.
+    /// throttle, and the learned refusal timing of every backend both know.
     pub fn carry_over(&mut self, old: &Gate) {
         if let (Some(new), Some(old)) = (&mut self.throttle, &old.throttle) {
             new.seen = old.seen.clone();
             new.turns = old.turns.clone();
         }
-        self.reject_latency = old.reject_latency.clone();
+        for pool in &mut self.reject_latency {
+            if let Some(kept) = old
+                .reject_latency
+                .iter()
+                .find(|o| o.proto == pool.proto && o.backend == pool.backend)
+            {
+                pool.samples = kept.samples.clone();
+            }
+        }
     }
 
     /// Start the task that re-reads the list files when they change, with
@@ -582,57 +634,78 @@ impl Gate {
         });
     }
 
+    /// The sample pool of `backend` for `proto`, if it is known.
+    fn latencies(&self, proto: Proto, backend: &str) -> Option<&Latencies> {
+        let proto = proto_index(proto);
+        self.reject_latency
+            .iter()
+            .find(|l| l.proto == proto && l.backend == backend)
+    }
+
     /// The time a failed legacy login is answered after: `failure_delay`,
-    /// or the median of the recent backend rejections of this protocol when
-    /// that is longer (bounded by `MAX_LEARNED_DELAY`).
-    fn failure_time(&self, proto: Proto) -> Duration {
-        let samples = self.reject_latency[proto_index(proto)]
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let mut v: Vec<Duration> = samples.iter().copied().collect();
-        drop(samples);
-        v.sort_unstable();
-        let learned = v.get(v.len() / 2).copied().unwrap_or_default();
+    /// or the learned rejection time when that is longer (bounded by
+    /// `MAX_LEARNED_DELAY`). The learned time is the median of `backend`'s
+    /// recent rejections. Without a backend (a refusal before the backend is
+    /// known), or for one without a pool, it is the largest median of the
+    /// protocol's backends: a refusal must not be quicker than a wrong
+    /// password at any backend the login could have gone to, and a mixed
+    /// median would be quicker than the slower backend's rejections.
+    fn failure_time(&self, proto: Proto, backend: Option<&str>) -> Duration {
+        let learned = match backend.and_then(|b| self.latencies(proto, b)) {
+            Some(pool) => pool.median(),
+            None => {
+                let proto = proto_index(proto);
+                self.reject_latency
+                    .iter()
+                    .filter(|l| l.proto == proto)
+                    .map(Latencies::median)
+                    .max()
+                    .unwrap_or_default()
+            }
+        };
         self.failure_delay.max(learned.min(MAX_LEARNED_DELAY))
     }
 
     /// Random extra delay added to every failed legacy reply: a quarter of
     /// the failure time, at least 50 ms, at most 1 s.
-    fn jitter(&self, proto: Proto) -> Duration {
-        let span =
-            (self.failure_time(proto) / 4).clamp(Duration::from_millis(50), Duration::from_secs(1));
+    fn jitter(&self, proto: Proto, backend: Option<&str>) -> Duration {
+        let span = (self.failure_time(proto, backend) / 4)
+            .clamp(Duration::from_millis(50), Duration::from_secs(1));
         random_up_to(span)
     }
 
     /// When to answer a login the gate refused (credential read at
-    /// `started`): as late as a typical wrong password, plus jitter.
+    /// `started`): as late as a typical wrong password at `backend`, or at
+    /// the slowest backend of the protocol when the refusal came before the
+    /// backend was known (`None`), plus jitter.
     pub fn refusal_deadline(
         &self,
         proto: Proto,
+        backend: Option<&str>,
         started: tokio::time::Instant,
     ) -> tokio::time::Instant {
-        started + self.failure_time(proto) + self.jitter(proto)
+        started + self.failure_time(proto, backend) + self.jitter(proto, backend)
     }
 
-    /// The backend rejected a password `latency` after the credential was
-    /// read: learn the latency, return when to answer (never before
-    /// `failure_delay`, plus the same jitter as a refusal).
+    /// `backend` rejected a password `latency` after the credential was
+    /// read: learn the latency for that backend, return when to answer
+    /// (never before `failure_delay`, plus the same jitter as a refusal).
     pub fn rejected_deadline(
         &self,
         proto: Proto,
+        backend: &str,
         started: tokio::time::Instant,
     ) -> tokio::time::Instant {
         let latency = started.elapsed();
-        {
-            let mut q = self.reject_latency[proto_index(proto)]
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
+        if let Some(pool) = self.latencies(proto, backend) {
+            let mut q = pool.samples.lock().unwrap_or_else(|p| p.into_inner());
             if q.len() == LATENCY_SAMPLES {
                 q.pop_front();
             }
             q.push_back(latency);
         }
-        (started + self.failure_delay).max(tokio::time::Instant::now()) + self.jitter(proto)
+        (started + self.failure_delay).max(tokio::time::Instant::now())
+            + self.jitter(proto, Some(backend))
     }
 
     /// No rule at all: every endpoint is OAuth-only.
@@ -686,12 +759,14 @@ impl Gate {
             return Verdict::Deny {
                 reason: Reason::UnknownAccount,
                 rule: "",
+                for_backend: false,
             };
         }
         let Some(m) = mechanism(mech) else {
             return Verdict::Deny {
                 reason: Reason::BlockedEndpoint,
                 rule: "",
+                for_backend: false,
             };
         };
         // 1. The first rule (in configuration order) that allows this login.
@@ -703,10 +778,20 @@ impl Gate {
             return Verdict::Deny {
                 reason: Reason::BlockedEndpoint,
                 rule: "",
+                for_backend: false,
             };
         };
         let rule = rule.name.as_str();
-        let deny = |reason| Verdict::Deny { reason, rule };
+        let deny = |reason| Verdict::Deny {
+            reason,
+            rule,
+            for_backend: false,
+        };
+        let deny_for_backend = |reason| Verdict::Deny {
+            reason,
+            rule,
+            for_backend: true,
+        };
         // 2. Domain.
         if let Some((inline, file)) = &self.domains {
             let ok = domain_of(user).is_some_and(|d| {
@@ -726,7 +811,7 @@ impl Gate {
         if let Some(a) = &self.account {
             match a.exists(user).await {
                 Ok(true) => {}
-                Ok(false) => return deny(Reason::UnknownAccount),
+                Ok(false) => return deny_for_backend(Reason::UnknownAccount),
                 Err(e) => return Verdict::Unavailable(e),
             }
         }
@@ -735,7 +820,7 @@ impl Gate {
             Some(t) => {
                 let turn = t.turn(user).await;
                 if t.is_throttled(user) {
-                    return deny(Reason::Throttled);
+                    return deny_for_backend(Reason::Throttled);
                 }
                 turn
             }
@@ -813,7 +898,7 @@ mod tests {
 
     fn denied(v: Verdict<'_>) -> Option<(Reason, String)> {
         match v {
-            Verdict::Deny { reason, rule } => Some((reason, rule.to_string())),
+            Verdict::Deny { reason, rule, .. } => Some((reason, rule.to_string())),
             _ => None,
         }
     }
@@ -1293,49 +1378,207 @@ mod tests {
         .is_some());
     }
 
-    /// Refusals are padded to the median of the recent backend rejections
-    /// of the same protocol (bounded), plus jitter; never below the delay.
+    /// Record a backend rejection of `ms` for `backend` directly.
+    fn learn(g: &Gate, proto: Proto, backend: &str, ms: u64) {
+        let pool = g.latencies(proto, backend).expect("registered backend");
+        pool.samples
+            .lock()
+            .unwrap()
+            .push_back(Duration::from_millis(ms));
+    }
+
+    /// Refusals are padded to the median of the recent rejections of the
+    /// backend (bounded), plus jitter; never below the delay.
     #[tokio::test]
     async fn refusal_time_follows_backend_rejections() {
         let g = gate_with(Legacy {
             failure_delay_ms: 100,
             rules: vec![rule("all", &["127.0.0.0/8"])],
             ..Legacy::default()
-        });
-        assert_eq!(g.failure_time(Proto::Imap), Duration::from_millis(100));
-        for ms in [800, 700, 900] {
-            let q = &g.reject_latency[proto_index(Proto::Imap)];
-            q.lock().unwrap().push_back(Duration::from_millis(ms));
-        }
-        assert_eq!(g.failure_time(Proto::Imap), Duration::from_millis(800));
+        })
+        .with_backends([
+            (Proto::Imap, "imap"),
+            (Proto::Smtp, "submission"),
+            (Proto::Sieve, "sieve"),
+        ]);
         assert_eq!(
-            g.failure_time(Proto::Smtp),
+            g.failure_time(Proto::Imap, None),
+            Duration::from_millis(100)
+        );
+        for ms in [800, 700, 900] {
+            learn(&g, Proto::Imap, "imap", ms);
+        }
+        assert_eq!(
+            g.failure_time(Proto::Imap, Some("imap")),
+            Duration::from_millis(800)
+        );
+        assert_eq!(
+            g.failure_time(Proto::Imap, None),
+            Duration::from_millis(800),
+            "one backend: the same time before and after it is known"
+        );
+        assert_eq!(
+            g.failure_time(Proto::Smtp, None),
             Duration::from_millis(100),
             "per protocol"
         );
         for _ in 0..4 {
-            g.reject_latency[0]
-                .lock()
-                .unwrap()
-                .push_back(Duration::from_secs(3600));
+            learn(&g, Proto::Imap, "imap", 3_600_000);
         }
-        assert_eq!(g.failure_time(Proto::Imap), MAX_LEARNED_DELAY);
+        assert_eq!(g.failure_time(Proto::Imap, None), MAX_LEARNED_DELAY);
         let now = tokio::time::Instant::now();
         for _ in 0..50 {
-            let d = g.refusal_deadline(Proto::Smtp, now) - now;
+            let d = g.refusal_deadline(Proto::Smtp, None, now) - now;
             assert!(
                 d >= Duration::from_millis(100) && d <= Duration::from_millis(150),
                 "{d:?}"
             );
         }
         let spread: std::collections::HashSet<_> = (0..20)
-            .map(|_| g.refusal_deadline(Proto::Smtp, now))
+            .map(|_| g.refusal_deadline(Proto::Smtp, None, now))
             .collect();
         assert!(spread.len() > 1, "jitter");
         for _ in 0..40 {
-            g.rejected_deadline(Proto::Sieve, now);
+            g.rejected_deadline(Proto::Sieve, "sieve", now);
         }
-        assert_eq!(g.reject_latency[2].lock().unwrap().len(), LATENCY_SAMPLES);
+        let sieve = g.latencies(Proto::Sieve, "sieve").unwrap();
+        assert_eq!(sieve.samples.lock().unwrap().len(), LATENCY_SAMPLES);
+        // A rejection of a backend without a pool teaches nothing.
+        g.rejected_deadline(Proto::Sieve, "other", now);
+        assert!(g.latencies(Proto::Sieve, "other").is_none());
+    }
+
+    /// Two backends behind one protocol, A rejecting after 300 ms and B after
+    /// 1500 ms. One pool per protocol answered a refusal of a B account at
+    /// the mixed median (300 ms), well before a wrong password at B: an
+    /// account oracle. Each backend pads its own refusals; a refusal before
+    /// the backend is known waits for the slower one.
+    #[tokio::test]
+    async fn refusal_timing_does_not_mix_backends() {
+        let g = gate_with(Legacy {
+            failure_delay_ms: 0,
+            rules: vec![rule("all", &["127.0.0.0/8"])],
+            ..Legacy::default()
+        })
+        .with_backends([(Proto::Imap, "a"), (Proto::Imap, "b"), (Proto::Smtp, "c")]);
+        for _ in 0..20 {
+            learn(&g, Proto::Imap, "a", 300);
+        }
+        for _ in 0..12 {
+            learn(&g, Proto::Imap, "b", 1500);
+        }
+        assert_eq!(
+            g.failure_time(Proto::Imap, Some("b")),
+            Duration::from_millis(1500),
+            "a B refusal waits like a wrong password at B"
+        );
+        assert_eq!(
+            g.failure_time(Proto::Imap, Some("a")),
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            g.failure_time(Proto::Imap, None),
+            Duration::from_millis(1500),
+            "before the backend is known: the slowest backend"
+        );
+        assert_eq!(
+            g.failure_time(Proto::Imap, Some("unknown")),
+            Duration::from_millis(1500),
+            "a backend without a pool: the slowest backend"
+        );
+        assert_eq!(g.failure_time(Proto::Smtp, None), Duration::ZERO);
+        // The deadline of a rejection learns for its own backend only.
+        let started = tokio::time::Instant::now() - Duration::from_millis(5000);
+        g.rejected_deadline(Proto::Imap, "a", started);
+        assert_eq!(
+            g.latencies(Proto::Imap, "b")
+                .unwrap()
+                .samples
+                .lock()
+                .unwrap()
+                .len(),
+            12
+        );
+        assert_eq!(
+            g.latencies(Proto::Imap, "a")
+                .unwrap()
+                .samples
+                .lock()
+                .unwrap()
+                .len(),
+            21
+        );
+    }
+
+    /// A reload keeps the learned timing of every backend both gates know
+    /// and starts a new backend cold.
+    #[tokio::test]
+    async fn carry_over_keeps_timing_per_backend() {
+        let cfg = || Legacy {
+            failure_delay_ms: 0,
+            rules: vec![rule("all", &["127.0.0.0/8"])],
+            ..Legacy::default()
+        };
+        let old = gate_with(cfg()).with_backends([(Proto::Imap, "a"), (Proto::Imap, "b")]);
+        learn(&old, Proto::Imap, "a", 700);
+        learn(&old, Proto::Imap, "b", 900);
+        let mut new = gate_with(cfg()).with_backends([(Proto::Imap, "a"), (Proto::Imap, "c")]);
+        new.carry_over(&old);
+        assert_eq!(
+            new.failure_time(Proto::Imap, Some("a")),
+            Duration::from_millis(700)
+        );
+        assert_eq!(new.failure_time(Proto::Imap, Some("c")), Duration::ZERO);
+        assert_eq!(
+            new.failure_time(Proto::Imap, None),
+            Duration::from_millis(700),
+            "the removed backend b no longer counts"
+        );
+        // Shared, not copied: the old generation's open connections keep
+        // teaching the new one.
+        learn(&old, Proto::Imap, "a", 700);
+        assert_eq!(
+            new.latencies(Proto::Imap, "a")
+                .unwrap()
+                .samples
+                .lock()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// The account check and the throttle refuse for the backend the login
+    /// goes to; the steps before it do not depend on the backend.
+    #[tokio::test]
+    async fn refusals_say_whether_they_depend_on_the_backend() {
+        let g = gate_with(Legacy {
+            allowed_domains: vec!["example.org".into()],
+            throttle: Some(config::Throttle {
+                failures: 1,
+                window_secs: 60,
+            }),
+            rules: vec![rule("all", &["127.0.0.0/8"])],
+            ..Legacy::default()
+        });
+        let peer: IpAddr = "127.0.0.1".parse().unwrap();
+        let for_backend = |v: Verdict<'_>| match v {
+            Verdict::Deny { for_backend, .. } => Some(for_backend),
+            _ => None,
+        };
+        let check = |user: &'static str| g.check(Proto::Imap, peer, None, "PLAIN", user);
+        assert_eq!(for_backend(check("").await), Some(false), "login");
+        assert_eq!(
+            for_backend(check("a@other.org").await),
+            Some(false),
+            "domain"
+        );
+        g.backend_rejected("a@example.org");
+        assert_eq!(
+            for_backend(check("a@example.org").await),
+            Some(true),
+            "throttle"
+        );
     }
 
     /// The mechanism is part of the rule: a LOGIN offered by one rule does

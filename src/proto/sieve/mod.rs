@@ -440,11 +440,12 @@ pub async fn handle(
                 auth::Outcome::Ok {
                     conn: (mut be, be_reply),
                     identity,
+                    issuer,
                 } => {
                     permit.authenticated();
                     client_tls.write_all(be_reply.as_bytes()).await?;
                     client_tls.write_all(b"\r\n").await?;
-                    tracing::info!(target: crate::obs::target::SIEVE, user=%crate::obs::authlog::sanitize(&identity), mech=%mech, "sieve auth ok; splicing");
+                    tracing::info!(target: crate::obs::target::SIEVE, user=%crate::obs::authlog::sanitize(&identity), mech=%mech, issuer=%issuer.as_deref().unwrap_or(""), "sieve auth ok; splicing");
                     crate::wire::splice(&mut client_tls, &mut be, Proto::Sieve, &ctx.tuning).await;
                     return Ok(());
                 }

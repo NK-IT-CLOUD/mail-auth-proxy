@@ -105,8 +105,8 @@ relays bytes. It never holds a master password or any other credential of its ow
   further processing (`oversize`, `bad_token`); a JWKS response over 256 KiB fails the
   fetch; a line is at most 16384 bytes, a ManageSieve literal at most 64 KiB.
 - Refusal timing: a refusal by the legacy gate is answered after the larger of
-  `failure_delay_ms` and the median of the last 32 backend rejections of that protocol
-  (at most 10 s); a backend rejection no earlier than `failure_delay_ms`; both with the
+  `failure_delay_ms` and the median of the last 32 rejections of the backend the login
+  goes to (at most 10 s); a backend rejection no earlier than `failure_delay_ms`; both with the
   same random jitter; a password-path outage (retry-later) no earlier than a refusal.
   OAuth failures are not delayed.
 - Client-controlled text never reaches error texts or log fields unescaped. The

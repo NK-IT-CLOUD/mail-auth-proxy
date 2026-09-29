@@ -103,7 +103,7 @@ The size cap and the protocol-error rule close an enumeration oracle. A backend 
 
 The size check, steps 1 to 4 and a wrong password all give the client the protocol's wrong-password reply, and their timing is made alike:
 
-- A refusal by the gate is answered after the larger of `legacy.failure_delay_ms` (default 2000, Dovecot's default `auth_failure_delay`) and the median latency of the last 32 backend rejections of the same protocol (capped at 10 s), counted from the credential.
+- A refusal by the gate is answered after the larger of `legacy.failure_delay_ms` (default 2000, Dovecot's default `auth_failure_delay`) and the median latency of the last 32 rejections of the backend the login goes to (capped at 10 s), counted from the credential. The latencies are learned per backend, so a refusal matches a wrong password at that backend; each protocol has one backend. A refusal in the steps before the account check (size, rule, domain) waits for the backend of the protocol with the largest median.
 - A backend rejection is answered no earlier than `failure_delay_ms` after the credential.
 - Both get the same random jitter: up to a quarter of that time, at least 50 ms, at most 1 s.
 - An outage on the password path (account check or backend unavailable) is answered with retry-later no earlier than a refusal, with the same jitter. Outages only reach accounts that passed the earlier steps, so an instant answer would identify them.

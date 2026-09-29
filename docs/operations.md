@@ -51,8 +51,8 @@ When a `protocol` record is written:
 - `INFO`:
   - `oauth validated; proxying to backend peer=… user=<email> mech=…` (IMAP)
   - `password auth; forwarding to backend peer=… user=<login> mech=…` (IMAP)
-  - `submission auth ok; splicing user=… mech=…`
-  - `sieve auth ok; splicing user=… mech=…`
+  - `submission auth ok; splicing user=… mech=… issuer=…`
+  - `sieve auth ok; splicing user=… mech=… issuer=…` (`issuer`: the configured issuer whose key verified the token, empty for a password)
   - `session closed by limit proto=… reason="idle_limit"|"max_session" secs=…` when a `[session]` limit ended a logged-in session
 - Startup, at `INFO`:
   - `legacy password rule rule=<name> networks=[…] sni=… users=… users_file=… protocols=… mechanisms=…` per rule and `legacy password gate domain_gate=… account_check=… throttle=… failure_delay_ms=…`, or `password auth disabled: OAuth only`.

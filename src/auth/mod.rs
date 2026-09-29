@@ -130,6 +130,17 @@ pub const MAX_PASSWORD: usize = 1024;
 /// Largest bearer token the proxy validates; a longer one is a `bad_token`.
 pub const MAX_TOKEN: usize = 16384;
 
+/// The backend a protocol's credentials go to, by name: each protocol has
+/// one, named after the section that configures it. Keys the refusal timing
+/// of the legacy gate (`legacy::Gate::with_backends`).
+pub fn backend_name(proto: Proto) -> &'static str {
+    match proto {
+        Proto::Imap => "imap",
+        Proto::Smtp => "submission",
+        Proto::Sieve => "sieve",
+    }
+}
+
 /// The facts about a connection that decide and label an auth attempt.
 pub struct Session<'a> {
     pub proto: Proto,
@@ -406,8 +417,13 @@ pub fn blocked_source() -> anyhow::Error {
 /// journal. The answer is best effort: a client that is already gone must not
 /// replace the reason (an outage's cause above all) with a write error.
 pub enum Outcome<C> {
-    /// Logged in as `identity`.
-    Ok { conn: C, identity: String },
+    /// Logged in as `identity`. `issuer`: the configured issuer whose key
+    /// verified the token; `None` for a password.
+    Ok {
+        conn: C,
+        identity: String,
+        issuer: Option<String>,
+    },
     /// A password on a connection that offers no password mechanism (or not
     /// this one). It was not forwarded.
     Blocked,
@@ -516,10 +532,10 @@ pub async fn authorize<B: BackendLogin>(
                     }
                 }
             };
-            let identity = match validated {
-                Ok(email) => {
+            let token::Validated { identity, issuer } = match validated {
+                Ok(validated) => {
                     metrics::record_token_validate(true);
-                    email
+                    validated
                 }
                 // The keys could not be checked for the token's kid: no
                 // verdict on the token, so not a failed login.
@@ -549,7 +565,11 @@ pub async fn authorize<B: BackendLogin>(
                     metrics::record_backend_login(s.proto, login_started.elapsed());
                     event(&identity, Reason::Ok, "", "");
                     metrics::record_upstream_forward(s.proto);
-                    Outcome::Ok { conn, identity }
+                    Outcome::Ok {
+                        conn,
+                        identity,
+                        issuer: Some(issuer),
+                    }
                 }
                 Err(BackendError::Rejected(reply)) => {
                     event(&identity, Reason::BackendReject, "", "");
@@ -563,6 +583,7 @@ pub async fn authorize<B: BackendLogin>(
         }
         ClientAuthKind::Password { user, pass } => {
             let started = tokio::time::Instant::now();
+            let backend_name = backend_name(s.proto);
             // The credential of a refused password was parsed only to log the
             // attempt (who, from where, which password fingerprint) for CrowdSec.
             let pwfp = authlog::pw_fingerprint(Some(pass));
@@ -575,7 +596,7 @@ pub async fn authorize<B: BackendLogin>(
                 // Before the gate, so the answer does not depend on the
                 // account; answered like any refusal.
                 event(user, Reason::Oversize, &pwfp, "");
-                tokio::time::sleep_until(gate.refusal_deadline(s.proto, started)).await;
+                tokio::time::sleep_until(gate.refusal_deadline(s.proto, None, started)).await;
                 return Outcome::Denied;
             }
             let check = tokio::time::timeout_at(
@@ -588,9 +609,15 @@ pub async fn authorize<B: BackendLogin>(
             });
             let (rule, turn) = match check {
                 legacy::Verdict::Pass { rule, turn } => (rule, turn),
-                legacy::Verdict::Deny { reason, rule } => {
+                legacy::Verdict::Deny {
+                    reason,
+                    rule,
+                    for_backend,
+                } => {
                     event(user, reason, &pwfp, rule);
-                    tokio::time::sleep_until(gate.refusal_deadline(s.proto, started)).await;
+                    let backend = for_backend.then_some(backend_name);
+                    tokio::time::sleep_until(gate.refusal_deadline(s.proto, backend, started))
+                        .await;
                     return Outcome::Denied;
                 }
                 legacy::Verdict::Unavailable(e) => {
@@ -598,7 +625,12 @@ pub async fn authorize<B: BackendLogin>(
                     // Padded like a refusal: an instant retry-later would
                     // tell accounts that reach the check from those the
                     // gate refuses earlier.
-                    tokio::time::sleep_until(gate.refusal_deadline(s.proto, started)).await;
+                    tokio::time::sleep_until(gate.refusal_deadline(
+                        s.proto,
+                        Some(backend_name),
+                        started,
+                    ))
+                    .await;
                     return Outcome::Unavailable(e.context("legacy account check"));
                 }
             };
@@ -619,10 +651,11 @@ pub async fn authorize<B: BackendLogin>(
                     Outcome::Ok {
                         conn,
                         identity: user.clone(),
+                        issuer: None,
                     }
                 }
                 Err(BackendError::Rejected(reply)) => {
-                    let answer_at = gate.rejected_deadline(s.proto, started);
+                    let answer_at = gate.rejected_deadline(s.proto, backend_name, started);
                     gate.backend_rejected(user);
                     drop(turn);
                     event(user, Reason::BackendReject, &pwfp, rule);
@@ -634,7 +667,12 @@ pub async fn authorize<B: BackendLogin>(
                     metrics::record_backend_error(s.proto);
                     // Only accounts that passed the gate get here: padded
                     // like a refusal, so the timing does not tell them apart.
-                    tokio::time::sleep_until(gate.refusal_deadline(s.proto, started)).await;
+                    tokio::time::sleep_until(gate.refusal_deadline(
+                        s.proto,
+                        Some(backend_name),
+                        started,
+                    ))
+                    .await;
                     Outcome::Unavailable(e)
                 }
             }

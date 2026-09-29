@@ -89,6 +89,16 @@ pub fn parse_alg(alg: &str) -> Option<Algorithm> {
     }
 }
 
+/// A token that passed validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Validated {
+    /// The verified identity claim, forwarded to the backend as the login.
+    pub identity: String,
+    /// The configured issuer whose key verified the token: the token's `iss`,
+    /// since each key is accepted only with the issuer that published it.
+    pub issuer: String,
+}
+
 /// The token rules of one issuer (compiled from `config::Issuer`).
 pub struct Policy {
     issuer: String,
@@ -653,15 +663,15 @@ impl Validator {
     /// stays `bad_token` for CrowdSec, also while another issuer is down.
     /// When that issuer's refresh failed it is `KeysStale` (an outage): the
     /// key may have been rotated in while its IdP was unreachable.
-    pub async fn validate_fresh(&self, token: &str) -> Result<String, TokenError> {
-        let first = self.validate(token);
+    pub async fn validate_fresh(&self, token: &str) -> Result<Validated, TokenError> {
+        let first = self.verify(token);
         if !matches!(first, Err(TokenError::UnknownKid)) {
             return first;
         }
         // Serialise on-demand refreshes. A task that waited here may find the
         // key already loaded by the refresh it waited for.
         let mut last = self.last_kid_refetch.lock().await;
-        let again = self.validate(token);
+        let again = self.verify(token);
         if !matches!(again, Err(TokenError::UnknownKid)) {
             return again;
         }
@@ -685,7 +695,7 @@ impl Validator {
         if let Err(re) = &refreshed {
             tracing::warn!(target: crate::obs::target::TOKEN, error = %re, "JWKS refresh for unknown kid");
         }
-        let verdict = match self.validate(token) {
+        let verdict = match self.verify(token) {
             Err(TokenError::UnknownKid) => Err(stale(&failed)),
             other => other,
         };
@@ -696,6 +706,12 @@ impl Validator {
     /// Validate `token` and return its verified identity (the issuer's
     /// `identity_claim`, by default `email`).
     pub fn validate(&self, token: &str) -> Result<String, TokenError> {
+        self.verify(token).map(|v| v.identity)
+    }
+
+    /// Validate `token`: its verified identity and the issuer that vouches
+    /// for it.
+    pub fn verify(&self, token: &str) -> Result<Validated, TokenError> {
         // serde puts the offending header value into its error text; that value
         // is attacker-chosen, so the detail is dropped.
         let header = decode_header(token).map_err(|_| invalid!("malformed header"))?;
@@ -714,7 +730,14 @@ impl Validator {
             // token: no algorithm confusion (alg=none, HS256 forgery), no
             // issuer borrowed from another realm (see `KeyEntry`).
             match decode::<Map<String, Value>>(token, &e.key, &e.validation) {
-                Ok(data) => return check_claims(&data.claims, &header, &e.policy),
+                Ok(data) => {
+                    return check_claims(&data.claims, &header, &e.policy).map(|identity| {
+                        Validated {
+                            identity,
+                            issuer: e.policy.issuer.clone(),
+                        }
+                    })
+                }
                 Err(err) => last = Some(err),
             }
         }
@@ -1007,6 +1030,17 @@ mod tests {
         );
         assert_eq!(v.validate(&tok_a).unwrap(), "a@x");
         assert_eq!(v.validate(&tok_b).unwrap(), "b@x");
+        // The issuer that vouches for the identity is the one whose key
+        // verified the token, also when both publish the same kid.
+        for (tok, identity, issuer) in [(&tok_a, "a@x", ISS_A), (&tok_b, "b@x", ISS_B)] {
+            assert_eq!(
+                v.verify(tok).unwrap(),
+                Validated {
+                    identity: identity.into(),
+                    issuer: issuer.into()
+                }
+            );
+        }
 
         // ...and the cross claim still fails for a colliding kid.
         let cross = mint(
@@ -1449,11 +1483,14 @@ mod tests {
             v.validate_fresh(&claiming(Some(ISS_B))).await,
             Err(TokenError::KeysStale)
         ));
-        // A's key kept working throughout.
-        assert!(v
-            .validate_fresh(&mint(&pem_a, "kid-a", claims()))
-            .await
-            .is_ok());
+        // A's key kept working throughout, with A as the issuer.
+        assert_eq!(
+            v.validate_fresh(&mint(&pem_a, "kid-a", claims()))
+                .await
+                .unwrap()
+                .issuer,
+            ISS_A
+        );
     }
 
     /// Only a 2xx response is a JWKS: a redirect (not followed) or another

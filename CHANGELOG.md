@@ -6,6 +6,16 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- The refusal timing of the legacy gate learns the rejection latencies per backend
+  instead of per protocol. A refusal by the account check or the throttle waits like a
+  wrong password at the backend the login goes to; a refusal before it (size, rule,
+  domain) waits for the slowest backend of the protocol. With one backend per protocol
+  the timing is the same as before; the change keeps refusals and wrong passwords alike
+  once a protocol has several backends.
+- The `submission auth ok` and `sieve auth ok` log lines name the issuer of the token
+  (`issuer=`, empty for a password).
+
 ### Fixed
 - The usage text (`-h`, `--help`, an unknown option) lists `-h` and `--help`.
 

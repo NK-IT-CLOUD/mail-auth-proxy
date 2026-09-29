@@ -138,7 +138,17 @@ impl Generation {
         let mut legacy = crate::auth::legacy::Gate::new(
             &cfg.legacy,
             std::time::Duration::from_secs(cfg.timeouts.connect_secs),
-        )?;
+        )?
+        .with_backends(
+            [
+                Some(metrics::Proto::Imap),
+                cfg.submission.as_ref().map(|_| metrics::Proto::Smtp),
+                cfg.sieve.as_ref().map(|_| metrics::Proto::Sieve),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|p| (p, crate::auth::backend_name(p))),
+        );
         let keepalive = keepalive(&cfg.session);
         let imap = Imap {
             acceptor: tls::acceptor(&certs, Some(b"imap")),

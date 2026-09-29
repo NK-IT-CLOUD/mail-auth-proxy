@@ -314,12 +314,13 @@ pub async fn handle(
                 auth::Outcome::Ok {
                     conn: mut be,
                     identity,
+                    issuer,
                 } => {
                     permit.authenticated();
                     client_tls
                         .write_all(b"235 2.7.0 Authentication successful\r\n")
                         .await?;
-                    tracing::info!(target: crate::obs::target::SUBMISSION, user=%crate::obs::authlog::sanitize(&identity), mech=%mech, "submission auth ok; splicing");
+                    tracing::info!(target: crate::obs::target::SUBMISSION, user=%crate::obs::authlog::sanitize(&identity), mech=%mech, issuer=%issuer.as_deref().unwrap_or(""), "submission auth ok; splicing");
                     crate::wire::splice(&mut client_tls, &mut be, Proto::Smtp, &ctx.tuning).await;
                     return Ok(());
                 }
