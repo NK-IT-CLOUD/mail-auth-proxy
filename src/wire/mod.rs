@@ -29,6 +29,8 @@ pub struct Tuning {
     pub preauth: Duration,
     /// Commands accepted before authentication.
     pub max_preauth_commands: usize,
+    /// Authentication attempts per connection, at least 1.
+    pub max_auth_attempts: u32,
     /// TCP keepalive of every client and backend connection.
     pub keepalive: Keepalive,
     /// After login: end the session after this long without a byte in
@@ -47,6 +49,7 @@ impl Default for Tuning {
             connect: Duration::from_secs(10),
             preauth: Duration::from_secs(60),
             max_preauth_commands: 8,
+            max_auth_attempts: 3,
             keepalive: Keepalive {
                 idle: Duration::from_secs(600),
                 interval: Duration::from_secs(60),

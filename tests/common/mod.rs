@@ -476,7 +476,8 @@ pub struct Seen {
     pub error_answer: Option<String>,
     /// Lines received after a successful login.
     pub relayed: Vec<String>,
-    /// A ManageSieve capability probe (LOGOUT without AUTHENTICATE).
+    /// A capability probe: ManageSieve LOGOUT or SMTP QUIT without
+    /// authenticating.
     pub probe: bool,
 }
 
@@ -556,7 +557,24 @@ pub struct MockBackend {
     /// IMAP: the greeting does not advertise SASL-IR, and an AUTHENTICATE
     /// with an initial response gets BAD (RFC 4959 §3).
     pub no_sasl_ir: Arc<AtomicBool>,
+    /// SMTP: the extension lines of the post-TLS EHLO reply besides
+    /// XCLIENT and AUTH, instead of `SMTP_EHLO`.
+    pub smtp_ehlo: Arc<Mutex<Option<Vec<String>>>>,
 }
+
+/// The SMTP mock's post-TLS EHLO extensions besides XCLIENT and AUTH:
+/// Postfix's defaults.
+pub const SMTP_EHLO: &[&str] = &[
+    "PIPELINING",
+    "SIZE 10240000",
+    "VRFY",
+    "ETRN",
+    "ENHANCEDSTATUSCODES",
+    "8BITMIME",
+    "DSN",
+    "SMTPUTF8",
+    "CHUNKING",
+];
 
 impl MockBackend {
     pub async fn start(kind: Kind, tls: Arc<rustls::ServerConfig>) -> MockBackend {
@@ -574,6 +592,8 @@ impl MockBackend {
         let untagged = caps_untagged.clone();
         let no_sasl_ir: Arc<AtomicBool> = Arc::default();
         let no_ir = no_sasl_ir.clone();
+        let smtp_ehlo: Arc<Mutex<Option<Vec<String>>>> = Arc::default();
+        let ehlo = smtp_ehlo.clone();
         let acceptor = tokio_rustls::TlsAcceptor::from(tls);
         let accept = tokio::spawn(async move {
             loop {
@@ -593,6 +613,7 @@ impl MockBackend {
                     login_caps: caps.lock().unwrap().clone(),
                     caps_untagged: untagged.load(Ordering::SeqCst),
                     no_sasl_ir: no_ir.load(Ordering::SeqCst),
+                    smtp_ehlo: ehlo.lock().unwrap().clone(),
                 };
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
@@ -614,6 +635,7 @@ impl MockBackend {
             login_caps,
             caps_untagged,
             no_sasl_ir,
+            smtp_ehlo,
         }
     }
 
@@ -659,6 +681,8 @@ struct Rec {
     caps_untagged: bool,
     /// `MockBackend::no_sasl_ir` when the connection was accepted.
     no_sasl_ir: bool,
+    /// `MockBackend::smtp_ehlo` when the connection was accepted.
+    smtp_ehlo: Option<Vec<String>>,
 }
 
 impl Rec {
@@ -883,11 +907,16 @@ async fn mock_smtp(
     assert_eq!(l, "STARTTLS", "mock smtp");
     tcp.write_all(b"220 2.0.0 Ready to start TLS\r\n").await?;
     let mut s = acceptor.accept(tcp).await?;
-    const EHLO: &[u8] =
-        b"250-backend.test\r\n250-XCLIENT NAME ADDR PROTO HELO LOGIN\r\n250 AUTH PLAIN LOGIN XOAUTH2\r\n";
+    let extensions: String = match &rec.smtp_ehlo {
+        Some(l) => l.iter().map(|x| format!("250-{x}\r\n")).collect(),
+        None => SMTP_EHLO.iter().map(|x| format!("250-{x}\r\n")).collect(),
+    };
+    let ehlo = format!(
+        "250-backend.test\r\n{extensions}250-XCLIENT NAME ADDR PROTO HELO LOGIN\r\n250 AUTH PLAIN LOGIN XOAUTH2\r\n"
+    );
     // After XCLIENT the session is the client's: XCLIENT only if its
     // address is authorized too.
-    const EHLO_CLIENT: &[u8] = b"250-backend.test\r\n250 AUTH PLAIN LOGIN XOAUTH2\r\n";
+    let ehlo_client = format!("250-backend.test\r\n{extensions}250 AUTH PLAIN LOGIN XOAUTH2\r\n");
     let mut after_xclient = false;
     while let Some(l) = read_line_raw(&mut s).await {
         if l.len() + 2 > SMTP_LINE_LIMIT {
@@ -898,8 +927,15 @@ async fn mock_smtp(
         let mut w = l.splitn(3, ' ');
         let verb = w.next().unwrap_or("").to_ascii_uppercase();
         match verb.as_str() {
-            "EHLO" if after_xclient && !rec.xclient_sticky => s.write_all(EHLO_CLIENT).await?,
-            "EHLO" => s.write_all(EHLO).await?,
+            "EHLO" if after_xclient && !rec.xclient_sticky => {
+                s.write_all(ehlo_client.as_bytes()).await?
+            }
+            "EHLO" => s.write_all(ehlo.as_bytes()).await?,
+            "QUIT" => {
+                rec.update(|r| r.probe = true);
+                s.write_all(b"221 2.0.0 Bye\r\n").await?;
+                return Ok(());
+            }
             "XCLIENT" => {
                 rec.update(|r| r.xclient = Some(l.clone()));
                 after_xclient = true;
@@ -1225,6 +1261,14 @@ pub struct Opts {
     pub sieve_down: bool,
     /// `[[tls.certificates]]` besides the default certificate (cert, key).
     pub tls_certificates: Vec<(PathBuf, PathBuf)>,
+    /// The submission backend is down when the proxy starts.
+    pub smtp_down: bool,
+    /// `limits.max_auth_attempts`. 1 by default: most tests look at one
+    /// refused attempt and the close that follows it.
+    pub max_auth_attempts: u32,
+    /// TOML lines added to `[submission]` (`ehlo_extensions`,
+    /// `capability_cache_secs`).
+    pub submission_extra: &'static str,
 }
 
 impl Default for Opts {
@@ -1243,6 +1287,9 @@ impl Default for Opts {
             session: None,
             sieve_down: false,
             tls_certificates: Vec::new(),
+            smtp_down: false,
+            max_auth_attempts: 1,
+            submission_extra: "",
         }
     }
 }
@@ -1341,6 +1388,7 @@ backend = {imap_be}
 listen = "{SMTP_IP}:0"
 backend = {smtp_be}
 xclient = {xclient}
+{submission_extra}
 
 [sieve]
 listen = "{SIEVE_IP}:0"
@@ -1357,6 +1405,7 @@ token_type = "keycloak"
 {legacy}
 [limits]
 max_preauth_per_ip = {per_ip}
+max_auth_attempts = {attempts}
 
 [timeouts]
 preauth_secs = {preauth}
@@ -1382,10 +1431,12 @@ connect_secs = 3
             imap_be = backend(imap, true),
             smtp_be = backend(smtp, false),
             xclient = opts.smtp_xclient,
+            submission_extra = opts.submission_extra,
             sieve_be = backend(sieve, true),
             jwks = idp.jwks_url(),
             issuer_extra = opts.issuer_extra,
             per_ip = opts.max_preauth_per_ip,
+            attempts = opts.max_auth_attempts,
             preauth = opts.preauth_secs,
             idle = opts.idle_secs,
             legacy = opts.legacy.clone().unwrap_or_else(default_password_gate),
@@ -1686,6 +1737,9 @@ impl Harness {
         let sieve_be = MockBackend::start(Kind::Sieve, pki.backend.clone()).await;
         if opts.sieve_down {
             sieve_be.shutdown().await;
+        }
+        if opts.smtp_down {
+            smtp_be.shutdown().await;
         }
         let proxy = Proxy::start(&pki, &idp, [&imap_be, &smtp_be, &sieve_be], &opts).await;
         Harness {

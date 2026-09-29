@@ -244,10 +244,14 @@ Postfix has no PROXY protocol on this path; the proxy's configuration check reje
 `smtpd_sender_login_maps` with `reject_authenticated_sender_login_mismatch` work as
 without the proxy, because the SASL login is the token's identity.
 
-The proxy answers the client's EHLO itself with the static
-`submission.ehlo_extensions`. Keep that list in line with what this service offers
-(`postconf -n` and an `EHLO` against the backend show it); `SIZE` is not advertised
-unless you add it.
+The proxy answers the client's EHLO itself, with the extensions this service offers
+after STARTTLS as far as the proxy handles them (PIPELINING, SIZE, 8BITMIME, SMTPUTF8,
+DSN, ENHANCEDSTATUSCODES, CHUNKING). It reads them with a connection of its own, at
+startup and then at most every `submission.capability_cache_secs`, and ends it with
+`QUIT`; Postfix logs it as a connection from the proxy without AUTH. Keywords removed
+per client address after XCLIENT (`smtpd_discard_ehlo_keyword_address_maps`) are not
+seen: remove them for the proxy's address too, or leave them out with
+`submission.ehlo_extensions`.
 
 ### `line_length_limit`
 

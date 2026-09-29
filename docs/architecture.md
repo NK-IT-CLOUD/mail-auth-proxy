@@ -18,7 +18,7 @@ client ──TLS──▶ mail-auth-proxy ────────────�
                  2. TLS handshake, SNI noted
                  3. greeting / capabilities: OAuth mechanisms always, PLAIN/LOGIN only
                     where a legacy rule matches source address, SNI and protocol
-                 4. read AUTHENTICATE / AUTH / LOGIN (one attempt per connection)
+                 4. read AUTHENTICATE / AUTH / LOGIN (up to limits.max_auth_attempts)
                  5a. OAuth: validate the JWT locally ──────── JWKS (cached, refreshed) ◀── IdP
                  5b. password: legacy gate (rule, domain, account check, throttle)
                  6. connect to the backend, pass the client address (PROXY v2 / XCLIENT),
@@ -26,7 +26,7 @@ client ──TLS──▶ mail-auth-proxy ────────────�
                  7. relay the backend's verdict; on success relay bytes until either side closes
 ```
 
-Each connection is one tokio task. Connections share only the JWKS key set, the server certificates, the ManageSieve capability cache, the legacy gate's caches and counters, the connection limits, the failed-login counters and the metrics. Trust boundaries and the threat model are in [SECURITY.md](../SECURITY.md#trust-boundaries).
+Each connection is one tokio task. Connections share only the JWKS key set, the server certificates, the ManageSieve capability and SMTP EHLO caches, the legacy gate's caches and counters, the connection limits, the failed-login counters and the metrics. Trust boundaries and the threat model are in [SECURITY.md](../SECURITY.md#trust-boundaries).
 
 ## Startup
 
@@ -234,14 +234,14 @@ Limits are checked at `accept()`, before TLS:
 
 ## Failed-login rate limit
 
-`[auth_ratelimit]` blocks a source address that presents too many refused credentials. A session takes one credential, so a guesser opens a new connection for each attempt; the per-account throttle covers passwords only, and only per account. The rate limit also covers token guessing, scanners and password spraying over many accounts, without a log-based blocker.
+`[auth_ratelimit]` blocks a source address that presents too many refused credentials. A connection takes at most `limits.max_auth_attempts` credentials (default 3), so a guesser soon needs new connections; the per-account throttle covers passwords only, and only per account. The rate limit also covers token guessing, scanners and password spraying over many accounts, without a log-based blocker.
 
 - **Source:** an IPv4 address (also IPv4-mapped), or an IPv6 network whose prefix length `limits.ipv6_source_prefix` sets (32 to 64, default 64), as for `limits.max_preauth_per_ip`. One host usually holds a whole /64; with 48, a site that rotates through its /64s stays one source.
 - **Counted:** every refused credential, one per `authresult` line with `result="fail"` and a credential: `bad_token`, `authzid_mismatch`, `blocked_endpoint`, `unknown_domain`, `unknown_account`, `throttled`, `oversize`, `backend_reject`. All reasons count alike, so the attempt that starts a block tells nothing about the account; `throttled` counts for the same reason (it occurs only for accounts that exist).
 - **Not counted:** `protocol` (no credential: a TLS or certificate fault on the proxy's side would otherwise block every client), and every outage: an unavailable backend or account check, or token keys that could not be checked. Outages write no `authresult` line and never block anyone.
 - **Repeats:** a credential identical to one of the source's last 8 failures in the window (same user and same password or token) counts once. A client retrying a stale password or an expired token does not block its address, and repeating a guess gains nothing. The comparison uses a keyed 64-bit fingerprint; the secret is not kept.
 - **Successful logins** do not reset the count: one valid account must not clear the way for guesses at others.
-- **Block:** after `failures` counted failures within `window_secs` (a window starts with the first failure), new connections from the source are closed at accept for `block_secs`, on every listener. Each further block of the same source doubles, up to `max_block_secs`; the escalation is forgotten once the last block ended `max_block_secs` ago. Failures of connections opened before the block do not extend it.
+- **Block:** after `failures` counted failures within `window_secs` (a window starts with the first failure), new connections from the source are closed at accept for `block_secs`, on every listener. An open connection from the source is closed at its next credential, before it is judged. Each further block of the same source doubles, up to `max_block_secs`; the escalation is forgotten once the last block ended `max_block_secs` ago. Failures of connections opened before the block do not extend it.
 - **Exempt:** sources in `exempt_networks` (default: loopback), and with `exempt_internal = true` also sources in `scope.internal_networks`. They are not counted at all.
 - **Memory:** at most 65,536 sources. A full table first drops entries with nothing left to remember, then the least valuable 1,024 (unblocked before blocked, oldest first); they are counted in `mail_auth_proxy_ratelimit_evictions_total`. Entries are also swept every 10 s.
 
@@ -260,10 +260,12 @@ To keep observing attacks on a legacy rule open to public networks, as a honeypo
 | `timeouts.idle_secs` | 30 s | every single `read_line` read (idle), on client and backend |
 | `timeouts.preauth_secs` | 60 s total | from accept to the backend's verdict: TLS handshake, plaintext dialog, SASL, token validation (with a JWKS refresh), the legacy account check and the backend login. Activity does not reset it, so drip-feeding does not help. |
 | `timeouts.connect_secs` | 10 s | backend TCP connect; backend TLS handshake; writing the PROXY header |
-| `limits.max_preauth_commands` | 8 | commands before a credential (per phase for SMTP and Sieve) |
+| `limits.max_preauth_commands` | 8 | commands before a credential (per phase for SMTP and Sieve), across all attempts |
+| `limits.max_auth_attempts` | 3 | authentication attempts per connection, within the one pre-auth budget |
 | JWKS fetch (fixed) | 10 s | per URL; all URLs are fetched in parallel |
 | `oauth.refresh_secs` | 300 s | periodic JWKS refresh of all URLs |
 | `sieve.capability_cache_secs` | 600 s | backend post-TLS capabilities |
+| `submission.capability_cache_secs` | 600 s | backend post-TLS EHLO extensions |
 | metrics scrape (fixed) | 10 s, 4 at a time | the whole request head, and the response, each; a fifth connection is closed at accept |
 | backend auth reply (fixed) | at most 32 lines | IMAP `P1` reply; each line within the idle timeout |
 | `session.keepalive_idle_secs`, `_interval_secs`, `_count` | 600 s, 60 s, 5 | TCP keepalive of every client and backend connection, from accept or connect ([after authentication](#after-authentication)) |

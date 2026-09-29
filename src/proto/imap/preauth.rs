@@ -57,24 +57,32 @@ pub struct ClientAuth {
 /// The loop is bounded so an unauthenticated peer can't hold the slot.
 ///
 /// `Ok(None)`: LOGOUT, or a close right after the greeting — a clean end, not
-/// a failure. Every refusal is answered; a read error or timeout is not.
-/// `name` is the server name shown in the greeting.
+/// a failure. Every refusal is answered; a read error or timeout is not. An
+/// authentication command that failed without a credential and may be
+/// followed by another is marked `auth::Retryable`.
+/// `name` is the server name shown in the greeting. `cmds` counts the
+/// commands of the connection across calls; the greeting goes out on the
+/// first call (`cmds` 0).
 pub async fn read_client_auth<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     pw: MechSet,
     name: &str,
     tuning: &Tuning,
+    cmds: &mut usize,
 ) -> Result<Option<ClientAuth>> {
     let caps = capabilities(pw);
-    stream
-        .write_all(format!("* OK [CAPABILITY {caps}] {name} ready\r\n").as_bytes())
-        .await?;
-    for n in 0..tuning.max_preauth_commands {
+    if *cmds == 0 {
+        stream
+            .write_all(format!("* OK [CAPABILITY {caps}] {name} ready\r\n").as_bytes())
+            .await?;
+    }
+    while *cmds < tuning.max_preauth_commands {
+        *cmds += 1;
         let line = match read_client_line(stream, tuning.idle).await {
             Ok(l) => l,
             // Connect, read the greeting, disconnect: a health check or port
             // probe, not a failed login.
-            Err(e) if n == 0 && e.is_eof() => return Ok(None),
+            Err(e) if *cmds == 1 && e.is_eof() => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         let mut parts = line.splitn(3, ' ');
@@ -138,7 +146,7 @@ pub async fn read_client_auth<S: AsyncRead + AsyncWrite + Unpin>(
                     stream
                         .write_all(format!("{tag} NO LOGIN empty field\r\n").as_bytes())
                         .await?;
-                    return Err(anyhow!("LOGIN empty field"));
+                    return Err(crate::auth::answered(anyhow!("LOGIN empty field")));
                 }
                 return Ok(Some(ClientAuth {
                     tag,
@@ -155,17 +163,17 @@ pub async fn read_client_auth<S: AsyncRead + AsyncWrite + Unpin>(
                             format!("{tag} BAD AUTHENTICATE needs a mechanism\r\n").as_bytes(),
                         )
                         .await?;
-                    return Err(anyhow!("no mechanism"));
+                    return Err(crate::auth::answered(anyhow!("no mechanism")));
                 };
                 let inline_ir = initial_response(aparts.next());
                 let Some(m) = Mechanism::parse(&mech) else {
                     stream
                         .write_all(format!("{tag} NO unsupported SASL mechanism\r\n").as_bytes())
                         .await?;
-                    return Err(anyhow!(
+                    return Err(crate::auth::answered(anyhow!(
                         "unsupported mechanism {}",
                         crate::obs::authlog::sanitize(&mech)
-                    ));
+                    )));
                 };
                 let (kind, host) = match read_sasl_credential(
                     stream,
@@ -204,7 +212,11 @@ pub async fn read_client_auth<S: AsyncRead + AsyncWrite + Unpin>(
                             .write_all(format!("{tag} {reply}\r\n").as_bytes())
                             .await;
                         let _ = stream.flush().await;
-                        return Err(e);
+                        return Err(if e.is::<Withheld>() {
+                            e
+                        } else {
+                            crate::auth::answered(e)
+                        });
                     }
                 };
                 return Ok(Some(ClientAuth {
@@ -503,7 +515,14 @@ mod tests {
         let ir = crate::auth::sasl::build_xoauth2("alice@example.org", "TKN");
         // OAuth must work even on the OAuth-only endpoint (no password mechanism).
         let server_task = tokio::spawn(async move {
-            read_client_auth(&mut server, MechSet::default(), "test", &Tuning::default()).await
+            read_client_auth(
+                &mut server,
+                MechSet::default(),
+                "test",
+                &Tuning::default(),
+                &mut 0,
+            )
+            .await
         });
         // read greeting
         let mut buf = [0u8; 256];
@@ -529,7 +548,7 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let ir = base64::engine::general_purpose::STANDARD.encode("\0alice@example.org\0pw123");
         let t = tokio::spawn(async move {
-            read_client_auth(&mut server, BOTH, "test", &Tuning::default()).await
+            read_client_auth(&mut server, BOTH, "test", &Tuning::default(), &mut 0).await
         });
         let mut buf = [0u8; 256];
         let n = client.read(&mut buf).await.unwrap();
@@ -554,7 +573,7 @@ mod tests {
     async fn reads_login_two_step() {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let t = tokio::spawn(async move {
-            read_client_auth(&mut server, BOTH, "test", &Tuning::default()).await
+            read_client_auth(&mut server, BOTH, "test", &Tuning::default(), &mut 0).await
         });
         let mut buf = [0u8; 256];
         let _ = client.read(&mut buf).await.unwrap(); // greeting
@@ -607,7 +626,14 @@ mod tests {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let ir = base64::engine::general_purpose::STANDARD.encode("\0bob@example.invalid\0pw");
         let t = tokio::spawn(async move {
-            read_client_auth(&mut server, MechSet::default(), "test", &Tuning::default()).await
+            read_client_auth(
+                &mut server,
+                MechSet::default(),
+                "test",
+                &Tuning::default(),
+                &mut 0,
+            )
+            .await
         });
         let mut buf = [0u8; 256];
         let n = client.read(&mut buf).await.unwrap();
@@ -644,7 +670,7 @@ mod tests {
         // *command* with a quoted password.
         let (mut client, mut server) = tokio::io::duplex(4096);
         let t = tokio::spawn(async move {
-            read_client_auth(&mut server, BOTH, "test", &Tuning::default()).await
+            read_client_auth(&mut server, BOTH, "test", &Tuning::default(), &mut 0).await
         });
         let mut buf = [0u8; 512];
         let _ = client.read(&mut buf).await.unwrap(); // greeting
@@ -676,7 +702,14 @@ mod tests {
     async fn unknown_preauth_command_rejected() {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let t = tokio::spawn(async move {
-            read_client_auth(&mut server, MechSet::default(), "test", &Tuning::default()).await
+            read_client_auth(
+                &mut server,
+                MechSet::default(),
+                "test",
+                &Tuning::default(),
+                &mut 0,
+            )
+            .await
         });
         let mut buf = [0u8; 256];
         let _ = client.read(&mut buf).await.unwrap(); // greeting
@@ -684,6 +717,45 @@ mod tests {
         let n = client.read(&mut buf).await.unwrap();
         assert!(std::str::from_utf8(&buf[..n]).unwrap().starts_with("F1 NO"));
         assert!(t.await.unwrap().is_err());
+    }
+
+    /// A failed AUTHENTICATE, or a LOGIN with an empty field, may be
+    /// followed by another attempt; the next call goes on without a second
+    /// greeting and counts commands across calls. An unparsable LOGIN, whose
+    /// end the proxy cannot be sure of, may not.
+    #[tokio::test]
+    async fn retryable_failures_and_the_next_attempt() {
+        for (line, retry) in [
+            (&b"a AUTHENTICATE FOO\r\n"[..], true),
+            (b"a AUTHENTICATE\r\n", true),
+            (b"a AUTHENTICATE PLAIN !!\r\n", true),
+            (b"a AUTHENTICATE PLAIN =\r\n", true),
+            (b"a LOGIN \"\" pw\r\n", true),
+            (b"a LOGIN user \"unterminated\r\n", false),
+            (b"a SELECT INBOX\r\n", false),
+        ] {
+            let what = String::from_utf8_lossy(line).trim().to_string();
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            client.write_all(line).await.unwrap();
+            client.write_all(b"b LOGIN user pw\r\n").await.unwrap();
+            let mut cmds = 0;
+            let e = read_client_auth(&mut server, BOTH, "test", &Tuning::default(), &mut cmds)
+                .await
+                .err()
+                .expect("an error");
+            assert_eq!(e.is::<crate::auth::Retryable>(), retry, "{what}: {e:#}");
+            if retry {
+                let next =
+                    read_client_auth(&mut server, BOTH, "test", &Tuning::default(), &mut cmds)
+                        .await;
+                assert_eq!(password(next), ("user".into(), "pw".into()), "{what}");
+                assert_eq!(cmds, 2, "{what}");
+            }
+            drop(server);
+            let mut out = String::new();
+            client.read_to_string(&mut out).await.unwrap();
+            assert_eq!(out.matches("* OK [CAPABILITY").count(), 1, "{what}: {out}");
+        }
     }
 
     #[test]
@@ -708,7 +780,7 @@ mod tests {
     async fn login_dialog(pw: MechSet, input: &[u8]) -> (Result<Option<ClientAuth>>, String) {
         let (mut client, mut server) = tokio::io::duplex(1 << 16);
         let t = tokio::spawn(async move {
-            read_client_auth(&mut server, pw, "test", &Tuning::default()).await
+            read_client_auth(&mut server, pw, "test", &Tuning::default(), &mut 0).await
         });
         let mut greeting = [0u8; 512];
         let _ = client.read(&mut greeting).await.unwrap();
@@ -787,7 +859,14 @@ mod tests {
     async fn logout_before_auth_is_a_clean_end() {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let t = tokio::spawn(async move {
-            read_client_auth(&mut server, MechSet::default(), "test", &Tuning::default()).await
+            read_client_auth(
+                &mut server,
+                MechSet::default(),
+                "test",
+                &Tuning::default(),
+                &mut 0,
+            )
+            .await
         });
         let mut buf = [0u8; 512];
         let _ = client.read(&mut buf).await.unwrap(); // greeting
@@ -800,7 +879,14 @@ mod tests {
     async fn cancelled_authenticate_gets_a_tagged_reply() {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let t = tokio::spawn(async move {
-            read_client_auth(&mut server, MechSet::default(), "test", &Tuning::default()).await
+            read_client_auth(
+                &mut server,
+                MechSet::default(),
+                "test",
+                &Tuning::default(),
+                &mut 0,
+            )
+            .await
         });
         let mut buf = [0u8; 512];
         let _ = client.read(&mut buf).await.unwrap(); // greeting
@@ -822,7 +908,14 @@ mod tests {
     async fn tag_without_command_gets_bad() {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let t = tokio::spawn(async move {
-            read_client_auth(&mut server, MechSet::default(), "test", &Tuning::default()).await
+            read_client_auth(
+                &mut server,
+                MechSet::default(),
+                "test",
+                &Tuning::default(),
+                &mut 0,
+            )
+            .await
         });
         let mut buf = [0u8; 512];
         let _ = client.read(&mut buf).await.unwrap(); // greeting
@@ -837,7 +930,7 @@ mod tests {
     async fn authenticate_login_with_initial_response() {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let t = tokio::spawn(async move {
-            read_client_auth(&mut server, BOTH, "test", &Tuning::default()).await
+            read_client_auth(&mut server, BOTH, "test", &Tuning::default(), &mut 0).await
         });
         let mut buf = [0u8; 512];
         let _ = client.read(&mut buf).await.unwrap(); // greeting
@@ -882,7 +975,14 @@ mod tests {
     async fn disconnect_after_greeting_is_a_clean_end() {
         let (mut client, mut server) = tokio::io::duplex(4096);
         let t = tokio::spawn(async move {
-            read_client_auth(&mut server, MechSet::default(), "test", &Tuning::default()).await
+            read_client_auth(
+                &mut server,
+                MechSet::default(),
+                "test",
+                &Tuning::default(),
+                &mut 0,
+            )
+            .await
         });
         let mut buf = [0u8; 512];
         let n = client.read(&mut buf).await.unwrap();

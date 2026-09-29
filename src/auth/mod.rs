@@ -269,6 +269,138 @@ pub fn discovery(s: &Session<'_>, d: &sasl::Discovery) {
     .record();
 }
 
+/// An authentication command that ended without a credential (an
+/// unsupported mechanism, a cancelled or undecodable response, one that holds
+/// no valid credential). It was answered and read to its end, so the client
+/// may try again on the same connection. Attached as context (`answered`).
+#[derive(Debug)]
+pub struct Retryable;
+
+impl std::fmt::Display for Retryable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("authentication attempt without a credential")
+    }
+}
+
+/// `e`, the answered failure of an authentication command, marked
+/// `Retryable` unless reading or writing the client failed: after a read
+/// error, a timeout or an oversized line the position in the client's data
+/// is lost, and the connection must end.
+pub fn answered(e: anyhow::Error) -> anyhow::Error {
+    if e.chain()
+        .any(|c| c.is::<LineError>() || c.is::<std::io::Error>())
+    {
+        e
+    } else {
+        e.context(Retryable)
+    }
+}
+
+/// The authentication attempts of one connection, at most
+/// `limits.max_auth_attempts`. Each attempt is judged, logged and counted by
+/// the rate limit on its own, like one on a new connection, within the
+/// connection's one pre-auth budget.
+pub struct Attempts {
+    left: u32,
+    /// A credential (or a discovery request) was presented.
+    presented: bool,
+    /// Why the last refused attempt failed.
+    last: Option<anyhow::Error>,
+}
+
+impl Attempts {
+    pub fn new(max: u32) -> Attempts {
+        Attempts {
+            left: max.max(1),
+            presented: false,
+            last: None,
+        }
+    }
+
+    /// An attempt was refused and answered; `error` says why, `presented`
+    /// whether it carried a credential or a discovery request. A `Retryable`
+    /// one without is logged here as `protocol`. `Ok` if the client may try
+    /// again, else the error that ends the session.
+    pub fn refused(
+        &mut self,
+        s: &Session<'_>,
+        error: anyhow::Error,
+        presented: bool,
+    ) -> Result<(), anyhow::Error> {
+        if !presented {
+            no_credential(s);
+        }
+        self.presented |= presented;
+        self.left = self.left.saturating_sub(1);
+        if self.left == 0 {
+            self.abort_if_nothing_presented(s);
+            return Err(error);
+        }
+        self.last = Some(error);
+        Ok(())
+    }
+
+    /// The dialog ended with `e` before another credential (a close, a
+    /// timeout, a command flood, a malformed command). A close at a line
+    /// boundary after a refused attempt is the client giving up: the session
+    /// ends with that refusal and no further line. Anything else is logged
+    /// as `protocol`. Either way the connection is a pre-auth abort if no
+    /// credential was ever presented.
+    pub fn ended(&mut self, s: &Session<'_>, e: anyhow::Error) -> anyhow::Error {
+        let clean_close = e
+            .chain()
+            .any(|c| c.downcast_ref::<LineError>().is_some_and(LineError::is_eof));
+        self.abort_if_nothing_presented(s);
+        match self.last.take() {
+            Some(last) if clean_close => last,
+            _ => {
+                no_credential(s);
+                e
+            }
+        }
+    }
+
+    fn abort_if_nothing_presented(&self, s: &Session<'_>) {
+        if !self.presented {
+            metrics::record_preauth_abort(s.proto, s.internal);
+        }
+    }
+}
+
+/// The `protocol` line of an attempt or a dialog that presented no
+/// credential. Not a failed login: neither the auth metrics nor the rate
+/// limit count it.
+fn no_credential(s: &Session<'_>) {
+    AuthEvent {
+        proto: s.proto,
+        scope: s.scope,
+        mech: "other",
+        user: "",
+        peer: s.peer.ip(),
+        reason: Reason::Protocol,
+        pwfp: "",
+        rule: "",
+    }
+    .record();
+}
+
+/// True if the rate limit blocked the source after the connection was
+/// accepted (by this connection's failures or another's). The credential is
+/// then not judged: the connection closes without an answer, like one the
+/// block refuses at accept.
+pub fn source_blocked(ctx: &Shared, s: &Session<'_>) -> bool {
+    let blocked = ctx.ratelimit.is_blocked(s.peer.ip());
+    if blocked {
+        metrics::record_ratelimit_block(s.proto);
+    }
+    blocked
+}
+
+/// The session-ending error of a blocked source (`source_blocked`).
+pub fn blocked_source() -> anyhow::Error {
+    refused("source blocked by the auth rate limit, credential not judged")
+}
+
 /// How `authorize` ended. Logging and metrics are done; the protocol only
 /// answers the client, then ends a failed session with an error for the
 /// journal. The answer is best effort: a client that is already gone must not
@@ -506,6 +638,29 @@ pub async fn authorize<B: BackendLogin>(
                     Outcome::Unavailable(e)
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failure the client caused with a complete command may be followed
+    /// by another attempt; one that broke the read of the client's data may
+    /// not.
+    #[test]
+    fn answered_marks_only_complete_exchanges() {
+        assert!(answered(anyhow::anyhow!("unsupported mechanism")).is::<Retryable>());
+        assert!(answered(anyhow::Error::new(sasl::BadResponse("cancel"))).is::<Retryable>());
+        for e in [
+            anyhow::Error::new(LineError::TooLong),
+            anyhow::Error::new(LineError::Timeout(30)),
+            anyhow::Error::new(LineError::Eof).context("sasl"),
+            anyhow::Error::new(std::io::Error::other("reset")).context("write"),
+        ] {
+            let e = answered(e);
+            assert!(!e.is::<Retryable>(), "{e:#}");
         }
     }
 }

@@ -65,7 +65,7 @@ Each of these ends the connection.
 | backend offers `UNAUTHENTICATE` (RFC 8437) in its greeting or after the login | `t NO [UNAVAILABLE] Backend temporarily unavailable`; the journal names the capability | none (counted in `mail_auth_proxy_backend_errors_total`) |
 | success | `t ` + the backend's own tagged reply text, e.g. `t OK [CAPABILITY IMAP4rev1 IDLE MOVE] Logged in` | `ok` |
 
-Every failure closes the connection; there is one authentication attempt per connection.
+After a refused attempt the client may try again, up to `limits.max_auth_attempts` attempts per connection (default 3; [D-GEN-1](standards.md#d-gen-1-limited-authentication-attempts-per-connection)). The last one, a retry-later reply (`[UNAVAILABLE]`), an unparsable `LOGIN` and a command not valid before authentication close the connection.
 
 Backend login steps:
 
@@ -150,7 +150,7 @@ The banner is `220 <hostname> ESMTP`.
 | `NOOP`, `RSET` | `250 2.0.0 OK` |
 | `STARTTLS` | `503 5.5.1 TLS already active` |
 | any other SMTP command except `AUTH` (`MAIL`, `RCPT`, `DATA`, `BDAT`, `VRFY`, `EXPN`, `HELP`) | `530 5.7.0 Authentication required` |
-| `EHLO` | `250-<hostname>`, one `250-` line per `submission.ehlo_extensions` entry (default PIPELINING, ENHANCEDSTATUSCODES, 8BITMIME, DSN, SMTPUTF8, CHUNKING), `250 AUTH XOAUTH2 OAUTHBEARER[ PLAIN LOGIN]` |
+| `EHLO` | `250-<hostname>`, one `250-` line per extension of the backend's EHLO reply the proxy handles (PIPELINING, SIZE, 8BITMIME, SMTPUTF8, DSN, ENHANCEDSTATUSCODES, CHUNKING; narrowed by `submission.ehlo_extensions`), `250 AUTH XOAUTH2 OAUTHBEARER[ PLAIN LOGIN]` |
 | `QUIT`, an unrecognised command | as before TLS |
 | after the 8th command (sent unprompted) | `421 4.7.0 Too many commands before AUTH` (closed) |
 | `AUTH` without mech | `501 5.5.4 Syntax: AUTH mechanism [initial-response]` |
@@ -163,9 +163,11 @@ The banner is `220 <hostname> ESMTP`.
 | a response that decodes but holds no valid credential (the cases listed for [IMAP](#imap-sasl-exchange), `AUTH PLAIN =` included) | `535 5.7.8 Authentication credentials invalid` |
 | an OAuth response with an empty `auth` value (discovery, RFC 7628 §4.3) | `334 <error result>`, then after the client's answer `535 5.7.8 …` or, for `*` and undecodable answers, `501 5.5.2 …` ([OAuth error result](#oauth-error-result)); `authresult` `protocol`, not a failed login |
 
-Every reply to an AUTH that does not succeed, here and in the [decision table](#smtp-decision-and-backend-login), is followed by `421 4.7.0 <hostname> closing connection`, and the connection closes (RFC 5321 §3.8): the proxy takes one AUTH per connection.
+After a reply to an AUTH that does not succeed, here and in the [decision table](#smtp-decision-and-backend-login), the client may send another AUTH (RFC 4954 §4), up to `limits.max_auth_attempts` per connection (default 3). The reply to the last one is followed by `421 4.7.0 <hostname> closing connection`, and the connection closes (RFC 5321 §3.8).
 
-The EHLO extension list is static: it does not come from the backend, and `SIZE` is left out. The client keeps this view for the whole session, because it does not send EHLO again after AUTH.
+The EHLO extension list is the backend's, with the backend's parameters (`SIZE` keeps its limit), as far as the proxy handles each extension ([standards: D-SMTP-3](standards.md#d-smtp-3-ehlo-list-from-a-probe-of-the-backend)). The proxy reads it with a probe connection of its own: at startup (a failure is logged, `WARN … submission backend EHLO extensions not available at startup`, and does not stop the start), then at the first EHLO after `submission.capability_cache_secs` (default 600 s), one probe at a time. A failed probe counts in `mail_auth_proxy_backend_errors_total{proto="smtp"}`, the next one waits 5 s, and meanwhile the list of the last successful probe is used; before the first, the reply lists no extension. The client keeps its view for the whole session, because it does not send EHLO again after AUTH; a connection keeps the list of its first EHLO.
+
+`BDAT` before AUTH gets `530 5.7.0 Authentication required`, then `421 4.7.0 <hostname> closing connection` and the close: the proxy does not read the chunk (RFC 3030 §2 asks for it to be read and discarded), so none of it is taken for commands.
 
 ### SMTP: decision and backend login
 
@@ -185,7 +187,7 @@ The EHLO extension list is static: it does not come from the backend, and `SIZE`
 | backend AUTH reply 510 to 599 (e.g. `535`) | `535 5.7.8 Authentication credentials invalid` (password: after `failure_delay_ms`) | `backend_reject` |
 | backend `235` | `235 2.7.0 Authentication successful`, then relay | `ok` |
 
-Every failure is followed by `421 4.7.0 <hostname> closing connection`, and the connection closes. Backend login steps, all within the pre-auth budget:
+A `454` retry-later reply, and the reply to the last attempt, are followed by `421 4.7.0 <hostname> closing connection`, and the connection closes; after any other failure the client may try again. Backend login steps, all within the pre-auth budget:
 
 1. Connect; expect `220`.
 2. `EHLO <hostname>`; expect `250` and `STARTTLS` among the extensions.
@@ -288,7 +290,7 @@ Before `AUTHENTICATE`, `CAPABILITY` (the capability list again, then `OK "Capabi
 | mech not in `XOAUTH2`, `OAUTHBEARER`, `PLAIN` (e.g. `LOGIN`) | `NO "Authentication mechanism not supported"`, before any challenge |
 | `AUTHENTICATE "PLAIN"` without IR where the connection does not offer PLAIN | `NO "password authentication not available on this endpoint"`, without a challenge |
 | anything else (another command, unquoted mech, bad literal, literal > 64 KiB) | `NO "Invalid AUTHENTICATE"` (closed) |
-| `"*"` / `*` as the response, a response that is not base64 or holds no valid credential (the cases listed for [IMAP](#imap-sasl-exchange)) | `NO "Invalid authentication response"` (closed) |
+| `"*"` / `*` as the response, a response that is not base64 or holds no valid credential (the cases listed for [IMAP](#imap-sasl-exchange)) | `NO "Invalid authentication response"`; a malformed string (bad literal, text after the quoted string) closes the connection |
 | an OAuth response with an empty `auth` value (discovery, RFC 7628 §4.3) | the [OAuth error result](#oauth-error-result), then `NO "Authentication failed"`; `authresult` `protocol`, not a failed login |
 
 ### ManageSieve: decision and backend login
@@ -390,11 +392,11 @@ the result is `{"status":"invalid_token"}`.
 
 ## Surprising and client-incompatible behaviour
 
-1. **One authentication attempt per connection.** Any failed or unsupported AUTH/AUTHENTICATE, and any unknown pre-auth command, closes the connection; SMTP announces the close with `421 4.7.0 <hostname> closing connection`. A client that falls back to another mechanism on the same connection, such as Python `smtplib.login()` from PLAIN to LOGIN after a 535, gets the 421 instead of a second attempt.
+1. **A few authentication attempts per connection.** A connection takes `limits.max_auth_attempts` attempts (default 3), so a client can fall back from one mechanism to another (Python `smtplib.login()` from PLAIN to LOGIN after a 535). After the last one, after a retry-later reply and after an unknown pre-auth command the connection closes; SMTP announces the close with `421 4.7.0 <hostname> closing connection`. When the rate limit has blocked the source in the meantime, the next credential is not judged and the connection closes without an answer.
 2. **The client's SASL username must match the token for OAuth.** The backend login is always the token's `identity_claim` (default `email`). An XOAUTH2 `user=` (required by the mechanism) or OAUTHBEARER `a=` must be empty, the identity itself, or its local part without a domain (`alice` for `alice@example.org`), all ASCII case-insensitive; anything else, in particular another full address, fails the exchange. OAUTHBEARER is converted to XOAUTH2 for the backend.
 3. **A legacy rule with `sni` needs SNI.** Clients connecting by IP (no SNI) or with a different hostname or alias only get OAuth from such a rule, even from its networks.
 4. **IMAP:** only `IMAP4rev1` is advertised before authentication; after login the backend's real list is relayed, with `IMAP4rev2` if the backend offers it. `STARTTLS` on the implicit-TLS port closes the connection.
-5. **SMTP:** the EHLO list is static (no `SIZE`; `CHUNKING`, `DSN` and `SMTPUTF8` are claimed whatever the backend supports).
+5. **SMTP:** the EHLO list is the backend's as the proxy's own probe sees it, cached for `submission.capability_cache_secs`; extensions the proxy does not handle (`VRFY`, `ETRN`, `XCLIENT`, `BINARYMIME`, …) are left out. `BDAT` before AUTH closes the connection.
 6. **ManageSieve:** before login only `CAPABILITY`, `NOOP`, `LOGOUT`, `STARTTLS` (before TLS) and `AUTHENTICATE` are accepted. There is no `LOGIN`. The plaintext greeting lists no mechanism (`"SASL" ""`); the mechanisms appear only after TLS. Client literals must be non-synchronising (`{n+}`); `{n}` is refused. The backend's capabilities are probed at startup; while no probe has succeeded and the current one fails, the plaintext greeting lacks the `"SIEVE"` line ([standards: D-SIEVE-1](standards.md#d-sieve-1-sieve-missing-from-the-pre-tls-greeting-while-the-backend-is-down)).
 7. **Password mechanisms that are not offered are refused before the password.** `AUTHENTICATE PLAIN` / `AUTH PLAIN` without an initial response, and SASL `LOGIN`, on a connection without a matching legacy rule get IMAP `NO`, SMTP `504 5.5.4` or ManageSieve `NO` at once; the client is never asked for a password the proxy would not use, nor sent the continuation for an IMAP `LOGIN` literal. A password already sent (IMAP `LOGIN` with a quoted string or a non-synchronising literal, a PLAIN initial response) is still logged with its fingerprint.
 8. **OAUTHBEARER `host` must be the name the client connected to.** When the client sent SNI, a different `host` (another name or alias of the server) is refused like an invalid token. XOAUTH2 has no `host`; without SNI nothing is compared.

@@ -50,8 +50,8 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 | Zero-length initial response sent as `=` | MUST | RFC 4959 §3, RFC 9051 §6.2.2 | Yes | `=` is the empty response. It holds no credential for the supported mechanisms and gets `NO [AUTHENTICATIONFAILED]`. |
 | Initial response with a mechanism that has none → tagged BAD | MUST | RFC 4959 §3, RFC 9051 §6.2.2 | Deviation | An initial response to LOGIN is taken as the user name. See D-SASL-3. |
 | `*` cancels; invalid base64 → tagged BAD | MUST | RFC 9051 §6.2.2 | Yes | A response that decodes but holds no valid credential gets `NO [AUTHENTICATIONFAILED]` |
-| Unsupported mechanism → tagged NO | SHOULD | RFC 9051 §6.2.2 | Yes | Then the connection closes. See D-GEN-1. |
-| After a failed AUTHENTICATE, the client may retry | MAY (client) | RFC 9051 §6.2.2 | Deviation | One attempt per connection. See D-GEN-1. |
+| Unsupported mechanism → tagged NO | SHOULD | RFC 9051 §6.2.2 | Yes | Counts as an attempt. See D-GEN-1. |
+| After a failed AUTHENTICATE, the client may retry | MAY (client) | RFC 9051 §6.2.2 | Partial | Up to `limits.max_auth_attempts` attempts (default 3) per connection, LOGIN included. See D-GEN-1. |
 | LOGIN with astring arguments (atom, quoted, literal) | MUST | RFC 9051 §6.2.3, §9 | Yes | Synchronising `{n}` after a `+` continuation and non-synchronising `{n+}` (RFC 9051 §4.3), up to 16384 octets each. Where LOGIN is not offered, a synchronising literal gets `NO` without a continuation. |
 | Response codes AUTHENTICATIONFAILED, UNAVAILABLE | | RFC 5530 §3 | Yes | AUTHENTICATIONFAILED for rejected credentials; UNAVAILABLE when the backend is unavailable. A backend `NO` with UNAVAILABLE, INUSE, SERVERBUG or LIMIT is an outage, not a rejection. |
 | ID command answered `* ID NIL` | MUST | RFC 2971 §3.1-3.2 | Yes | |
@@ -85,13 +85,14 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 | Invalid credentials → `535 5.7.8`; temporary failure → `454 4.7.0`; success → `235 2.7.0` | SHOULD | RFC 4954 §6 | Yes | |
 | Commands before AUTH → `530 5.7.0` | SHOULD | RFC 4954 §6 | Yes | |
 | Authentication lines up to 12288 octets | | RFC 4954 §4 | Yes | Limit 16384 |
-| Server closes only after QUIT, 421 or a timeout | MUST NOT (otherwise) | RFC 5321 §3.8, §7.8 | Yes | After a failed or unsupported AUTH the reply is followed by `421 4.7.0 <domain> closing connection`, then the close. One AUTH per connection, see D-GEN-1. |
+| Server closes only after QUIT, 421 or a timeout | MUST NOT (otherwise) | RFC 5321 §3.8, §7.8 | Yes | After a refused AUTH the client may send another, up to `limits.max_auth_attempts`. The reply to the last one, and to an AUTH that meets an outage, is followed by `421 4.7.0 <domain> closing connection`, then the close. See D-GEN-1. |
 | Unknown commands → `500` | SHOULD | RFC 5321 §4.2.4 | Yes | |
 | Server timeout ≥ 5 minutes | SHOULD | RFC 5321 §4.5.3.2.7 | Deviation | Pre-authentication budget. See D-GEN-2. |
 | PIPELINING: responses in order, input not lost | MUST | RFC 2920 §3.2 | Yes | Commands pipelined after AUTH are relayed once authentication succeeds |
 | Enhanced status codes on 2xx/4xx/5xx replies | MUST (when offered) | RFC 2034 §4, RFC 3463 | Yes | Except the `250` replies to EHLO and HELO, which RFC 2034 §4 exempts |
-| Only advertise extensions that work | MUST | RFC 5321 §4.2.4 | Partial | The post-TLS extension list is configured statically and must match the backend. See D-SMTP-3. |
-| PIPELINING, ENHANCEDSTATUSCODES, DSN, 8BITMIME offered | SHOULD | RFC 6409 §7 | Yes (default list) | |
+| Only advertise extensions that work | MUST | RFC 5321 §4.2.4 | Partial | The post-TLS list is the backend's own, as far as the proxy handles each extension (PIPELINING, SIZE, 8BITMIME, SMTPUTF8, DSN, ENHANCEDSTATUSCODES, CHUNKING), from a probe the proxy caches. See D-SMTP-3. |
+| PIPELINING, ENHANCEDSTATUSCODES, DSN, 8BITMIME offered | SHOULD | RFC 6409 §7 | Yes | Where the backend offers them |
+| After a failed BDAT the chunk is read and discarded before the reply | MUST | RFC 3030 §2 | Deviation | Before AUTH, BDAT gets `530` and `421`, then the close: the proxy does not read mail data before AUTH, and its chunk is never taken for commands |
 | Implicit TLS on 465 | SHOULD | RFC 8314 §3.3 | No | D-SMTP-1 |
 
 ## 4. ManageSieve
@@ -216,13 +217,14 @@ Metric names follow the Prometheus naming guidelines: an application prefix (`ma
 
 ## Known deviations
 
-### D-GEN-1: one authentication attempt per connection
+### D-GEN-1: limited authentication attempts per connection
 
-- Behaviour: any failed or unsupported authentication, and any command not valid before authentication, is answered and then the connection closes. In SMTP the reply to a refused AUTH is followed by `421 4.7.0 <hostname> closing connection`.
+- Behaviour: a connection takes up to `limits.max_auth_attempts` authentication attempts (default 3; 1 closes after the first refusal). Every AUTHENTICATE, AUTH or IMAP LOGIN command is an attempt, whether it fails on the credential or before one (an unsupported mechanism, a cancelled or undecodable response). After the last one, and after an outage (a retry-later reply), the connection closes; in SMTP the reply is followed by `421 4.7.0 <hostname> closing connection`. A command not valid before authentication, and a malformed command whose end the proxy cannot be sure of (an IMAP LOGIN it cannot parse, an unparsable ManageSieve AUTHENTICATE or string, a read error), is answered and ends the connection at once.
 - What the specifications say:
-  - IMAP (RFC 9051 §6.2.2) and ManageSieve (RFC 5804 §2.1) let the client try another mechanism after NO.
+  - IMAP (RFC 9051 §6.2.2) and ManageSieve (RFC 5804 §2.1) let the client try another mechanism after NO; SMTP (RFC 4954 §4) lets it send another AUTH after a failed one. None sets a number.
   - SMTP servers must not close except after QUIT, a 421 reply or a timeout (RFC 5321 §3.8); with the 421 the SMTP close conforms. RFC 5321 §7.8 allows servers to defend against attacks.
-- Rationale: this limits online guessing and keeps unauthenticated sessions short. Clients that fall back from one mechanism to another on the same connection must reconnect.
+- Each attempt is handled as one on a new connection would be: its own `authresult` line, the rate limit count, the legacy gate with its throttle and the refusal timing. Before a credential is judged, the proxy checks whether the rate limit has blocked the source since the accept (by this connection's failures or another's); if so, the connection closes without an answer, like one refused at accept. The pre-auth budget (`timeouts.preauth_secs`) and `limits.max_preauth_commands` count for the whole connection, not per attempt.
+- Rationale: clients fall back from one mechanism to another on the same connection (Python `smtplib` from PLAIN to LOGIN, Thunderbird through its list), and an OAuth client may retry with a refreshed token after the error result. A small limit keeps unauthenticated sessions short; beyond it, guessing needs new connections, which the rate limit and the per-IP limit see at accept.
 
 ### D-GEN-2: short pre-authentication timeouts
 
@@ -271,9 +273,12 @@ The LOGIN mechanism is server-first, so RFC 4954 §4 and RFC 4959 §3 require th
 
 Only STARTTLS on 587 is implemented.
 
-### D-SMTP-3: static EHLO list
+### D-SMTP-3: EHLO list from a probe of the backend
 
-The extensions advertised after STARTTLS come from configuration, not from the backend. Clients do not send EHLO again after AUTH, so the list must match what the backend offers (RFC 5321 §4.2.4). Each entry must be an `ehlo-line` (RFC 5321 §4.1.1.1) with a keyword that appears once; the proxy cannot check that the backend offers it.
+- Behaviour: the extensions advertised after STARTTLS are those of the backend's own post-TLS EHLO reply that the proxy handles: PIPELINING, SIZE (with the backend's limit), 8BITMIME, SMTPUTF8, DSN, ENHANCEDSTATUSCODES and CHUNKING, narrowed further by `submission.ehlo_extensions` if set. The proxy reads the reply with a probe connection of its own (at startup, then at most once per `submission.capability_cache_secs`, one at a time); a client's EHLO reply is built at its first EHLO and kept for the connection.
+- What the specification says: only extensions that work may be advertised (RFC 5321 §4.2.4). Clients do not send EHLO again after AUTH, so the list the proxy shows is what they use against the backend.
+- Limits: the probe is the proxy's own session. Postfix settings that change the list by client address after XCLIENT (`smtpd_discard_ehlo_keyword_address_maps`) are not seen, and a change on the backend shows only after the cache time. While no probe succeeds, the list of the last successful one is used, whatever its age; before the first, no extension is advertised. Fewer extensions than the backend has are always safe: the client uses none of the others.
+- Left out, whatever the backend offers: AUTH and STARTTLS (the proxy's own), XCLIENT and XFORWARD (the proxy's authorisation at the backend), VRFY, EXPN and ETRN, and every extension the proxy has not been checked against (BINARYMIME, REQUIRETLS, …).
 
 ### D-SMTP-4: server name
 

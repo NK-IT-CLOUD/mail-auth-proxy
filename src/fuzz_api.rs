@@ -26,18 +26,26 @@ pub const MAX_LINE: usize = crate::wire::line::MAX_LINE;
 /// The idle timeout the wrappers pass. In-memory streams never wait.
 pub const IDLE: Duration = Duration::from_secs(30);
 
-/// The IMAP pre-auth dialog up to a credential.
+/// The IMAP pre-auth dialog up to a credential, with a further attempt
+/// after each one that failed without a credential and may be retried, as
+/// the listener does, up to the default attempt limit.
 pub async fn imap_read_client_auth<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     pw: MechSet,
 ) -> Result<Option<ClientAuth>> {
-    crate::proto::imap::preauth::read_client_auth(
-        stream,
-        pw,
-        "fuzz",
-        &crate::wire::Tuning::default(),
-    )
-    .await
+    let tuning = crate::wire::Tuning::default();
+    let mut cmds = 0;
+    let mut attempts = tuning.max_auth_attempts;
+    loop {
+        let r =
+            crate::proto::imap::preauth::read_client_auth(stream, pw, "fuzz", &tuning, &mut cmds)
+                .await;
+        attempts -= 1;
+        match r {
+            Err(e) if attempts > 0 && e.is::<crate::auth::Retryable>() => continue,
+            r => return r,
+        }
+    }
 }
 
 /// The two astrings of an IMAP `LOGIN` command.
@@ -78,6 +86,24 @@ pub async fn smtp_read_auth<S: AsyncRead + AsyncWrite + Unpin>(
     crate::proto::smtp::preauth::read_smtp_auth(line, stream, pw, challenge.base64(), IDLE)
         .await
         .map(|(mech, kind, _host)| (mech, kind))
+}
+
+/// True if the client may follow the failed attempt `e` with another.
+pub fn is_retryable(e: &anyhow::Error) -> bool {
+    e.is::<crate::auth::Retryable>()
+}
+
+/// The extensions relayed from the backend's EHLO reply.
+pub const SMTP_EHLO_RELAYED: &[&str] = crate::proto::smtp::ehlo::RELAYED;
+
+/// The keyword of an EHLO line, `None` if it is none.
+pub fn smtp_ehlo_keyword(line: &str) -> Option<&str> {
+    crate::proto::smtp::ehlo::ehlo_keyword(line)
+}
+
+/// The EHLO lines advertised to clients from the backend's extension lines.
+pub fn smtp_ehlo_advertised(backend: &[String], only: Option<&[String]>) -> Vec<String> {
+    crate::proto::smtp::ehlo::advertised(backend, only)
 }
 
 /// One (possibly multiline) SMTP reply from the backend.

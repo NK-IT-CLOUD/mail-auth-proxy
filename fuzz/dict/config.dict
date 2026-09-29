@@ -16,6 +16,7 @@
 "max_connections = "
 "max_preauth_per_ip = "
 "max_preauth_commands = "
+"max_auth_attempts = "
 "preauth_secs = "
 "idle_secs = "
 "connect_secs = "

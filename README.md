@@ -255,12 +255,12 @@ The full index is [docs/README.md](docs/README.md).
 
 ## Known limitations
 
-- One authentication attempt per connection; a failed attempt closes it.
+- At most `limits.max_auth_attempts` authentication attempts per connection (default 3).
 - After login the idle limit and the session lifetime limit are off by default
   (`[session]`); TCP keepalive is on. A session does not end when its token expires.
-- IMAP `LOGIN` with literals and ManageSieve `LOGIN` are not supported.
-- The SMTP `EHLO` list is static (`submission.ehlo_extensions`); `SIZE` is not advertised by
-  default.
+- ManageSieve `LOGIN` is not supported.
+- The SMTP `EHLO` list is the backend's as the proxy's own probe sees it, cached for
+  `submission.capability_cache_secs`; extensions the proxy does not handle are left out.
 - Connections closed by a limit, a failed-login block or a timeout get no `421`/`BYE`.
 - The failed-login block counts per source address (IPv6 per /64, set by
   `limits.ipv6_source_prefix`): users behind one NAT or webmail server share it unless

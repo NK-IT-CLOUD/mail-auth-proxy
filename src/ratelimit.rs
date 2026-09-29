@@ -1,7 +1,7 @@
 //! Rate limit on failed logins per source address.
 //!
-//! A session takes one credential, so a guesser simply opens a new
-//! connection for every attempt; the per-account throttle covers passwords
+//! A connection takes a few credentials (`limits.max_auth_attempts`), so a
+//! guesser soon opens new connections; the per-account throttle covers passwords
 //! only, and only per account (not spraying over many accounts, not token
 //! guessing). This counts the refused credentials of each source (an IPv4
 //! address, an IPv6 network of `limits.ipv6_source_prefix`, by default /64:

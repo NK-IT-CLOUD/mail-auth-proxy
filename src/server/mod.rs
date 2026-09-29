@@ -141,7 +141,9 @@ fn build_local(cfg: &config::Config) -> Result<Local> {
                 acceptor: tls::acceptor(&certs, None),
                 backend: BackendConn::new(&s.backend, keepalive)?,
                 xclient: s.xclient,
-                ehlo_extensions: s.ehlo_extensions.clone(),
+                ehlo_only: s.ehlo_extensions.clone(),
+                ehlo: Default::default(),
+                caps_ttl: std::time::Duration::from_secs(s.capability_cache_secs),
             })
         })
         .transpose()?;
@@ -364,6 +366,7 @@ pub async fn run(cfg: config::Config) -> Result<()> {
             connect: std::time::Duration::from_secs(cfg.timeouts.connect_secs),
             preauth: std::time::Duration::from_secs(cfg.timeouts.preauth_secs),
             max_preauth_commands: cfg.limits.max_preauth_commands,
+            max_auth_attempts: cfg.limits.max_auth_attempts,
             keepalive: keepalive(&cfg.session),
             session_idle: cfg
                 .session
@@ -413,14 +416,16 @@ pub async fn run(cfg: config::Config) -> Result<()> {
     if let Some((sub, protocol)) = cfg.submission.as_ref().zip(submission) {
         let sub_listener = TcpListener::bind(&sub.listen).await?;
         tracing::info!(target: crate::obs::target::MAIN, listen=%sub.listen, backend=%sub.backend.address, "submission listener up");
+        let ctx = Arc::new(Ctx {
+            shared: shared.clone(),
+            protocol,
+        });
+        tokio::spawn(crate::proto::smtp::probe_at_startup(ctx.clone()));
         listener::spawn_listener(
             sub_listener,
             metrics::Proto::Smtp,
             "submission session ended",
-            Arc::new(Ctx {
-                shared: shared.clone(),
-                protocol,
-            }),
+            ctx,
             crate::proto::smtp::handle,
             life.clone(),
         );

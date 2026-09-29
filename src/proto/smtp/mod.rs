@@ -3,6 +3,7 @@
 //! relay.
 
 pub(crate) mod backend;
+pub mod ehlo;
 pub(crate) mod preauth;
 
 use crate::auth::discovery::{self, Answer};
@@ -28,8 +29,22 @@ pub struct Submission {
     pub backend: BackendConn,
     /// Announce the client address with XCLIENT when the backend offers it.
     pub xclient: bool,
-    /// Extensions advertised after STARTTLS besides AUTH.
-    pub ehlo_extensions: Vec<String>,
+    /// `submission.ehlo_extensions`: the keywords the EHLO reply may list
+    /// at most; `None`: every one of `ehlo::RELAYED`.
+    pub ehlo_only: Option<Vec<String>>,
+    /// The backend's post-TLS EHLO extensions.
+    pub ehlo: ehlo::EhloCache,
+    /// How long they are reused.
+    pub caps_ttl: std::time::Duration,
+}
+
+/// Probe the backend's EHLO extensions once at startup, so the first
+/// clients need not wait for a probe. A failure is logged and counted like
+/// any failed probe and does not stop the start.
+pub async fn probe_at_startup(ctx: Arc<Ctx<Submission>>) {
+    if let Err(e) = ehlo::backend_extensions(&ctx.protocol, &ctx.tuning, ctx.hostname()).await {
+        tracing::warn!(target: crate::obs::target::SUBMISSION, error=%format!("{e:#}"), "submission backend EHLO extensions not available at startup");
+    }
 }
 
 pub async fn handle(
@@ -136,205 +151,253 @@ pub async fn handle(
             preauth_until,
         };
 
-        // The EHLO reply after TLS: no STARTTLS, password mechanisms only as far
-        // as the legacy gate offers them.
-        let extensions: String = ctx
-            .protocol
-            .ehlo_extensions
-            .iter()
-            .map(|x| format!("250-{x}\r\n"))
-            .collect();
-        let ehlo_reply = format!(
-            "250-{name}\r\n{extensions}250 AUTH XOAUTH2 OAUTHBEARER{}{}\r\n",
-            if pw_mechs.plain { " PLAIN" } else { "" },
-            if pw_mechs.login { " LOGIN" } else { "" },
-        );
+        // The EHLO reply after TLS: the backend's extensions as far as the
+        // proxy handles them (`ehlo::RELAYED`), no STARTTLS, password
+        // mechanisms only as far as the legacy gate offers them. Built at the
+        // first EHLO and kept for the connection: the client keeps its view
+        // for the whole session.
+        let mut ehlo_reply: Option<String> = None;
         // The post-TLS dialog until AUTH arrives. Clients may send EHLO more than
         // once (and NOOP/RSET in between); only AUTH ends this phase. The SASL
         // continuation reads (AUTH LOGIN's two 334 round-trips, AUTH PLAIN
         // without an initial response) run inside the same budget: they are
-        // client-paced too. `Ok(None)` is a clean QUIT.
+        // client-paced too. After a refused AUTH the dialog goes on, up to
+        // `limits.max_auth_attempts` attempts (RFC 4954 §4), each judged and
+        // counted on its own; the last is followed by 421 and the close.
         // The client's last EHLO or HELO after TLS, for XCLIENT.
         let mut helo: Option<ClientHelo> = None;
-        let authed = match deadline_at(
-            preauth_until,
-            tuning.preauth,
-            "submission post-TLS",
-            async {
-                let mut cmds = 0usize;
-                loop {
-                    cmds += 1;
-                    if cmds > tuning.max_preauth_commands {
-                        client_tls
-                            .write_all(b"421 4.7.0 Too many commands before AUTH\r\n")
-                            .await?;
-                        client_tls.flush().await?;
-                        return Err(anyhow!("submission: post-TLS command limit reached"));
-                    }
-                    let line = read_client_line(&mut client_tls, tuning.idle).await?;
-                    if let Some(h) = ClientHelo::parse(&line) {
-                        helo = Some(h);
-                    }
-                    if verb_is(&line, "EHLO") {
-                        client_tls.write_all(ehlo_reply.as_bytes()).await?;
-                    } else if verb_is(&line, "HELO") {
-                        // HELO takes a one-line reply without extensions
-                        // (RFC 5321 §4.1.1.1).
-                        client_tls
-                            .write_all(format!("250 {name}\r\n").as_bytes())
-                            .await?;
-                    } else if verb_is(&line, "AUTH") {
-                        // One AUTH per connection (anti-guessing): a refused one
-                        // is answered, then the connection is closed with 421.
-                        let challenge = ctx.error_challenge.base64();
-                        return match read_smtp_auth(
-                            &line,
-                            &mut client_tls,
-                            pw_mechs,
-                            challenge,
-                            tuning.idle,
-                        )
-                        .await
-                        {
-                            Ok(v) => Ok(Some(v)),
-                            Err(e) => {
-                                let _ = client_tls.write_all(closing(name).as_bytes()).await;
-                                Err(e)
+        let mut attempts = auth::Attempts::new(tuning.max_auth_attempts);
+        let mut cmds = 0usize;
+        loop {
+            // An AUTH command was read: a failure is answered, and one that
+            // ends the session is followed by 421.
+            let mut auth_command = false;
+            // `Ok(None)` is a clean QUIT.
+            let authed = deadline_at(
+                preauth_until,
+                tuning.preauth,
+                "submission post-TLS",
+                async {
+                    loop {
+                        cmds += 1;
+                        if cmds > tuning.max_preauth_commands {
+                            client_tls
+                                .write_all(b"421 4.7.0 Too many commands before AUTH\r\n")
+                                .await?;
+                            client_tls.flush().await?;
+                            return Err(anyhow!("submission: post-TLS command limit reached"));
+                        }
+                        let line = read_client_line(&mut client_tls, tuning.idle).await?;
+                        if let Some(h) = ClientHelo::parse(&line) {
+                            helo = Some(h);
+                        }
+                        if verb_is(&line, "EHLO") {
+                            if ehlo_reply.is_none() {
+                                let extensions =
+                                    ehlo::for_client(&ctx.protocol, tuning, name).await;
+                                ehlo_reply = Some(ehlo_reply_text(name, &extensions, pw_mechs));
                             }
-                        };
-                    } else if verb_is(&line, "NOOP") || verb_is(&line, "RSET") {
-                        client_tls.write_all(b"250 2.0.0 OK\r\n").await?;
-                    } else if verb_is(&line, "QUIT") {
-                        client_tls.write_all(b"221 2.0.0 Bye\r\n").await?;
-                        return Ok(None);
-                    } else if verb_is(&line, "STARTTLS") {
-                        client_tls
-                            .write_all(b"503 5.5.1 TLS already active\r\n")
-                            .await?;
-                    } else if is_command(&line) {
-                        // RFC 4954 §6: before AUTH, every command other than
-                        // AUTH, EHLO, HELO, NOOP, RSET or QUIT gets 530.
-                        client_tls
-                            .write_all(b"530 5.7.0 Authentication required\r\n")
-                            .await?;
-                    } else {
-                        client_tls
-                            .write_all(b"500 5.5.1 Command not recognized\r\n")
-                            .await?;
+                            let reply = ehlo_reply.as_deref().unwrap_or_default();
+                            client_tls.write_all(reply.as_bytes()).await?;
+                        } else if verb_is(&line, "HELO") {
+                            // HELO takes a one-line reply without extensions
+                            // (RFC 5321 §4.1.1.1).
+                            client_tls
+                                .write_all(format!("250 {name}\r\n").as_bytes())
+                                .await?;
+                        } else if verb_is(&line, "AUTH") {
+                            auth_command = true;
+                            let challenge = ctx.error_challenge.base64();
+                            return read_smtp_auth(
+                                &line,
+                                &mut client_tls,
+                                pw_mechs,
+                                challenge,
+                                tuning.idle,
+                            )
+                            .await
+                            .map(Some);
+                        } else if verb_is(&line, "NOOP") || verb_is(&line, "RSET") {
+                            client_tls.write_all(b"250 2.0.0 OK\r\n").await?;
+                        } else if verb_is(&line, "QUIT") {
+                            client_tls.write_all(b"221 2.0.0 Bye\r\n").await?;
+                            return Ok(None);
+                        } else if verb_is(&line, "STARTTLS") {
+                            client_tls
+                                .write_all(b"503 5.5.1 TLS already active\r\n")
+                                .await?;
+                        } else if verb_is(&line, "BDAT") {
+                            // RFC 3030 §2: the chunk that follows must be
+                            // read and discarded. The proxy does not read
+                            // mail data before AUTH: it closes, so the chunk
+                            // is never taken for commands.
+                            client_tls
+                                .write_all(
+                                    format!(
+                                        "530 5.7.0 Authentication required\r\n{}",
+                                        closing(name)
+                                    )
+                                    .as_bytes(),
+                                )
+                                .await?;
+                            client_tls.flush().await?;
+                            return Err(anyhow!("BDAT before AUTH"));
+                        } else if is_command(&line) {
+                            // RFC 4954 §6: before AUTH, every command other than
+                            // AUTH, EHLO, HELO, NOOP, RSET or QUIT gets 530.
+                            client_tls
+                                .write_all(b"530 5.7.0 Authentication required\r\n")
+                                .await?;
+                        } else {
+                            client_tls
+                                .write_all(b"500 5.5.1 Command not recognized\r\n")
+                                .await?;
+                        }
                     }
-                }
-            },
-        )
-        .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                // Answered already; recorded like a blocked password.
-                if let Some(w) = e.downcast_ref::<auth::Withheld>() {
-                    let _ = client_tls.flush().await;
-                    return Err(auth::withheld(&ctx, &session, w));
-                }
-                // Answered with the error result already.
-                if let Some(d) = e.downcast_ref::<Discovery>() {
-                    auth::discovery(&session, d);
-                    let _ = client_tls.flush().await;
-                    return Err(refused(format!("{e:#}")));
-                }
-                // No credential was presented (EOF, total timeout, command flood,
-                // unparsable AUTH): a `protocol` record and a pre-auth abort.
-                crate::obs::authlog::AuthEvent {
-                    proto: crate::obs::metrics::Proto::Smtp,
-                    scope,
-                    mech: "other",
-                    user: "",
-                    peer: peer.ip(),
-                    reason: crate::obs::authlog::Reason::Protocol,
-                    pwfp: "",
-                    rule: "",
-                }
-                .record();
-                crate::obs::metrics::record_preauth_abort(crate::obs::metrics::Proto::Smtp, internal);
-                let _ = client_tls.flush().await;
-                return Err(e);
-            }
-        };
-        let (mech, kind, host) = match authed {
-            Some(v) => v,
-            None => return Ok(()),
-        };
-
-        // Gate, token validation and backend login (connect, STARTTLS, AUTH with
-        // the client's own credential).
-        let login = SmtpLogin {
-            backend: &ctx.protocol.backend,
-            tuning,
-            name,
-            xclient: ctx.protocol.xclient,
-            peer,
-            helo: helo.as_ref(),
-        };
-        const INVALID: &str = "535 5.7.8 Authentication credentials invalid";
-        let outcome = auth::authorize(&ctx, &session, &mech, &kind, host.as_deref(), &login).await;
-        // The credential is not needed after the login: dropping it zeroizes it
-        // before the splice, which can last for hours.
-        drop(kind);
-        let (reply, error) = match outcome {
-            auth::Outcome::Ok {
-                conn: mut be,
-                identity,
-            } => {
-                permit.authenticated();
-                client_tls
-                    .write_all(b"235 2.7.0 Authentication successful\r\n")
-                    .await?;
-                tracing::info!(target: crate::obs::target::SUBMISSION, user=%crate::obs::authlog::sanitize(&identity), mech=%mech, "submission auth ok; splicing");
-                crate::wire::splice(&mut client_tls, &mut be, Proto::Smtp, &ctx.tuning).await;
-                return Ok(());
-            }
-            auth::Outcome::Blocked => (
-                "504 5.5.4 password authentication not available on this endpoint",
-                refused(format!(
-                    "password auth blocked on OAuth-only endpoint (scope={scope})"
-                )),
-            ),
-            // RFC 7628 section 3.2.2: the error result as a `334` challenge,
-            // then the failure once the client has answered it (section 3.2.3).
-            auth::Outcome::BadToken(e) => {
-                let prompt = format!("334 {}", ctx.error_challenge.base64());
-                let answer =
-                    discovery::complete_line(&mut client_tls, &prompt, &mech, preauth_until, tuning)
-                        .await;
-                (
-                    preauth::error_result_reply(&answer),
-                    refused(format!("token rejected: {e}{}", Answer::note(&answer))),
-                )
-            }
-            auth::Outcome::WrongAuthzid => (
-                INVALID,
-                refused("authorization identity differs from the token's identity"),
-            ),
-            // Refused by the legacy gate: the same answer as a wrong password.
-            auth::Outcome::Denied => (INVALID, refused("password refused by the legacy gate")),
-            auth::Outcome::Rejected(code) => {
-                (INVALID, refused(format!("backend AUTH rejected: {code}")))
-            }
-            // Any failure talking to Postfix before its AUTH verdict, or a reply
-            // without a verdict, is answered 454 so the client retries later
-            // instead of seeing a silently closed connection.
-            auth::Outcome::Unavailable(e) => (
-                "454 4.7.0 Temporary authentication failure",
-                e.context("backend unavailable"),
-            ),
-        };
-        let _ = client_tls
-            .write_all(format!("{reply}\r\n{}", closing(name)).as_bytes())
+                },
+            )
             .await;
-        let _ = client_tls.flush().await;
-        Err(error)
+            let (mech, kind, host) = match authed {
+                Ok(Some(v)) => v,
+                Ok(None) => return Ok(()),
+                Err(e) => {
+                    let next = if let Some(w) = e.downcast_ref::<auth::Withheld>() {
+                        // Answered already; recorded like a blocked password.
+                        let error = auth::withheld(&ctx, &session, w);
+                        attempts.refused(&session, error, true)
+                    } else if let Some(d) = e.downcast_ref::<Discovery>() {
+                        // Answered with the error result already.
+                        auth::discovery(&session, d);
+                        attempts.refused(&session, refused(format!("{e:#}")), true)
+                    } else if e.is::<auth::Retryable>() {
+                        // Answered already, without a credential.
+                        attempts.refused(&session, e, false)
+                    } else {
+                        // No further credential (EOF, total timeout, command
+                        // flood, a failed read in AUTH): a `protocol` record
+                        // unless the client gave up after a refusal.
+                        Err(attempts.ended(&session, e))
+                    };
+                    if let Err(e) = next {
+                        if auth_command {
+                            let _ = client_tls.write_all(closing(name).as_bytes()).await;
+                        }
+                        let _ = client_tls.flush().await;
+                        return Err(e);
+                    }
+                    continue;
+                }
+            };
+            if auth::source_blocked(&ctx, &session) {
+                return Err(auth::blocked_source());
+            }
+
+            // Gate, token validation and backend login (connect, STARTTLS, AUTH with
+            // the client's own credential).
+            let login = SmtpLogin {
+                backend: &ctx.protocol.backend,
+                tuning,
+                name,
+                xclient: ctx.protocol.xclient,
+                peer,
+                helo: helo.as_ref(),
+            };
+            const INVALID: &str = "535 5.7.8 Authentication credentials invalid";
+            let outcome =
+                auth::authorize(&ctx, &session, &mech, &kind, host.as_deref(), &login).await;
+            // The credential is not needed after the login: dropping it zeroizes it
+            // before the splice, which can last for hours.
+            drop(kind);
+            let unavailable = matches!(outcome, auth::Outcome::Unavailable(_));
+            let (reply, error) = match outcome {
+                auth::Outcome::Ok {
+                    conn: mut be,
+                    identity,
+                } => {
+                    permit.authenticated();
+                    client_tls
+                        .write_all(b"235 2.7.0 Authentication successful\r\n")
+                        .await?;
+                    tracing::info!(target: crate::obs::target::SUBMISSION, user=%crate::obs::authlog::sanitize(&identity), mech=%mech, "submission auth ok; splicing");
+                    crate::wire::splice(&mut client_tls, &mut be, Proto::Smtp, &ctx.tuning).await;
+                    return Ok(());
+                }
+                auth::Outcome::Blocked => (
+                    "504 5.5.4 password authentication not available on this endpoint",
+                    refused(format!(
+                        "password auth blocked on OAuth-only endpoint (scope={scope})"
+                    )),
+                ),
+                // RFC 7628 section 3.2.2: the error result as a `334` challenge,
+                // then the failure once the client has answered it (section 3.2.3).
+                auth::Outcome::BadToken(e) => {
+                    let prompt = format!("334 {}", ctx.error_challenge.base64());
+                    let answer = discovery::complete_line(
+                        &mut client_tls,
+                        &prompt,
+                        &mech,
+                        preauth_until,
+                        tuning,
+                    )
+                    .await;
+                    (
+                        preauth::error_result_reply(&answer),
+                        refused(format!("token rejected: {e}{}", Answer::note(&answer))),
+                    )
+                }
+                auth::Outcome::WrongAuthzid => (
+                    INVALID,
+                    refused("authorization identity differs from the token's identity"),
+                ),
+                // Refused by the legacy gate: the same answer as a wrong password.
+                auth::Outcome::Denied => (INVALID, refused("password refused by the legacy gate")),
+                auth::Outcome::Rejected(code) => {
+                    (INVALID, refused(format!("backend AUTH rejected: {code}")))
+                }
+                // Any failure talking to Postfix before its AUTH verdict, or a reply
+                // without a verdict, is answered 454 so the client retries later
+                // instead of seeing a silently closed connection.
+                auth::Outcome::Unavailable(e) => (
+                    "454 4.7.0 Temporary authentication failure",
+                    e.context("backend unavailable"),
+                ),
+            };
+            // An outage ends the session: another attempt would meet it too.
+            let ended = if unavailable {
+                Err(error)
+            } else {
+                attempts.refused(&session, error, true)
+            };
+            match ended {
+                Ok(()) => {
+                    client_tls
+                        .write_all(format!("{reply}\r\n").as_bytes())
+                        .await?;
+                }
+                Err(error) => {
+                    let _ = client_tls
+                        .write_all(format!("{reply}\r\n{}", closing(name)).as_bytes())
+                        .await;
+                    let _ = client_tls.flush().await;
+                    return Err(error);
+                }
+            }
+        }
     }
     .await;
     crate::wire::close(&mut client_tls).await;
     result
+}
+
+/// The EHLO reply after STARTTLS: the server name, `extensions` and the
+/// AUTH line with the password mechanisms `pw` offers.
+fn ehlo_reply_text(name: &str, extensions: &[String], pw: crate::auth::legacy::MechSet) -> String {
+    let extensions: String = extensions.iter().map(|x| format!("250-{x}\r\n")).collect();
+    format!(
+        "250-{name}\r\n{extensions}250 AUTH XOAUTH2 OAUTHBEARER{}{}\r\n",
+        if pw.plain { " PLAIN" } else { "" },
+        if pw.login { " LOGIN" } else { "" },
+    )
 }
 
 /// True if `line` is an SMTP command the proxy recognises (RFC 5321 §4.1,
@@ -349,9 +412,9 @@ fn is_command(line: &str) -> bool {
     .any(|v| verb_is(line, v))
 }
 
-/// The reply before the proxy closes a connection after a refused AUTH. The
-/// proxy takes one AUTH per connection, and RFC 5321 §3.8 lets a server
-/// close only after QUIT, a timeout, or a 421.
+/// The reply before the proxy closes a connection after a refused AUTH (the
+/// last attempt, or an outage). RFC 5321 §3.8 lets a server close only after
+/// QUIT, a timeout, or a 421.
 fn closing(name: &str) -> String {
     format!("421 4.7.0 {name} closing connection\r\n")
 }

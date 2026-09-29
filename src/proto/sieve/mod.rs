@@ -205,280 +205,297 @@ pub async fn handle(
     // The TLS session ends with close_notify whichever way the dialog
     // ends (RFC 8314 §3.4); the relay closes its own.
     let result: Result<()> = async {
-        // Source IP + SNI decide whether password auth is offered — same legacy
-        // rules as IMAP/SMTP. External clients and forged-SNI attackers stay
-        // OAuth-only unless a rule names their network.
-        let sni = client_tls.get_ref().1.server_name().map(|s| s.to_string());
-        let pw_mechs = crate::auth::legacy::MechSet {
-            plain: ctx.password_mechs(Proto::Sieve, sni.as_deref(), peer).plain,
-            login: false,
-        };
-        let session = auth::Session {
-            proto: Proto::Sieve,
-            peer,
-            internal,
-            scope,
-            sni: sni.as_deref(),
-            pw_mechs,
-            preauth_until,
-        };
+            // Source IP + SNI decide whether password auth is offered — same legacy
+            // rules as IMAP/SMTP. External clients and forged-SNI attackers stay
+            // OAuth-only unless a rule names their network.
+            let sni = client_tls.get_ref().1.server_name().map(|s| s.to_string());
+            let pw_mechs = crate::auth::legacy::MechSet {
+                plain: ctx.password_mechs(Proto::Sieve, sni.as_deref(), peer).plain,
+                login: false,
+            };
+            let session = auth::Session {
+                proto: Proto::Sieve,
+                peer,
+                internal,
+                scope,
+                sni: sni.as_deref(),
+                pw_mechs,
+                preauth_until,
+            };
 
-        // Relay the backend's post-TLS capabilities, rewriting SASL to what
-        // this endpoint allows and dropping STARTTLS (already done).
-        let be_caps = match deadline_at(
-            preauth_until,
-            tuning.preauth,
-            "sieve backend capabilities",
-            backend_caps(&ctx.protocol, tuning),
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = client_tls
-                    .write_all(b"BYE \"Service temporarily unavailable\"\r\n")
-                    .await;
-                let _ = client_tls.flush().await;
-                return Err(e);
-            }
-        };
-        let caps = rewrite_caps(&be_caps, pw_mechs.plain);
-        client_tls.write_all(caps.as_bytes()).await?;
-        client_tls
-            .write_all(b"OK \"TLS negotiation successful.\"\r\n")
-            .await?;
-
-        // Read commands until AUTHENTICATE and parse the credential, inside the
-        // pre-auth budget. RFC 5804 allows CAPABILITY, NOOP and LOGOUT before
-        // authenticating. Every other way this ends without a credential is a
-        // pre-auth abort; LOGOUT is a clean end.
-        let (mech, outcome) = match deadline_at(
-            preauth_until,
-            tuning.preauth,
-            "sieve post-TLS auth",
-            async {
-                let mut cmds = 0usize;
-                let line = loop {
-                    cmds += 1;
-                    if cmds > tuning.max_preauth_commands {
-                        client_tls
-                            .write_all(b"BYE \"Too many commands before AUTHENTICATE\"\r\n")
-                            .await?;
-                        return Err(anyhow!("sieve: post-TLS command limit reached"));
-                    }
-                    let line = read_client_line(&mut client_tls, tuning.idle).await?;
-                    if verb_is(&line, "CAPABILITY") {
-                        client_tls.write_all(caps.as_bytes()).await?;
-                        client_tls
-                            .write_all(b"OK \"Capability completed.\"\r\n")
-                            .await?;
-                    } else if verb_is(&line, "NOOP") {
-                        let reply = noop(&line, &mut client_tls, tuning.idle).await;
-                        client_tls.write_all(reply.as_bytes()).await?;
-                    } else if verb_is(&line, "LOGOUT") {
-                        client_tls
-                            .write_all(b"OK \"Logout completed.\"\r\n")
-                            .await?;
-                        client_tls.flush().await?;
-                        return Ok(None);
-                    } else {
-                        break line;
-                    }
-                };
-                let (mech, ir) =
-                    match parse_authenticate_line(&line, &mut client_tls, tuning.idle).await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            // Best effort: the client may already be gone.
-                            let _ = client_tls
-                                .write_all(b"NO \"Invalid AUTHENTICATE\"\r\n")
-                                .await;
-                            return Err(e);
-                        }
-                    };
-                // No SASL LOGIN dialog for ManageSieve: PLAIN is its password
-                // mechanism.
-                let password = match Mechanism::parse(&mech) {
-                    Some(Mechanism::XOAuth2 | Mechanism::OAuthBearer) => false,
-                    Some(Mechanism::Plain) => true,
-                    Some(Mechanism::Login) | None => {
-                        client_tls
-                            .write_all(b"NO \"Authentication mechanism not supported\"\r\n")
-                            .await?;
-                        return Err(anyhow!(
-                            "unsupported sieve mechanism {}",
-                            crate::obs::authlog::sanitize(&mech)
-                        ));
-                    }
-                };
-                let ir = match ir {
-                    Some(ir) => ir,
-                    // Never ask for a password the endpoint does not take.
-                    None if password && !pw_mechs.plain => {
-                        client_tls
-                            .write_all(
-                                b"NO \"password authentication not available on this endpoint\"\r\n",
-                            )
-                            .await?;
-                        return Err(anyhow::Error::new(auth::Withheld {
-                            mech,
-                            user: String::new(),
-                        }));
-                    }
-                    None => match read_continuation(&mut client_tls, tuning.idle).await {
-                        Ok(ir) => ir,
-                        Err(e) => {
-                            let _ = client_tls
-                                .write_all(b"NO \"Invalid authentication response\"\r\n")
-                                .await;
-                            return Err(e);
-                        }
-                    },
-                };
-                let kind = if password {
-                    crate::auth::sasl::parse_plain(&ir)
-                        .map(|(user, pass)| {
-                            (
-                                crate::auth::sasl::ClientAuthKind::Password { user, pass },
-                                None,
-                            )
-                        })
-                        .map_err(|e| anyhow!("plain parse: {e}"))
-                } else {
-                    crate::auth::sasl::parse_sasl(&mech, &ir)
-                        .map(|c| {
-                            let kind = crate::auth::sasl::ClientAuthKind::OAuth {
-                                user: c.user,
-                                token: c.token,
-                            };
-                            (kind, c.host)
-                        })
-                        .context("sasl parse")
-                };
-                match kind {
-                    Ok((k, host)) => Ok(Some((mech, k, host))),
-                    // Answered below with the error result.
-                    Err(e) if e.is::<Discovery>() => Err(e),
-                    Err(e) => {
-                        client_tls
-                            .write_all(b"NO \"Invalid authentication response\"\r\n")
-                            .await?;
-                        Err(e)
-                    }
-                }
-            },
-        )
-        .await
-        {
-            // Gate, token validation and backend login. The backend is
-            // contacted only with a credential that passed the local checks.
-            Ok(Some((mech, kind, host))) => {
-                let login = SieveLogin {
-                    backend: &ctx.protocol.backend,
-                    tuning,
-                    origin: (peer, local),
-                };
-                let outcome =
-                    auth::authorize(&ctx, &session, &mech, &kind, host.as_deref(), &login).await;
-                // The credential is not needed after the login: dropping it
-                // zeroizes it before the splice, which can last for hours.
-                drop(kind);
-                (mech, outcome)
-            }
-            Ok(None) => return Ok(()),
-            Err(e) => {
-                // Answered already; recorded like a blocked password.
-                if let Some(w) = e.downcast_ref::<auth::Withheld>() {
-                    let _ = client_tls.flush().await;
-                    return Err(auth::withheld(&ctx, &session, w));
-                }
-                // Answered with the error result like a rejected token.
-                if let Some(d) = e.downcast_ref::<Discovery>() {
-                    auth::discovery(&session, d);
-                    let asked = auth::Outcome::BadToken(TokenError::Invalid(d.to_string()));
-                    (d.mech.clone(), asked)
-                } else {
-                    // No credential was presented (EOF, timeout, unparsable
-                    // AUTHENTICATE): a `protocol` record and a pre-auth abort.
-                    crate::obs::authlog::AuthEvent {
-                        proto: crate::obs::metrics::Proto::Sieve,
-                        scope,
-                        mech: "other",
-                        user: "",
-                        peer: peer.ip(),
-                        reason: crate::obs::authlog::Reason::Protocol,
-                        pwfp: "",
-                        rule: "",
-                    }
-                    .record();
-                    crate::obs::metrics::record_preauth_abort(
-                        crate::obs::metrics::Proto::Sieve,
-                        internal,
-                    );
+            // Relay the backend's post-TLS capabilities, rewriting SASL to what
+            // this endpoint allows and dropping STARTTLS (already done).
+            let be_caps = match deadline_at(
+                preauth_until,
+                tuning.preauth,
+                "sieve backend capabilities",
+                backend_caps(&ctx.protocol, tuning),
+            )
+            .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = client_tls
+                        .write_all(b"BYE \"Service temporarily unavailable\"\r\n")
+                        .await;
                     let _ = client_tls.flush().await;
                     return Err(e);
                 }
-            }
-        };
+            };
+            let caps = rewrite_caps(&be_caps, pw_mechs.plain);
+            client_tls.write_all(caps.as_bytes()).await?;
+            client_tls
+                .write_all(b"OK \"TLS negotiation successful.\"\r\n")
+                .await?;
 
-        const FAILED: &str = "NO \"Authentication failed\"";
-        let (reply, error) = match outcome {
-            auth::Outcome::Ok {
-                conn: (mut be, be_reply),
-                identity,
-            } => {
-                permit.authenticated();
-                client_tls.write_all(be_reply.as_bytes()).await?;
-                client_tls.write_all(b"\r\n").await?;
-                tracing::info!(target: crate::obs::target::SIEVE, user=%crate::obs::authlog::sanitize(&identity), mech=%mech, "sieve auth ok; splicing");
-                crate::wire::splice(&mut client_tls, &mut be, Proto::Sieve, &ctx.tuning).await;
-                return Ok(());
+            // Read commands until AUTHENTICATE and parse the credential, inside the
+            // pre-auth budget. RFC 5804 allows CAPABILITY, NOOP and LOGOUT before
+            // authenticating. After a NO the client may try again (RFC 5804
+            // §2.1), up to `limits.max_auth_attempts` attempts, each judged and
+            // counted on its own. Every other way this ends without a credential
+            // is a pre-auth abort; LOGOUT is a clean end.
+            let mut attempts = auth::Attempts::new(tuning.max_auth_attempts);
+            let mut cmds = 0usize;
+            loop {
+            let (mech, outcome) = match deadline_at(
+                preauth_until,
+                tuning.preauth,
+                "sieve post-TLS auth",
+                async {
+                    let line = loop {
+                        cmds += 1;
+                        if cmds > tuning.max_preauth_commands {
+                            client_tls
+                                .write_all(b"BYE \"Too many commands before AUTHENTICATE\"\r\n")
+                                .await?;
+                            return Err(anyhow!("sieve: post-TLS command limit reached"));
+                        }
+                        let line = read_client_line(&mut client_tls, tuning.idle).await?;
+                        if verb_is(&line, "CAPABILITY") {
+                            client_tls.write_all(caps.as_bytes()).await?;
+                            client_tls
+                                .write_all(b"OK \"Capability completed.\"\r\n")
+                                .await?;
+                        } else if verb_is(&line, "NOOP") {
+                            let reply = noop(&line, &mut client_tls, tuning.idle).await;
+                            client_tls.write_all(reply.as_bytes()).await?;
+                        } else if verb_is(&line, "LOGOUT") {
+                            client_tls
+                                .write_all(b"OK \"Logout completed.\"\r\n")
+                                .await?;
+                            client_tls.flush().await?;
+                            return Ok(None);
+                        } else {
+                            break line;
+                        }
+                    };
+                    let (mech, ir) =
+                        match parse_authenticate_line(&line, &mut client_tls, tuning.idle).await {
+                            Ok(v) => v,
+                            Err(e) => {
+                                // Best effort: the client may already be gone.
+                                let _ = client_tls
+                                    .write_all(b"NO \"Invalid AUTHENTICATE\"\r\n")
+                                    .await;
+                                return Err(e);
+                            }
+                        };
+                    // No SASL LOGIN dialog for ManageSieve: PLAIN is its password
+                    // mechanism.
+                    let password = match Mechanism::parse(&mech) {
+                        Some(Mechanism::XOAuth2 | Mechanism::OAuthBearer) => false,
+                        Some(Mechanism::Plain) => true,
+                        Some(Mechanism::Login) | None => {
+                            client_tls
+                                .write_all(b"NO \"Authentication mechanism not supported\"\r\n")
+                                .await?;
+                            return Err(auth::answered(anyhow!(
+                                "unsupported sieve mechanism {}",
+                                crate::obs::authlog::sanitize(&mech)
+                            )));
+                        }
+                    };
+                    let ir = match ir {
+                        Some(ir) => ir,
+                        // Never ask for a password the endpoint does not take.
+                        None if password && !pw_mechs.plain => {
+                            client_tls
+                                .write_all(
+                                    b"NO \"password authentication not available on this endpoint\"\r\n",
+                                )
+                                .await?;
+                            return Err(anyhow::Error::new(auth::Withheld {
+                                mech,
+                                user: String::new(),
+                            }));
+                        }
+                        None => match read_continuation(&mut client_tls, tuning.idle).await {
+                            Ok(ir) => ir,
+                            Err(e) => {
+                                let _ = client_tls
+                                    .write_all(b"NO \"Invalid authentication response\"\r\n")
+                                    .await;
+                                // A cancel ends the exchange cleanly; a malformed
+                                // string may leave its octets unread.
+                                return Err(if e.is::<crate::auth::sasl::BadResponse>() {
+                                    auth::answered(e)
+                                } else {
+                                    e
+                                });
+                            }
+                        },
+                    };
+                    let kind = if password {
+                        crate::auth::sasl::parse_plain(&ir)
+                            .map(|(user, pass)| {
+                                (
+                                    crate::auth::sasl::ClientAuthKind::Password { user, pass },
+                                    None,
+                                )
+                            })
+                            .map_err(|e| anyhow!("plain parse: {e}"))
+                    } else {
+                        crate::auth::sasl::parse_sasl(&mech, &ir)
+                            .map(|c| {
+                                let kind = crate::auth::sasl::ClientAuthKind::OAuth {
+                                    user: c.user,
+                                    token: c.token,
+                                };
+                                (kind, c.host)
+                            })
+                            .context("sasl parse")
+                    };
+                    match kind {
+                        Ok((k, host)) => Ok(Some((mech, k, host))),
+                        // Answered below with the error result.
+                        Err(e) if e.is::<Discovery>() => Err(e),
+                        Err(e) => {
+                            client_tls
+                                .write_all(b"NO \"Invalid authentication response\"\r\n")
+                                .await?;
+                            Err(auth::answered(e))
+                        }
+                    }
+                },
+            )
+            .await
+            {
+                // Gate, token validation and backend login. The backend is
+                // contacted only with a credential that passed the local checks.
+                Ok(Some((mech, kind, host))) => {
+                    if auth::source_blocked(&ctx, &session) {
+                        return Err(auth::blocked_source());
+                    }
+                    let login = SieveLogin {
+                        backend: &ctx.protocol.backend,
+                        tuning,
+                        origin: (peer, local),
+                    };
+                    let outcome =
+                        auth::authorize(&ctx, &session, &mech, &kind, host.as_deref(), &login).await;
+                    // The credential is not needed after the login: dropping it
+                    // zeroizes it before the splice, which can last for hours.
+                    drop(kind);
+                    (mech, outcome)
+                }
+                Ok(None) => return Ok(()),
+                Err(e) => {
+                    // Answered already; recorded like a blocked password.
+                    if let Some(w) = e.downcast_ref::<auth::Withheld>() {
+                        let error = auth::withheld(&ctx, &session, w);
+                        if let Err(e) = attempts.refused(&session, error, true) {
+                            let _ = client_tls.flush().await;
+                            return Err(e);
+                        }
+                        continue;
+                    }
+                    // Answered already, without a credential.
+                    if e.is::<auth::Retryable>() {
+                        if let Err(e) = attempts.refused(&session, e, false) {
+                            let _ = client_tls.flush().await;
+                            return Err(e);
+                        }
+                        continue;
+                    }
+                    // Answered with the error result like a rejected token.
+                    if let Some(d) = e.downcast_ref::<Discovery>() {
+                        auth::discovery(&session, d);
+                        let asked = auth::Outcome::BadToken(TokenError::Invalid(d.to_string()));
+                        (d.mech.clone(), asked)
+                    } else {
+                        // No further credential (EOF, timeout, unparsable
+                        // AUTHENTICATE): a `protocol` record unless the client
+                        // gave up after a refusal.
+                        let _ = client_tls.flush().await;
+                        return Err(attempts.ended(&session, e));
+                    }
+                }
+            };
+
+            const FAILED: &str = "NO \"Authentication failed\"";
+            let unavailable = matches!(outcome, auth::Outcome::Unavailable(_));
+            let (reply, error) = match outcome {
+                auth::Outcome::Ok {
+                    conn: (mut be, be_reply),
+                    identity,
+                } => {
+                    permit.authenticated();
+                    client_tls.write_all(be_reply.as_bytes()).await?;
+                    client_tls.write_all(b"\r\n").await?;
+                    tracing::info!(target: crate::obs::target::SIEVE, user=%crate::obs::authlog::sanitize(&identity), mech=%mech, "sieve auth ok; splicing");
+                    crate::wire::splice(&mut client_tls, &mut be, Proto::Sieve, &ctx.tuning).await;
+                    return Ok(());
+                }
+                auth::Outcome::Blocked => (
+                    "NO \"password authentication not available on this endpoint\"",
+                    refused(format!(
+                        "password auth blocked on OAuth-only endpoint (scope={scope})"
+                    )),
+                ),
+                // RFC 7628 section 3.2.2: the error result as a challenge string,
+                // then the failure once the client has answered it (section 3.2.3).
+                // Every ending, an abort (`"*"`, RFC 5804 section 2.1) included,
+                // is a NO.
+                auth::Outcome::BadToken(e) => {
+                    let answer = deadline_at(preauth_until, tuning.preauth, "error challenge", async {
+                        client_tls
+                            .write_all(sieve_challenge(ctx.error_challenge.base64()).as_bytes())
+                            .await?;
+                        client_tls.flush().await?;
+                        read_sasl_string(&mut client_tls, tuning.idle).await
+                    })
+                    .await
+                    .map(|s| discovery::classify(&mech, &s));
+                    (
+                        FAILED,
+                        refused(format!("token rejected: {e}{}", Answer::note(&answer))),
+                    )
+                }
+                auth::Outcome::WrongAuthzid => (
+                    "NO \"Authorization failed\"",
+                    refused("authorization identity differs from the token's identity"),
+                ),
+                // Refused by the legacy gate: the same answer as a wrong password.
+                auth::Outcome::Denied => (FAILED, refused("password refused by the legacy gate")),
+                auth::Outcome::Rejected(reply) => {
+                    (FAILED, refused(format!("backend auth rejected: {reply}")))
+                }
+                // Outage, not a verdict on the credential (see BackendError).
+                auth::Outcome::Unavailable(e) => (
+                    "NO (TRYLATER) \"Service temporarily unavailable\"",
+                    e.context("backend unavailable"),
+                ),
+            };
+            let _ = client_tls
+                .write_all(format!("{reply}\r\n").as_bytes())
+                .await;
+            let _ = client_tls.flush().await;
+            // An outage ends the session: another attempt would meet it too.
+            if unavailable {
+                return Err(error);
             }
-            auth::Outcome::Blocked => (
-                "NO \"password authentication not available on this endpoint\"",
-                refused(format!(
-                    "password auth blocked on OAuth-only endpoint (scope={scope})"
-                )),
-            ),
-            // RFC 7628 section 3.2.2: the error result as a challenge string,
-            // then the failure once the client has answered it (section 3.2.3).
-            // Every ending, an abort (`"*"`, RFC 5804 section 2.1) included,
-            // is a NO.
-            auth::Outcome::BadToken(e) => {
-                let answer = deadline_at(preauth_until, tuning.preauth, "error challenge", async {
-                    client_tls
-                        .write_all(sieve_challenge(ctx.error_challenge.base64()).as_bytes())
-                        .await?;
-                    client_tls.flush().await?;
-                    read_sasl_string(&mut client_tls, tuning.idle).await
-                })
-                .await
-                .map(|s| discovery::classify(&mech, &s));
-                (
-                    FAILED,
-                    refused(format!("token rejected: {e}{}", Answer::note(&answer))),
-                )
-            }
-            auth::Outcome::WrongAuthzid => (
-                "NO \"Authorization failed\"",
-                refused("authorization identity differs from the token's identity"),
-            ),
-            // Refused by the legacy gate: the same answer as a wrong password.
-            auth::Outcome::Denied => (FAILED, refused("password refused by the legacy gate")),
-            auth::Outcome::Rejected(reply) => {
-                (FAILED, refused(format!("backend auth rejected: {reply}")))
-            }
-            // Outage, not a verdict on the credential (see BackendError).
-            auth::Outcome::Unavailable(e) => (
-                "NO (TRYLATER) \"Service temporarily unavailable\"",
-                e.context("backend unavailable"),
-            ),
-        };
-        let _ = client_tls
-            .write_all(format!("{reply}\r\n").as_bytes())
-            .await;
-        let _ = client_tls.flush().await;
-        Err(error)
+            attempts.refused(&session, error, true)?;
+        }
     }
     .await;
     crate::wire::close(&mut client_tls).await;

@@ -59,7 +59,8 @@ The file is strict. Startup fails, and `--check-config` reports, when:
   `leeway_secs` is above 300, `refresh_secs` above 86400, a timeout above 3600 or
   `failure_delay_ms` above 10000;
 - `submission.backend.proxy_protocol` is set, or a `submission.ehlo_extensions` entry is
-  not an EHLO line, repeats a keyword or is `AUTH` or `STARTTLS`;
+  not an EHLO line, repeats a keyword or is `AUTH` or `STARTTLS` (an entry the proxy never
+  advertises, or one with parameters, is a warning);
 - an issuer is listed twice, has no audience, or lists an unsupported algorithm;
 - `openid_configuration_url` is not `https://` or contains `user:password@` or a
   fragment, `scope` is not an RFC 6749 scope, or more than one issuer sets
@@ -114,7 +115,8 @@ backend `.…` keys below, written inline (`backend = { address = "…" }`) or a
 | `submission.listen` | `ip:port` | section optional | STARTTLS listener; omit the section to disable SMTP |
 | `submission.backend` | backend | required in section | STARTTLS backend (Postfix); `proxy_protocol` is not supported here |
 | `submission.xclient` | bool | `false` | send XCLIENT if the backend advertises it. With `false`, a backend that advertises XCLIENT to the proxy is a misconfiguration: every login is an outage (454) until the key is set or the proxy is removed from `smtpd_authorized_xclient_hosts`, because the client could otherwise send its own XCLIENT after login |
-| `submission.ehlo_extensions` | array | a subset of Postfix's defaults (no `SIZE`, `VRFY`, `ETRN`) | advertised after STARTTLS besides AUTH (not `AUTH`/`STARTTLS`, in any case). Each entry is an EHLO line (RFC 5321 §4.1.1.1): a keyword of letters, digits and hyphens that does not start with a hyphen, then optional parameters of printable ASCII, all separated by single spaces; each keyword once (case-insensitive); default `PIPELINING`, `ENHANCEDSTATUSCODES`, `8BITMIME`, `DSN`, `SMTPUTF8`, `CHUNKING`. The client keeps this list for the whole session, so it must match what the backend offers. |
+| `submission.ehlo_extensions` | array | unset | the most the EHLO reply after STARTTLS may list, by keyword. The reply lists the extensions of the backend's own EHLO reply that the proxy handles (`PIPELINING`, `SIZE`, `8BITMIME`, `SMTPUTF8`, `DSN`, `ENHANCEDSTATUSCODES`, `CHUNKING`), with the backend's parameters; this list narrows them further. Each entry is an EHLO line (RFC 5321 §4.1.1.1): a keyword of letters, digits and hyphens that does not start with a hyphen, then optional parameters of printable ASCII, all separated by single spaces; each keyword once (case-insensitive); not `AUTH` or `STARTTLS`. Parameters are ignored (warning), as is a keyword the proxy never passes on (warning). |
+| `submission.capability_cache_secs` | integer | 600 | reuse of the backend's EHLO extensions, read by a probe connection; ≥ 1 |
 | `sieve.listen` | `ip:port` | section optional | STARTTLS listener; omit the section to disable ManageSieve |
 | `sieve.backend` | backend | required in section | STARTTLS ManageSieve backend |
 | `sieve.capability_cache_secs` | integer | 600 | reuse of the backend capability list; ≥ 1 |
@@ -161,6 +163,7 @@ backend `.…` keys below, written inline (`backend = { address = "…" }`) or a
 | `limits.max_preauth_per_ip` | integer | 32 | unauthenticated connections per IP; ≥ 1. IPv4 (also IPv4-mapped) counts per address, IPv6 per `limits.ipv6_source_prefix` (one host usually holds a whole /64) |
 | `limits.ipv6_source_prefix` | integer | 64 | prefix length by which IPv6 sources are grouped for `max_preauth_per_ip` and `[auth_ratelimit]`; 32-64. 48 makes a whole site (a typical /48 assignment) one source, so an attacker cannot rotate through its /64s |
 | `limits.max_preauth_commands` | integer | 8 | commands before authentication; ≥ 1 |
+| `limits.max_auth_attempts` | integer | 3 | authentication attempts per connection, 1-10; 1 closes after the first refusal. Each is judged, logged and counted by the rate limit on its own; warns when larger than `max_preauth_commands` |
 | `timeouts.preauth_secs` | integer | 60 | accept to credential, in total; 1-3600 |
 | `timeouts.idle_secs` | integer | 30 | silence on any single read; 1-3600 |
 | `timeouts.connect_secs` | integer | 10 | backend connect, TLS handshake, PROXY header; 1-3600 |

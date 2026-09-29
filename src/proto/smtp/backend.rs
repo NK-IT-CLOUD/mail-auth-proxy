@@ -107,60 +107,60 @@ fn auth_verdict(code: u16, password: bool) -> AuthVerdict {
     }
 }
 
+/// Connect to the submission backend, read its greeting, `EHLO <name>`,
+/// STARTTLS and the TLS handshake, then `EHLO <name>` again. Returns the
+/// TLS stream and the lines of the post-TLS EHLO reply (without the code,
+/// the first being the backend's name).
+pub(super) async fn connect_ehlo(
+    backend: &BackendConn,
+    tuning: &Tuning,
+    name: &str,
+) -> Result<(TlsStream<TcpStream>, Vec<String>)> {
+    // No PROXY header: the configuration rejects one for the submission
+    // backend, which learns the client address via XCLIENT instead.
+    let mut tcp_be = connect::connect(backend, None, tuning.connect, "submission backend").await?;
+
+    let (code, _) = read_smtp_reply(&mut tcp_be, tuning.idle).await?;
+    if code != 220 {
+        return Err(anyhow!("backend greeting code {code}"));
+    }
+
+    tcp_be
+        .write_all(format!("EHLO {name}\r\n").as_bytes())
+        .await?;
+    let (code, lines) = read_smtp_reply(&mut tcp_be, tuning.idle).await?;
+    if code != 250 {
+        return Err(anyhow!("backend EHLO code {code}"));
+    }
+    if !lines.iter().any(|l| verb_is(l, "STARTTLS")) {
+        return Err(anyhow!("backend did not advertise STARTTLS"));
+    }
+
+    tcp_be.write_all(b"STARTTLS\r\n").await?;
+    let (code, _) = read_smtp_reply(&mut tcp_be, tuning.idle).await?;
+    if code != 220 {
+        return Err(anyhow!("backend STARTTLS code {code}"));
+    }
+
+    let mut be = connect::tls(backend, tcp_be, tuning.connect, "submission backend").await?;
+
+    be.write_all(format!("EHLO {name}\r\n").as_bytes()).await?;
+    let (code, ehlo_lines) = read_smtp_reply(&mut be, tuning.idle).await?;
+    if code != 250 {
+        return Err(anyhow!("backend post-TLS EHLO code {code}"));
+    }
+    Ok((be, ehlo_lines))
+}
+
 impl SmtpLogin<'_> {
-    /// Connect, STARTTLS, EHLO, optional XCLIENT, then AUTH with the client's
-    /// own credential (never a master password). Returns the final AUTH reply
+    /// `connect_ehlo`, optional XCLIENT, then AUTH with the client's own
+    /// credential (never a master password). Returns the final AUTH reply
     /// code.
     async fn dialog(
         &self,
         credential: BackendCredential<'_>,
     ) -> Result<(TlsStream<TcpStream>, u16)> {
-        // No PROXY header: the configuration rejects one for the submission
-        // backend, which learns the client address via XCLIENT instead.
-        let mut tcp_be = connect::connect(
-            self.backend,
-            None,
-            self.tuning.connect,
-            "submission backend",
-        )
-        .await?;
-
-        let (code, _) = read_smtp_reply(&mut tcp_be, self.tuning.idle).await?;
-        if code != 220 {
-            return Err(anyhow!("backend greeting code {code}"));
-        }
-
-        tcp_be
-            .write_all(format!("EHLO {}\r\n", self.name).as_bytes())
-            .await?;
-        let (code, lines) = read_smtp_reply(&mut tcp_be, self.tuning.idle).await?;
-        if code != 250 {
-            return Err(anyhow!("backend EHLO code {code}"));
-        }
-        if !lines.iter().any(|l| verb_is(l, "STARTTLS")) {
-            return Err(anyhow!("backend did not advertise STARTTLS"));
-        }
-
-        tcp_be.write_all(b"STARTTLS\r\n").await?;
-        let (code, _) = read_smtp_reply(&mut tcp_be, self.tuning.idle).await?;
-        if code != 220 {
-            return Err(anyhow!("backend STARTTLS code {code}"));
-        }
-
-        let mut be = connect::tls(
-            self.backend,
-            tcp_be,
-            self.tuning.connect,
-            "submission backend",
-        )
-        .await?;
-
-        be.write_all(format!("EHLO {}\r\n", self.name).as_bytes())
-            .await?;
-        let (code, ehlo_lines) = read_smtp_reply(&mut be, self.tuning.idle).await?;
-        if code != 250 {
-            return Err(anyhow!("backend post-TLS EHLO code {code}"));
-        }
+        let (mut be, ehlo_lines) = connect_ehlo(self.backend, self.tuning, self.name).await?;
 
         // XCLIENT (optional): Postfix then logs and stamps the real client
         // address. Only when configured and advertised; a backend that does

@@ -16,7 +16,8 @@ use zeroize::Zeroizing;
 /// Returns the mechanism name, a classified `ClientAuthKind` and the
 /// OAUTHBEARER `host`, if any. Never logs
 /// secrets. Every error path answers the client (501, 503, 504 or 535)
-/// before returning. A password mechanism `pw` does not offer never prompts for the
+/// before returning; one the client may follow with another AUTH is marked
+/// `auth::Retryable`. A password mechanism `pw` does not offer never prompts for the
 /// password: 504 and the error `Withheld` (RFC 4954 §4). An OAuth response
 /// with an empty `auth` value (RFC 7628 §4.3) gets the error result
 /// `challenge` (base64) as a `334`, then the failure once the client has
@@ -42,17 +43,17 @@ where
         stream
             .write_all(b"501 5.5.4 Syntax: AUTH mechanism [initial-response]\r\n")
             .await?;
-        return Err(anyhow!("no mechanism in AUTH"));
+        return Err(crate::auth::answered(anyhow!("no mechanism in AUTH")));
     };
     let inline = initial_response(parts.next());
     let Some(m) = Mechanism::parse(&mech) else {
         stream
             .write_all(b"504 5.5.4 Unrecognized authentication type\r\n")
             .await?;
-        return Err(anyhow!(
+        return Err(crate::auth::answered(anyhow!(
             "unsupported mechanism {}",
             crate::obs::authlog::sanitize(&mech)
-        ));
+        )));
     };
     // Parsed also where passwords are not offered, so `auth::authorize` can
     // log and refuse it.
@@ -84,14 +85,14 @@ where
             let _ = stream
                 .write_all(b"501 5.5.2 Invalid or cancelled authentication response\r\n")
                 .await;
-            Err(e)
+            Err(crate::auth::answered(e))
         }
         // Decodes, but holds no valid credential: a failed authentication.
         Err(e) => {
             let _ = stream
                 .write_all(b"535 5.7.8 Authentication credentials invalid\r\n")
                 .await;
-            Err(e)
+            Err(crate::auth::answered(e))
         }
     }
 }

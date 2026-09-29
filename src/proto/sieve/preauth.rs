@@ -73,7 +73,9 @@ where
     stream.write_all(b"\"\"\r\n").await?;
     let response = read_sasl_string(stream, idle).await?;
     if response.as_str() == "*" {
-        return Err(anyhow!("client cancelled authentication"));
+        return Err(anyhow::Error::new(crate::auth::sasl::BadResponse(
+            "client cancelled authentication",
+        )));
     }
     Ok(response)
 }

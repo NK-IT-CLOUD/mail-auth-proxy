@@ -41,6 +41,28 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   certificate file), one series per certificate. With one certificate there is still one
   series, now labelled; a query or an exact series match on the unlabelled series must
   be adjusted, and with several certificates an alert takes the earliest (`min`).
+- The EHLO reply after STARTTLS lists the submission backend's own extensions instead of
+  a static list (RFC 5321 §4.2.4), as far as the proxy handles each one: PIPELINING,
+  SIZE (with the backend's limit, advertised now), 8BITMIME, SMTPUTF8, DSN,
+  ENHANCEDSTATUSCODES and CHUNKING; never XCLIENT, XFORWARD, VRFY, ETRN or unknown
+  ones. The proxy reads them with a probe connection of its own, at startup and then at
+  most once per `submission.capability_cache_secs` (new, default 600), one at a time;
+  failed probes count in `backend_errors_total{proto="smtp"}`, and the last list stays
+  in use. `submission.ehlo_extensions` is now optional and narrows the list by keyword:
+  existing lists keep working, their parameters are ignored and keywords the proxy
+  never passes on give a warning.
+- `BDAT` before AUTH is answered with `530`, then `421` and the close: its chunk was
+  read as commands (RFC 3030 §2).
+- A connection takes up to `limits.max_auth_attempts` authentication attempts (new,
+  default 3, 1-10) instead of one (RFC 9051 §6.2.2, RFC 4954 §4, RFC 5804 §2.1), so
+  clients that fall back from one mechanism to another on the same connection (Python
+  `smtplib` from PLAIN to LOGIN, Thunderbird) or retry with a refreshed token no longer
+  lose it. Each attempt gets its own `authresult` line (format unchanged), counts for
+  the rate limit and passes the legacy gate and the refusal timing like one on a new
+  connection; the pre-auth budget and `max_preauth_commands` span all of them. A source
+  the rate limit blocks while the connection is open is closed at its next credential,
+  before it is judged. After an outage, the last attempt, an unknown command or a
+  malformed one, the connection closes as before. Set 1 for the old behaviour.
 - The ManageSieve backend's capabilities are probed once at startup, so the first
   greetings no longer wait for a probe. A failure there is logged and counted in
   `mail_auth_proxy_backend_errors_total{proto="sieve"}`; the start goes on.

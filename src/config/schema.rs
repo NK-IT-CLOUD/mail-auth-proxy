@@ -11,19 +11,6 @@ pub const DEFAULT_ALGORITHMS: &[&str] = &[
     "RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384",
 ];
 
-/// ESMTP extensions advertised after STARTTLS, besides AUTH. The client keeps
-/// this view for the whole session (it does not send EHLO again after AUTH),
-/// so the list must match what the backend offers. A subset of what Postfix
-/// offers by default (SIZE, VRFY and ETRN are left out).
-pub const DEFAULT_EHLO_EXTENSIONS: &[&str] = &[
-    "PIPELINING",
-    "ENHANCEDSTATUSCODES",
-    "8BITMIME",
-    "DSN",
-    "SMTPUTF8",
-    "CHUNKING",
-];
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -153,16 +140,14 @@ pub struct Submission {
     /// Announce the client address with XCLIENT when the backend offers it.
     #[serde(default)]
     pub xclient: bool,
-    /// Extensions advertised after STARTTLS besides AUTH.
-    #[serde(default = "default_ehlo_extensions")]
-    pub ehlo_extensions: Vec<String>,
-}
-
-fn default_ehlo_extensions() -> Vec<String> {
-    DEFAULT_EHLO_EXTENSIONS
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    /// The EHLO extensions advertised after STARTTLS at most (by keyword);
+    /// the reply lists those of them the backend offers and the proxy
+    /// handles. Unset: all the proxy handles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ehlo_extensions: Option<Vec<String>>,
+    /// How long the backend's EHLO extensions are reused.
+    #[serde(default = "default_caps_cache_secs")]
+    pub capability_cache_secs: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -509,6 +494,10 @@ pub struct Limits {
     /// Commands a client may send before it authenticates.
     #[serde(default = "default_max_preauth_commands")]
     pub max_preauth_commands: usize,
+    /// Authentication attempts per connection (1-10); 1 closes the
+    /// connection after the first refused one.
+    #[serde(default = "default_max_auth_attempts")]
+    pub max_auth_attempts: u32,
     /// Prefix length by which IPv6 sources are grouped for
     /// `max_preauth_per_ip` and the auth rate limit (32-64).
     #[serde(default = "default_ipv6_source_prefix")]
@@ -521,6 +510,7 @@ impl Default for Limits {
             max_connections: default_max_connections(),
             max_preauth_per_ip: default_max_preauth_per_ip(),
             max_preauth_commands: default_max_preauth_commands(),
+            max_auth_attempts: default_max_auth_attempts(),
             ipv6_source_prefix: default_ipv6_source_prefix(),
         }
     }
@@ -540,6 +530,10 @@ fn default_max_preauth_per_ip() -> usize {
 
 fn default_max_preauth_commands() -> usize {
     8
+}
+
+fn default_max_auth_attempts() -> u32 {
+    3
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

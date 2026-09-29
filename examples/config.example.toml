@@ -38,8 +38,11 @@ backend = { address = "192.0.2.10:10993", verify_name = "imap.example.org", prox
 listen = "0.0.0.0:587"                     # STARTTLS
 backend = { address = "192.0.2.10:587", verify_name = "smtp.example.org" }
 xclient = true                             # Postfix: smtpd_authorized_xclient_hosts
-# Advertised after STARTTLS besides AUTH; must match what the backend offers.
-ehlo_extensions = ["PIPELINING", "ENHANCEDSTATUSCODES", "8BITMIME", "DSN", "SMTPUTF8", "CHUNKING"]
+# The EHLO reply after STARTTLS lists the backend's extensions that the proxy handles
+# (PIPELINING, SIZE, 8BITMIME, SMTPUTF8, DSN, ENHANCEDSTATUSCODES, CHUNKING);
+# ehlo_extensions narrows them by keyword.
+# ehlo_extensions = ["PIPELINING", "SIZE", "8BITMIME", "DSN", "SMTPUTF8", "ENHANCEDSTATUSCODES"]
+capability_cache_secs = 600                # reuse of the backend's EHLO extensions
 
 [sieve]                                    # optional: omit to disable
 listen = "0.0.0.0:4190"                    # STARTTLS
@@ -128,6 +131,7 @@ internal_networks = ["10.0.0.0/8", "192.168.0.0/16"]   # log/metric label only
 max_connections = 2048                     # all protocols; at most half unauthenticated
 max_preauth_per_ip = 32                    # unauthenticated connections per source IP
 max_preauth_commands = 8
+max_auth_attempts = 3                      # per connection; 1 closes after the first refusal
 
 [timeouts]
 preauth_secs = 60                          # accept to credential, in total

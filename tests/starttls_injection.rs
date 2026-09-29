@@ -35,7 +35,7 @@ async fn smtp_starttls_injection() {
     h.wait_session_ended(Kind::Smtp, 1).await;
     // A TLS failure writes no authresult for SMTP; it is a pre-auth abort.
     assert!(h.proxy.authresults().is_empty());
-    assert!(h.smtp_be.seen().is_empty(), "backend contacted");
+    assert!(h.smtp_be.sessions().is_empty(), "backend contacted");
     assert_eq!(
         h.proxy
             .metric("mail_auth_proxy_preauth_aborts_total{proto=\"smtp\",scope=\"internal\"}")

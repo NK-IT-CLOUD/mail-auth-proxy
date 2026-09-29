@@ -361,6 +361,7 @@ async fn smtp_gate_matrix() {
                     [
                         &format!("250-{HOSTNAME}"),
                         "250-PIPELINING",
+                        "250-SIZE 10240000",
                         "250-ENHANCEDSTATUSCODES",
                         "250-8BITMIME",
                         "250-DSN",

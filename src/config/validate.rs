@@ -23,6 +23,11 @@ const MAX_REFRESH_SECS: u64 = 86_400;
 /// slots, and past 2^63 seconds the deadline overflows the clock.
 const MAX_TIMEOUT_SECS: u64 = 3600;
 
+/// Upper bound of `limits.max_auth_attempts`. Every attempt is judged and
+/// counted like one on a new connection; the bound keeps a single connection
+/// from being a guessing channel of its own between two rate-limit checks.
+const MAX_AUTH_ATTEMPTS: u32 = 10;
+
 impl Config {
     /// Every check serde cannot express. Collects all problems instead of
     /// stopping at the first, so one `--check-config` run shows them all.
@@ -63,8 +68,9 @@ impl Config {
             if s.backend.proxy_protocol {
                 err("submission.backend.proxy_protocol is not supported (Postfix gets the client address via xclient)".into());
             }
+            use crate::proto::smtp::ehlo::{ehlo_keyword, RELAYED};
             let mut keywords: Vec<&str> = Vec::new();
-            for x in &s.ehlo_extensions {
+            for x in s.ehlo_extensions.iter().flatten() {
                 match ehlo_keyword(x) {
                     None => err(format!("submission.ehlo_extensions: {x:?} is not an EHLO line (a keyword of letters, digits and hyphens, then parameters, separated by single spaces; RFC 5321 section 4.1.1.1)")),
                     Some(k) if ["AUTH", "STARTTLS"].iter().any(|v| k.eq_ignore_ascii_case(v)) => {
@@ -73,8 +79,18 @@ impl Config {
                     Some(k) if keywords.iter().any(|o| o.eq_ignore_ascii_case(k)) => {
                         err(format!("submission.ehlo_extensions: {k:?} is listed twice"));
                     }
-                    Some(k) => keywords.push(k),
+                    Some(k) => {
+                        keywords.push(k);
+                        if !RELAYED.iter().any(|r| r.eq_ignore_ascii_case(k)) {
+                            warnings.push(format!("submission.ehlo_extensions: {k:?} is never advertised: the proxy passes on only {} from the backend", RELAYED.join(", ")));
+                        } else if k.len() < x.len() {
+                            warnings.push(format!("submission.ehlo_extensions: the parameters of {x:?} are ignored: the backend's are advertised"));
+                        }
+                    }
                 }
+            }
+            if s.capability_cache_secs == 0 {
+                err("submission.capability_cache_secs must be at least 1".into());
             }
         }
         if let Some(s) = &self.sieve {
@@ -283,6 +299,16 @@ impl Config {
         if l.max_connections == 0 || l.max_preauth_per_ip == 0 || l.max_preauth_commands == 0 {
             err("limits: max_connections, max_preauth_per_ip and max_preauth_commands must be at least 1".into());
         }
+        if !(1..=MAX_AUTH_ATTEMPTS).contains(&l.max_auth_attempts) {
+            err(format!(
+                "limits.max_auth_attempts must be between 1 and {MAX_AUTH_ATTEMPTS}"
+            ));
+        } else if l.max_auth_attempts as usize > l.max_preauth_commands {
+            warnings.push(format!(
+                "limits.max_auth_attempts ({}) is larger than limits.max_preauth_commands ({}): every attempt is a command, so a connection gets at most {} attempts",
+                l.max_auth_attempts, l.max_preauth_commands, l.max_preauth_commands
+            ));
+        }
         // Longer than /64 would give a host with its own /64 (RFC 7934) a
         // separate budget per address again.
         if !(32..=64).contains(&l.ipv6_source_prefix) {
@@ -398,21 +424,6 @@ fn check_hostname(h: &str) -> Result<(), String> {
         return Err("must be a host name: labels of 1-63 letters, digits and inner hyphens, separated by dots, at most 253 characters (RFC 5321 section 4.1.2)".into());
     }
     Ok(())
-}
-
-/// The keyword of `line` if it is an `ehlo-line` of RFC 5321 section
-/// 4.1.1.1: `ehlo-keyword *( SP ehlo-param )`, the keyword
-/// `(ALPHA / DIGIT) *(ALPHA / DIGIT / "-")`, each parameter one or more
-/// printable ASCII characters except space.
-fn ehlo_keyword(line: &str) -> Option<&str> {
-    let mut words = line.split(' ');
-    let keyword = words.next()?;
-    let keyword_ok = keyword.starts_with(|c: char| c.is_ascii_alphanumeric())
-        && keyword
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-');
-    let params_ok = words.all(|p| !p.is_empty() && p.bytes().all(|b| (b'!'..=b'~').contains(&b)));
-    (keyword_ok && params_ok).then_some(keyword)
 }
 
 /// Two listeners that cannot both bind: the same port and the same address,
@@ -1218,6 +1229,36 @@ mod tests {
         }
     }
 
+    /// `limits.max_auth_attempts` is 1-10 (default 3); more attempts than
+    /// commands is a warning.
+    #[test]
+    fn auth_attempts_are_bounded() {
+        let l = crate::config::parse(V2).unwrap();
+        assert_eq!(l.config.limits.max_auth_attempts, 3);
+        for v in ["1", "10"] {
+            assert!(errors_with(&format!("[limits]\nmax_auth_attempts = {v}\n")).is_empty());
+        }
+        for v in ["0", "11"] {
+            let e = errors_with(&format!("[limits]\nmax_auth_attempts = {v}\n"));
+            assert!(
+                e.contains("max_auth_attempts must be between 1 and 10"),
+                "{v}: {e}"
+            );
+        }
+        let l = crate::config::parse(&format!(
+            "{V2}[limits]\nmax_auth_attempts = 5\nmax_preauth_commands = 4\n"
+        ))
+        .unwrap();
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        assert!(
+            l.warnings
+                .iter()
+                .any(|w| w.contains("max_auth_attempts (5)")),
+            "{:?}",
+            l.warnings
+        );
+    }
+
     /// `server.hostname` is an RFC 5321 Domain; IP addresses and address
     /// literals are refused.
     #[test]
@@ -1327,6 +1368,41 @@ mod tests {
         }
         let e = with(r#""SIZE 1000", "PIPELINING", "size 2000""#);
         assert!(e.contains("\"size\" is listed twice"), "{e}");
+    }
+
+    /// `submission.ehlo_extensions` narrows the backend's list: a keyword
+    /// the proxy never passes on, and parameters, which the backend's
+    /// replace, are warned about. Unset, it is left out of the printed
+    /// configuration.
+    #[test]
+    fn ehlo_extensions_warnings() {
+        let sub = "[submission]\nlisten = \"0.0.0.0:587\"\nbackend = { address = \"192.0.2.10:587\", verify_name = \"mail.example.org\" }\n";
+        let warnings = |extra: &str| {
+            let l = crate::config::parse(&format!("{V2}{sub}{extra}")).unwrap();
+            assert!(l.errors.is_empty(), "{:?}", l.errors);
+            l.warnings
+                .into_iter()
+                .filter(|w| w.contains("submission."))
+                .collect::<Vec<_>>()
+        };
+        assert!(warnings("").is_empty());
+        assert!(warnings("ehlo_extensions = [\"PIPELINING\", \"dsn\"]\n").is_empty());
+        let w = warnings("ehlo_extensions = [\"VRFY\", \"SIZE 1000\", \"X-EXT\"]\n");
+        assert_eq!(w.len(), 3, "{w:?}");
+        assert!(w[0].contains("\"VRFY\" is never advertised"), "{w:?}");
+        assert!(
+            w[1].contains("parameters of \"SIZE 1000\" are ignored"),
+            "{w:?}"
+        );
+        assert!(w[2].contains("\"X-EXT\" is never advertised"), "{w:?}");
+        let e = errors_with(&format!("{sub}capability_cache_secs = 0\n"));
+        assert!(
+            e.contains("submission.capability_cache_secs must be at least 1"),
+            "{e}"
+        );
+        let l = crate::config::parse(&format!("{V2}{sub}")).unwrap();
+        assert_eq!(l.config.submission.as_ref().unwrap().ehlo_extensions, None);
+        assert_eq!(l.config.submission.unwrap().capability_cache_secs, 600);
     }
 
     /// Listeners are compared as socket addresses, the metrics endpoint
