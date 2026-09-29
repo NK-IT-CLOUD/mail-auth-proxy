@@ -3,27 +3,26 @@
 # maintainer scripts against a stub systemctl and cannot see what systemd refuses
 # at start (user, sandbox, capabilities, sd_notify). Assertions in
 # packaging/systemd-test.sh; it ends the container with its status.
-# CONTAINER_ENGINE is buildah (rootless, the maintainer's runner) or docker
-# (GitHub-hosted runners).
+# Rootless buildah only (CONTAINER_ENGINE=buildah, the self-hosted runner); the CI
+# skips this test elsewhere.
 #   ci-systemd-test.sh NEW_DIR RELEASES_DIR   (one .deb in NEW_DIR and in each
 #                                              RELEASES_DIR/VERSION/, the releases
 #                                              the test upgrades from)
 #
-# systemd needs a writable cgroup. buildah: the container runs in a delegated
-# scope of the runner's user manager and mounts its own cgroup2; --cap-add ALL
-# only grants capabilities inside the container's user namespace. docker:
-# --privileged with a private cgroup namespace.
+# systemd needs a writable cgroup: the container runs in a delegated scope of
+# the runner's user manager and mounts its own cgroup2; --cap-add ALL only grants
+# capabilities inside the container's user namespace.
 # The container must always end: the test unit's job timeout stops systemd
-# (exit-force); if that fails, the guard halts it. buildah: SIGRTMIN+3 to
-# systemd (PID 1 ignores SIGTERM), then KILL to the whole process tree (crun puts
-# the container into its own cgroup, so a signal to buildah alone would leave
-# systemd running). docker: docker kill. The container's journal lands in
-# $out/journal.
+# (exit-force); if that fails, the guard halts it: SIGRTMIN+3 to systemd (PID 1
+# ignores SIGTERM), then KILL to the whole process tree (crun puts the container
+# into its own cgroup, so a signal to buildah alone would leave systemd running).
+# The container's journal lands in $out/journal.
 set -euo pipefail
 new=$1 releases=$2
-engine=${CONTAINER_ENGINE:-docker}
+[ "${CONTAINER_ENGINE:-buildah}" = buildah ] \
+    || { echo "unsupported CONTAINER_ENGINE: $CONTAINER_ENGINE (buildah only)" >&2; exit 2; }
 guard_secs=420
-ctr= img= boot= out=
+ctr= boot= out=
 
 tree() { local c; for c in $(pgrep -P "$1" || true); do tree "$c"; done; echo "$1"; }
 halt_and_kill() { # pid of the backgrounded buildah run
@@ -38,31 +37,16 @@ halt_and_kill() { # pid of the backgrounded buildah run
 }
 cleanup() {
     [ -z "$boot" ] || halt_and_kill "$boot"
-    case $engine in
-        buildah) [ -z "$ctr" ] || buildah rm "$ctr" > /dev/null ;;
-        docker)
-            [ -z "$ctr" ] || docker rm -f "$ctr" > /dev/null
-            # Written as root: hand the directory back before removing it.
-            [ -z "$img" ] || [ -z "$out" ] \
-                || docker run --rm --network none -v "$out:/out" "$img" chown -R "$(id -u):$(id -g)" /out || true
-            [ -z "$img" ] || docker rmi -f "$img" > /dev/null
-            ;;
-    esac
+    [ -z "$ctr" ] || buildah rm "$ctr" > /dev/null
     [ -z "$out" ] || rm -rf "$out"
 }
 trap cleanup EXIT
 
 c_run() { # container, shell command
-    case $engine in
-        buildah) buildah run "$1" -- sh -c "$2" < /dev/null ;;
-        docker) docker exec "$1" sh -c "$2" ;;
-    esac
+    buildah run "$1" -- sh -c "$2" < /dev/null
 }
 c_copy() { # container, source, destination
-    case $engine in
-        buildah) buildah copy --quiet "$1" "$2" "$3" ;;
-        docker) docker exec "$1" mkdir -p "$(dirname "$3")" && docker cp -q "$2" "$1:$3" ;;
-    esac
+    buildah copy --quiet "$1" "$2" "$3"
 }
 
 # Boots systemd in the prepared container and waits for it to end; exit status
@@ -84,27 +68,12 @@ boot_buildah() {
     kill $(tree "$guard") 2> /dev/null || true
     return $rc
 }
-boot_docker() {
-    img=$(docker commit -q "$ctr")
-    docker rm -f "$ctr" > /dev/null
-    ctr=$(docker create --privileged --cgroupns private --network none \
-        --tmpfs /run --tmpfs /tmp -v "$out:/out" -v "$out/journal:/var/log/journal" \
-        --env container=docker "$img" /lib/systemd/systemd)
-    docker start "$ctr" > /dev/null
-    local rc
-    rc=$(timeout $guard_secs docker wait "$ctr") || { echo "timeout: killing the container"; docker kill "$ctr" > /dev/null; return 1; }
-    return "$rc"
-}
 
 systemd_test() { # image, release directory
     echo "== $1, upgrade from $2"
     out=$(mktemp -d)
     mkdir "$out/journal"
-    case $engine in
-        buildah) ctr=$(buildah from --quiet "$1") ;;
-        docker) ctr=$(docker run -d --quiet "$1" sleep infinity) ;;
-        *) echo "unsupported CONTAINER_ENGINE: $engine" >&2; exit 2 ;;
-    esac
+    ctr=$(buildah from --quiet "$1")
     # dbus: systemd-run --wait in postinstall needs the system bus.
     c_run "$ctr" 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends systemd dbus openssl ca-certificates python3 iproute2 > /dev/null'
     c_copy "$ctr" packaging/systemd-test.sh /pkg/systemd-test.sh
@@ -117,21 +86,19 @@ systemd_test() { # image, release directory
     c_run "$ctr" 'sh /pkg/systemd-test.sh setup'
     echo "booting systemd"
     local start=$SECONDS rc=0
-    "boot_$engine" || rc=$?
+    boot_buildah || rc=$?
     echo "container ended after $((SECONDS - start)) s with status $rc"
     cat "$out/log" 2> /dev/null || echo "no test log"
     if [ "$rc" != 0 ] || ! grep -q '^OK: ' "$out/log" 2> /dev/null; then
         echo "FAIL: container exit status $rc or the test did not finish; journal:"
-        [ "$engine" != docker ] \
-            || docker run --rm --network none -v "$out:/out" "$img" chown -R "$(id -u):$(id -g)" /out || true
         journalctl --directory="$out/journal" --no-pager -n 100 -o short-monotonic 2> /dev/null || true
         exit 1
     fi
     cleanup
-    ctr= img= out=
+    ctr= out=
 }
 for r in "$releases"/*/; do
     systemd_test docker.io/library/debian:12@sha256:f37a335e82bca302e955fa39f9dfe28f1be618f016f8a2b56318e5a5111afc26 "$r"
     systemd_test docker.io/library/ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3 "$r"
 done
-echo "systemd start tests: ok ($engine)"
+echo "systemd start tests: ok"

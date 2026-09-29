@@ -185,8 +185,8 @@ jobs:
 
   # Static musl build in the digest-pinned image, deb + rpm with nfpm, then
   # install, upgrade and remove in throwaway containers (assertions in
-  # packaging/smoke-test.sh), then start the unit under systemd
-  # (packaging/systemd-test.sh).
+  # packaging/smoke-test.sh), then, on the self-hosted runner, start the unit
+  # under systemd (packaging/systemd-test.sh).
   package-smoke:
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     if: vars.CI_RUNNER == '' || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -228,7 +228,13 @@ jobs:
         run: packaging/ci-install-tests.sh "dist/0.0.0-ci.0" "dist/0.0.0-ci.${{ github.run_number }}" dist/releases
 
       # The real unit under systemd as PID 1; the script's guard ends a hung
-      # container well before this limit.
+      # container well before this limit. Rootless buildah on the self-hosted
+      # runner only: the test is not built for other engines.
       - name: Start under systemd
+        if: env.CONTAINER_ENGINE == 'buildah'
         timeout-minutes: 20
         run: packaging/ci-systemd-test.sh "dist/0.0.0-ci.${{ github.run_number }}" dist/releases
+
+      - name: Start under systemd (skipped)
+        if: env.CONTAINER_ENGINE != 'buildah'
+        run: echo "::notice title=Start under systemd::SKIP - the systemd start test runs on the self-hosted runner only (CONTAINER_ENGINE=buildah)"

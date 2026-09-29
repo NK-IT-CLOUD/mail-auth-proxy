@@ -6,6 +6,10 @@ gate=$here/leak-gate.sh
 pubtree=$here/public-tree.sh
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+# Commits start `git maintenance run --auto` detached; since git 2.54 its default
+# strategy repacks once there are about 100 loose objects and can still be writing
+# into .git while the trap removes $work.
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=maintenance.auto GIT_CONFIG_VALUE_0=false
 export GNUPGHOME=$work/gnupg
 repo=$work/repo
 mkdir -p "$repo" "$GNUPGHOME"
