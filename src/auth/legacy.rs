@@ -381,8 +381,8 @@ impl Throttle {
         order.select_nth_unstable(n - 1);
         for (_, k) in &order[..n] {
             seen.remove(k);
-            crate::obs::metrics::record_throttle_eviction();
         }
+        crate::obs::metrics::record_throttle_evictions(n as u64);
     }
 
     fn success(&self, user: &str) {

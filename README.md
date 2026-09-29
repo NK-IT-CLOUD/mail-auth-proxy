@@ -232,7 +232,7 @@ authentication, so keep it on loopback or a management network.
 | `mail_auth_proxy_tls_cert_expiry_timestamp_seconds` | expiry of the certificate in use |
 
 The complete list with labels, including `mail_auth_proxy_build_info`,
-`process_start_time_seconds`, the JWKS refresh failures, the legacy-gate and the other
+`process_start_time_seconds`, the JWKS refresh failures and skipped keys, the legacy-gate and the other
 rate-limit counters, is in
 [docs/operations.md](docs/operations.md#prometheus-metrics).
 
@@ -262,8 +262,9 @@ The full index is [docs/README.md](docs/README.md).
 - The SMTP `EHLO` list is static (`submission.ehlo_extensions`); `SIZE` is not advertised by
   default.
 - Connections closed by a limit, a failed-login block or a timeout get no `421`/`BYE`.
-- The failed-login block counts per source address (IPv6 per /64): users behind one NAT or
-  webmail server share it unless that address is exempt.
+- The failed-login block counts per source address (IPv6 per /64, set by
+  `limits.ipv6_source_prefix`): users behind one NAT or webmail server share it unless
+  that address is exempt.
 - Legacy rules trust the source address: the proxy must see real client addresses (no SNAT
   or load balancer in front). A rule with `sni` needs SNI, which clients connecting by IP
   address do not send.

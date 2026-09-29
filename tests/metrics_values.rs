@@ -18,12 +18,14 @@ async fn jwks_success_and_failures_by_issuer() {
     let success =
         format!("mail_auth_proxy_jwks_last_success_timestamp_seconds{{issuer=\"{ISSUER}\"}}");
     let failures = format!("mail_auth_proxy_jwks_refresh_failures_total{{issuer=\"{ISSUER}\"}}");
+    let skipped = format!("mail_auth_proxy_jwks_keys_skipped_total{{issuer=\"{ISSUER}\"}}");
 
     // The startup fetch counts as a success.
     let m = h.proxy.metrics().await;
     let loaded = m[&success];
     assert!(loaded <= now() && now() - loaded < 60, "{loaded}");
     assert_eq!(m[&failures], 0);
+    assert_eq!(m[&skipped], 0);
 
     // The IdP goes away: the SIGHUP refresh fails, the issuer keeps its keys
     // and its last success time.

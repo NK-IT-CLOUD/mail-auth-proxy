@@ -28,6 +28,11 @@ client ──TLS──▶ mail-auth-proxy ────────────�
 
 Each connection is one tokio task. Connections share only the JWKS key set, the server certificate, the ManageSieve capability cache, the legacy gate's caches and counters, the connection limits, the failed-login counters and the metrics. Trust boundaries and the threat model are in [SECURITY.md](../SECURITY.md#trust-boundaries).
 
+## Startup
+
+- The configuration is validated before anything else; an error aborts the start, and warnings are logged. File paths (`tls.cert`, `tls.key`, `ca_file`, `domains_file`, `doveadm_key_file`, `doveadm_ca_file`, `users_file`) must be absolute: a relative path would resolve against the working directory, so `--check-config` in a shell could pass on files the service never reads. A relative path is a validation error.
+- The two per-process HMAC keys, for the password fingerprint (`pwfp`) and for the rate limit's fingerprints of repeated credentials, are generated from the system RNG before the certificate, the JWKS and the listeners. Without a system RNG the proxy refuses to start. The keys are never written anywhere; a restart makes new ones.
+
 ## Client TLS
 
 - rustls with the aws-lc-rs provider. TLS 1.2 and TLS 1.3 use rustls' default cipher suites. There is no ALPN and no client-certificate authentication.
@@ -63,7 +68,7 @@ IMAP advertises `LOGINDISABLED` whenever LOGIN is not offered (the LOGIN command
 
 ### Checks on a password attempt
 
-A password credential is always parsed, even when it is not advertised, so the attempt can be logged with a password fingerprint. The checks then run in this order, all before any backend contact:
+A password the client has sent is always parsed, even when its mechanism is not advertised, so the attempt can be logged with a password fingerprint: the IMAP `LOGIN` command and a PLAIN initial response carry it. A mechanism the connection does not offer is never asked for its password: without an initial response (SASL LOGIN: after the username in the initial response) it is refused at once as `blocked_endpoint`, without `pwfp`. The checks then run in this order, all before any backend contact:
 
 | Step | Check | Refused as |
 |---|---|---|
@@ -74,7 +79,7 @@ A password credential is always parsed, even when it is not advertised, so the a
 | 2 | the login's domain is in `allowed_domains` ∪ `domains_file` (only if either is set; a login without `@domain` fails) | `unknown_domain` |
 | 3 | the account exists (`account_check = "doveadm"`) | `unknown_account` |
 | 4 | the account is not throttled (`throttle`) | `throttled` |
-| | the backend checks the password; a protocol error in direct answer to the password (SMTP `500` to `509` after the response to `334`, IMAP tagged `BAD`) also counts as a rejection; a reply to the bare SMTP `AUTH` line or an IMAP `* BYE` is an outage | `backend_reject` |
+| | the backend checks the password; a protocol error in direct answer to the password (SMTP `500` to `509` after the response to `334`, IMAP tagged `BAD`) also counts as a rejection; a reply to the bare SMTP `AUTH` line, an IMAP `* BYE` or a ManageSieve `BYE` (other than `AUTH-TOO-WEAK`, `TRANSITION-NEEDED`) is an outage | `backend_reject` |
 
 The size cap and the protocol-error rule close an enumeration oracle. A backend may answer a crafted password with a protocol error (Postfix does beyond `smtpd_sasl_response_limit`, 12288 octets), and it only ever sees passwords of accounts that passed the gate. An immediate retry-later there, next to a delayed refusal for the other accounts, would tell the two groups apart.
 
@@ -105,7 +110,7 @@ Sources: doc.dovecot.org 2.4.5 "Doveadm → HTTP API" and the `user` command in 
 
 ### Throttle
 
-Each backend rejection counts against the account for `window_secs` from its first failure. The key is the login folded to ASCII lower case, so `Bob@x` and `bob@x` share one counter. Once `failures` is reached, further attempts are refused without asking the backend until the window ends. A successful login resets the count. Password attempts for one account take turns: the next one is checked only after the previous one has its backend verdict counted, so parallel connections cannot run more attempts than `failures` allows. Correct passwords wait at most for one backend answer; nothing is refused because of parallel logins. At most 65 536 accounts are tracked (expired entries are dropped first, then the oldest). Only rejections of existing accounts are counted, so unknown names do not fill the table.
+Each backend rejection counts against the account for `window_secs` from its first failure. The key is the login folded to ASCII lower case, so `Bob@x` and `bob@x` share one counter. Once `failures` is reached, further attempts are refused without asking the backend until the window ends. A successful login resets the count. Password attempts for one account take turns: the next one is checked only after the previous one has its backend verdict counted, so parallel connections cannot run more attempts than `failures` allows. Correct passwords wait at most for one backend answer; nothing is refused because of parallel logins. At most 65 536 accounts are tracked. When a new account finds the table full, expired entries are dropped first, then the oldest running ones, down to 1,024 below the limit, so the scan under the lock runs once per 1,024 new accounts; the running windows dropped are counted in `mail_auth_proxy_legacy_throttle_evictions_total`. Only rejections of existing accounts are counted, so unknown names do not fill the table.
 
 ### User and domain files
 
@@ -130,9 +135,11 @@ A source IP in `scope.internal_networks` counts as `scope=internal`, whatever th
 | Mechanism | Client → proxy | Proxy → backend |
 |---|---|---|
 | `XOAUTH2` | `user=<u>^Aauth=Bearer <jwt>^A^A`. The scheme `Bearer` is case-insensitive and `user=` must not be empty. | `XOAUTH2` rebuilt as `user=<validated identity claim>^Aauth=Bearer <same jwt>^A^A` |
-| `OAUTHBEARER` | GS2 header `n,a=<authzid>,` (the authzid is optional: `n,,`), then `^A`-separated fields with `auth=Bearer <jwt>`. `host=` and `port=` are ignored. | converted to `XOAUTH2` as above |
-| `PLAIN` | `authzid\0authcid\0passwd`. User and password must be non-empty. The login is the authcid; a non-empty authzid must equal it, otherwise the exchange fails (acting as another user is not supported). | `PLAIN` rebuilt as `\0<login>\0<passwd>` (empty authzid) |
-| `LOGIN` | Two base64 prompts (`Username:`, `Password:`). An initial response on the AUTH line is the username; then only the password is asked for. IMAP and SMTP only. | sent as `PLAIN` |
+| `OAUTHBEARER` | GS2 header `n,a=<authzid>,` or `y,…` (the authzid is optional: `n,,`; `=2C` and `=3D` in it stand for `,` and `=`; `p=` channel binding is refused), then `^A`-separated fields with `auth=Bearer <jwt>`. A `host=` must match the TLS server name when the client sent SNI (RFC 7628 §3.2; ASCII case-insensitive, a trailing dot ignored), otherwise the token counts as rejected (`bad_token`). `port=` is ignored. | converted to `XOAUTH2` as above |
+| `PLAIN` | `authzid\0authcid\0passwd`. User and password must be non-empty, and the password must not contain a NUL (RFC 4616 §2). The login is the authcid; a non-empty authzid must equal it, otherwise the exchange fails (acting as another user is not supported). | `PLAIN` rebuilt as `\0<login>\0<passwd>` (empty authzid) |
+| `LOGIN` | Two base64 prompts (`Username:`, `Password:`). An initial response on the AUTH line is the username; then only the password is asked for. Neither field may contain a NUL. IMAP and SMTP only. | sent as `PLAIN` |
+
+A SASL user the client names (XOAUTH2 `user=`, OAUTHBEARER `a=`) longer than 255 bytes or with control characters makes the response malformed. An OAuth response whose `auth` value is empty (`auth=`, or `Bearer` without a token) is a discovery request (RFC 7628 §4.3): it gets the error result of a rejected token ([protocols](protocols.md#oauth-error-result)), is logged as `protocol` and counts as no failed login.
 
 For OAuth, the login forwarded to the backend is always the token's `identity_claim` (default `email`). The username the client supplies (XOAUTH2 `user=`, OAUTHBEARER `a=`, the SASL authorisation identity) is logged when validation fails. Once the token is valid, that username must be empty, name the same identity, or be its local part without a domain (ASCII case-insensitive). Any other name fails the exchange with `authzid_mismatch` before the backend is contacted (RFC 4422 §3.6).
 
@@ -158,29 +165,31 @@ The user name is not treated as a secret and is not zeroized.
 
 ## OAuth token validation
 
-Validation is local; the proxy makes no introspection or userinfo call. A token over 16384 bytes is a `bad_token` without validation.
+Validation is local; the proxy makes no introspection or userinfo call. A token over 16384 bytes is a `bad_token` without validation. A token whose JWS header has a `crit` member is a `bad_token` too: the proxy understands no JWS extension (RFC 7515 §4.1.11). Validation, with any JWKS refresh it waits for, must finish within the pre-auth budget; a validation that runs out is an outage (retry-later). The refresh itself still completes and records its result, so the 30 s spacing below holds while an IdP is slow.
 
 1. Key selection. The `kid` from the JWT header is looked up. A token without `kid` uses the key id `"default"`, which also matches JWKS keys that have no `kid`. An unknown `kid` triggers one refresh of all JWKS and a second lookup. These on-demand refreshes happen at most every 30 s and are serialised with the periodic refresh, so an older snapshot never overwrites a newer one; tokens arriving during a refresh wait for it. If the key is still unknown, the result of the last on-demand refresh decides (this one, or the one less than 30 s ago that made this one wait):
    - It succeeded for the issuer the token claims in `iss`, or the token claims no configured issuer: the token is rejected as `bad_token`. A flood of random `kid`s therefore stays visible to CrowdSec, also while another issuer's JWKS is down.
    - It failed for that issuer: the answer is retry-later (an outage, no `authresult` line), because a key rotated in while the IdP was unreachable must not look like a forged token.
 
-   The `iss` is read unverified here, only to pick the refresh result. For an array `iss`, any configured issuer in it whose refresh failed makes it an outage.
+   The `iss` is read unverified here, only to pick the refresh result. An `iss` that is not a string (an array is invalid anyway, step 4) counts as no configured issuer.
 2. Algorithm pinned to the key. The algorithm comes from the JWKS key, never from the token header. A key with `alg` is used with exactly that algorithm. A key without `alg` is used with the one algorithm its type implies (ES256 for P-256, ES384 for P-384, RS256 for RSA), or skipped when the issuer sets `infer_key_algorithm = false`. Every key therefore has exactly one algorithm (RFC 8725 §3.1). Either way only the issuer's `allowed_algorithms` count. An RSA key used with another algorithm must say so in its `alg`. Keys are skipped when their algorithm is not allowed, when `kty` is not `EC`/`RSA`, or when they declare a `use` other than `sig` (a missing `use` is accepted). `alg=none` and HS* forgeries fail.
 3. Issuer bound to the key. Each `[[oauth.issuers]]` entry pairs one `issuer` with its `jwks_url`, and each key is accepted only with the `iss` of the issuer whose JWKS published it. A realm-B key cannot sign a token that claims realm A. If several issuers publish the same `kid`, each candidate key is tried against its own issuer.
-4. Required claims: `iss`, `aud`, `exp`. `aud` may be a string or an array and must contain one of the issuer's `audiences`.
+4. Required claims: `iss`, `aud`, `exp`. `iss` must be a string (RFC 7519 §4.1.1); an array is refused. `aud` may be a string or an array and must contain one of the issuer's `audiences`.
 5. Time checks: `exp` is checked, and `nbf` when present. The leeway is `oauth.leeway_secs` (default 60 s), so a token is still accepted up to 60 s after `exp` and up to 60 s before `nbf`.
 6. Issuer rules:
    - Access tokens only, per `token_type`. `keycloak`: the claim `typ` equals `Bearer` (case-insensitive), so ID tokens (`typ=ID`) and tokens without `typ` fail. `rfc9068`: the JWT header `typ` is `at+jwt` or `application/at+jwt`. `any`: no check.
    - `email_verified` must be the JSON boolean `true` when `require_email_verified` is on (default for `identity_claim = "email"`). Missing, `false` or the string `"true"` fail.
-   - With `allowed_clients` set, the `client_claim` (default `azp`) must be one of them.
+   - With `allowed_clients` set, the `client_claim` must be one of them. It defaults to `client_id` for `token_type = "rfc9068"` (RFC 9068 §2.2) and to `azp` otherwise.
 7. Identity: the `identity_claim` (default `email`). It must be a string of at most 254 characters without whitespace or control characters; for `email` also exactly one `@` with non-empty local part and domain. It is forwarded to the backend as the login.
 
 JWKS handling:
 
-- The proxy fetches every JWKS at startup with a 10 s timeout. If any configured JWKS is unreachable, unparsable, or has no usable key, **the proxy refuses to start**.
+- The JWKS of all issuers are fetched in parallel, each with a 10 s timeout, at startup, on every refresh and for an unknown `kid`. One round therefore takes at most one fetch timeout, however many IdPs are down, and so does the wait of a token that needs it.
+- At startup, if any configured JWKS is unreachable, unparsable, or has no usable key, **the proxy refuses to start**.
 - It refreshes all JWKS every `oauth.refresh_secs` (default 300 s). An issuer whose refresh succeeds has its keys fully replaced, which is how key revocation takes effect. An issuer whose refresh fails keeps its previous keys.
+- A key with missing or undecodable members is skipped with a warning (RFC 7517 §5) and counted in `mail_auth_proxy_jwks_keys_skipped_total`; the other keys of the set are used. Only a set without any usable key fails.
 - A signing key published after the last refresh is picked up by the unknown-`kid` refresh (step 1), so it is accepted within seconds. Random `kid`s cannot cause more than one refresh per 30 s.
-- JWKS URLs must use `https://`; plain `http://` is accepted only for `localhost`, `127.0.0.1` and `::1`. A non-2xx status, a redirect, or a body over 256 KiB fails the fetch.
+- JWKS URLs must use `https://`; plain `http://` is accepted only for `localhost`, `127.0.0.1` and `::1`. Only a 2xx response is used: another status, a redirect (never followed), or a body over 256 KiB fails the fetch.
 - TLS for JWKS fetches uses rustls-platform-verifier, that is, the system trust store.
 
 ## Backend TLS
@@ -218,7 +227,7 @@ Limits are checked at `accept()`, before TLS:
 |---|---|---|
 | `limits.max_connections` | 2048 | open client connections across all three listeners |
 | unauthenticated share | `max(max_connections / 2, 1)` | unauthenticated connections across all listeners and all IPs |
-| `limits.max_preauth_per_ip` | 32 | unauthenticated connections per source IP (IPv6: per /64), **shared across IMAP, SMTP and Sieve** |
+| `limits.max_preauth_per_ip` | 32 | unauthenticated connections per source IP (IPv6: per network of `limits.ipv6_source_prefix`, default /64), **shared across IMAP, SMTP and Sieve** |
 
 - A connection over any limit is closed at once, with no protocol greeting, no `421` and no `BYE`. It is counted in `mail_auth_proxy_connections_rejected_total{proto}`.
 - The per-IP slot and the unauthenticated-share slot are released once the backend accepts the credential. An authenticated session counts only against `max_connections`, so many logged-in sessions from one IP (a webmail host, a NAT) do not exhaust the per-IP limit.
@@ -227,7 +236,7 @@ Limits are checked at `accept()`, before TLS:
 
 `[auth_ratelimit]` blocks a source address that presents too many refused credentials. A session takes one credential, so a guesser opens a new connection for each attempt; the per-account throttle covers passwords only, and only per account. The rate limit also covers token guessing, scanners and password spraying over many accounts, without a log-based blocker.
 
-- **Source:** an IPv4 address (also IPv4-mapped), an IPv6 /64, as for `limits.max_preauth_per_ip`.
+- **Source:** an IPv4 address (also IPv4-mapped), or an IPv6 network whose prefix length `limits.ipv6_source_prefix` sets (32 to 64, default 64), as for `limits.max_preauth_per_ip`. One host usually holds a whole /64; with 48, a site that rotates through its /64s stays one source.
 - **Counted:** every refused credential, one per `authresult` line with `result="fail"` and a credential: `bad_token`, `authzid_mismatch`, `blocked_endpoint`, `unknown_domain`, `unknown_account`, `throttled`, `oversize`, `backend_reject`. All reasons count alike, so the attempt that starts a block tells nothing about the account; `throttled` counts for the same reason (it occurs only for accounts that exist).
 - **Not counted:** `protocol` (no credential: a TLS or certificate fault on the proxy's side would otherwise block every client), and every outage: an unavailable backend or account check, or token keys that could not be checked. Outages write no `authresult` line and never block anyone.
 - **Repeats:** a credential identical to one of the source's last 8 failures in the window (same user and same password or token) counts once. A client retrying a stale password or an expired token does not block its address, and repeating a guess gains nothing. The comparison uses a keyed 64-bit fingerprint; the secret is not kept.
@@ -249,11 +258,11 @@ To keep observing attacks on a legacy rule open to public networks, as a honeypo
 | Setting | Default | Applies to |
 |---|---|---|
 | `timeouts.idle_secs` | 30 s | every single `read_line` read (idle), on client and backend |
-| `timeouts.preauth_secs` | 60 s total | from accept to credential: TLS handshake, plaintext dialog, SASL. Activity does not reset it, so drip-feeding does not help. |
+| `timeouts.preauth_secs` | 60 s total | from accept to the backend's verdict: TLS handshake, plaintext dialog, SASL, token validation (with a JWKS refresh), the legacy account check and the backend login. Activity does not reset it, so drip-feeding does not help. |
 | `timeouts.connect_secs` | 10 s | backend TCP connect; backend TLS handshake; writing the PROXY header |
 | `limits.max_preauth_commands` | 8 | commands before a credential (per phase for SMTP and Sieve) |
-| JWKS fetch (fixed) | 10 s | per URL |
-| `oauth.refresh_secs` | 300 s | periodic JWKS refresh, all URLs one after another |
+| JWKS fetch (fixed) | 10 s | per URL; all URLs are fetched in parallel |
+| `oauth.refresh_secs` | 300 s | periodic JWKS refresh of all URLs |
 | `sieve.capability_cache_secs` | 600 s | backend post-TLS capabilities |
 | metrics scrape (fixed) | 10 s, 4 at a time | the whole request head, and the response, each; a fifth connection is closed at accept |
 | backend auth reply (fixed) | at most 32 lines | IMAP `P1` reply; each line within the idle timeout |
@@ -263,6 +272,6 @@ To keep observing attacks on a legacy rule open to public networks, as a honeypo
 | session close (fixed) | 2 s | closing both TLS streams after a session limit |
 | shutdown drain (fixed) | 10 s | after SIGTERM/SIGINT, how long open sessions may continue ([operations: signals](operations.md#signals-and-service-manager)) |
 
-The pre-auth budget does not cover the backend phase (connect, greeting, AUTH verdict); the connect and idle timeouts bound each of its steps.
+The pre-auth budget also covers token validation, the account check and the backend phase (connect, greeting, AUTH verdict); the connect and idle timeouts bound each step within it. A credential whose check or backend login runs out of budget gets the retry-later reply: an outage (`mail_auth_proxy_backend_errors_total`), not a failed login. Only the padding of a refused password may end after the budget.
 
 A timeout closes the connection silently, with no `* BYE` and no `421`.

@@ -312,7 +312,11 @@ impl Validator {
                     // keys in the map (refresh would add the previous keys on
                     // top).
                     let mut staged = HashMap::new();
-                    match Self::merge_jwks_keys(&jwks, policy, self.leeway, &mut staged) {
+                    let merged = Self::merge_jwks_keys(&jwks, policy, self.leeway, &mut staged);
+                    if let Ok(skipped) = merged {
+                        crate::obs::metrics::record_jwks_keys_skipped(issuer, skipped as u64);
+                    }
+                    match merged {
                         // A realm that publishes zero usable keys is treated as
                         // failed: replacing its keys with nothing would lock
                         // that realm's users out until the next refresh.
@@ -1367,6 +1371,37 @@ mod tests {
                 "nk@x"
             );
         }
+    }
+
+    /// Broken keys of a fetched JWKS are counted per issuer, on every fetch,
+    /// while the good key of the set is used.
+    #[tokio::test]
+    async fn skipped_jwks_keys_are_counted_per_issuer() {
+        let issuer = crate::obs::metrics::TEST_ISSUERS[1];
+        crate::obs::metrics::register_issuers(crate::obs::metrics::TEST_ISSUERS);
+        let (_pem, jwks) = test_es256_keypair("kid1");
+        let mut no_y = jwks["keys"][0].clone();
+        no_y["kid"] = json!("broken-1");
+        no_y.as_object_mut().unwrap().remove("y");
+        let rsa_no_e = json!({"kty":"RSA","kid":"broken-2","alg":"RS256","n":"AQAB"});
+        let set = json!({"keys": [no_y, rsa_no_e, jwks["keys"][0].clone()]});
+        let mut p = policy(issuer);
+        p.jwks_url = serve_jwks(set.clone()).await;
+        let v = Validator::from_parts(vec![(set, p)]).unwrap();
+        let skipped = || {
+            let key = format!("mail_auth_proxy_jwks_keys_skipped_total{{issuer=\"{issuer}\"}} ");
+            crate::obs::metrics::render_for_tests()
+                .lines()
+                .find_map(|l| l.strip_prefix(key.as_str()))
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap()
+        };
+        assert_eq!(skipped(), 0);
+        v.refresh().await.unwrap();
+        assert_eq!(skipped(), 2);
+        v.refresh().await.unwrap();
+        assert_eq!(skipped(), 4);
+        assert_eq!(v.snapshot().keys().collect::<Vec<_>>(), ["kid1"]);
     }
 
     fn policy(issuer: &str) -> Policy {

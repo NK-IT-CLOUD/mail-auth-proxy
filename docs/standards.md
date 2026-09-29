@@ -46,15 +46,15 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 | AUTHENTICATE with a `+ ` continuation and base64 responses | MUST | RFC 9051 §6.2.2 | Yes | |
 | AUTHENTICATE without an initial response is supported | MUST | RFC 4959 §3, RFC 9051 §6.2.2 | Yes | |
 | SASL-IR (initial response on the command line) | | RFC 4959 §3 | Yes | |
-| Zero-length initial response sent as `=` | MUST | RFC 4959 §3, RFC 9051 §6.2.2 | Deviation | `=` is rejected as invalid base64. See D-SASL-2. |
+| Zero-length initial response sent as `=` | MUST | RFC 4959 §3, RFC 9051 §6.2.2 | Yes | `=` is the empty response. It holds no credential for the supported mechanisms and gets `NO [AUTHENTICATIONFAILED]`. |
 | Initial response with a mechanism that has none → tagged BAD | MUST | RFC 4959 §3, RFC 9051 §6.2.2 | Deviation | An initial response to LOGIN is taken as the user name. See D-SASL-3. |
-| `*` cancels; invalid base64 → tagged BAD | MUST | RFC 9051 §6.2.2 | Yes | |
+| `*` cancels; invalid base64 → tagged BAD | MUST | RFC 9051 §6.2.2 | Yes | A response that decodes but holds no valid credential gets `NO [AUTHENTICATIONFAILED]` |
 | Unsupported mechanism → tagged NO | SHOULD | RFC 9051 §6.2.2 | Yes | Then the connection closes. See D-GEN-1. |
 | After a failed AUTHENTICATE, the client may retry | MAY (client) | RFC 9051 §6.2.2 | Deviation | One attempt per connection. See D-GEN-1. |
 | LOGIN with astring arguments (atom, quoted, literal) | MUST | RFC 9051 §6.2.3, §9 | Partial | Atoms and quoted strings only; literals get BAD. See D-IMAP-1. |
 | Response codes AUTHENTICATIONFAILED, UNAVAILABLE | | RFC 5530 §3 | Yes | AUTHENTICATIONFAILED for rejected credentials; UNAVAILABLE when the backend is unavailable. A backend `NO` with UNAVAILABLE, INUSE, SERVERBUG or LIMIT is an outage, not a rejection. |
 | ID command answered `* ID NIL` | MUST | RFC 2971 §3.1-3.2 | Yes | |
-| `ID` listed in CAPABILITY | | RFC 2971 §3 | No | See D-IMAP-2 |
+| `ID` listed in CAPABILITY | | RFC 2971 §3 | Yes | |
 | Untagged BAD when the tag cannot be determined | | RFC 9051 §7.1.3 | Yes | |
 | Commands not valid in this state → BAD or NO | | RFC 3501 §3 | Yes (NO) | Then the connection closes |
 | Pre-authentication inactivity timeout may be short | | RFC 9051 §5.4 | Yes | Default 30 s idle, 60 s total. See D-GEN-2. |
@@ -77,14 +77,14 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 | AUTH advertised after TLS | MUST | RFC 6409 §7 | Yes | |
 | `334 ` with an empty challenge when no initial response is given | MUST | RFC 4954 §4 | Yes | |
 | `*` cancels → `501` | MUST | RFC 4954 §4 | Yes | |
-| Undecodable response → `501 5.5.2` | MUST | RFC 4954 §4 | Yes | |
-| `=` as zero-length initial response | MUST | RFC 4954 §4 | Deviation | See D-SASL-2 |
+| Undecodable response → `501 5.5.2` | MUST | RFC 4954 §4 | Yes | A response that decodes but holds no valid credential gets `535 5.7.8` |
+| `=` as zero-length initial response | MUST | RFC 4954 §4 | Yes | It holds no credential for the supported mechanisms and gets `535 5.7.8` |
 | Initial response with a server-first mechanism → `501` | MUST | RFC 4954 §4 | Deviation | LOGIN, see D-SASL-3 |
-| Unsupported mechanism → `504 5.5.4` | | RFC 4954 §4, §6 | Yes | |
+| Unsupported mechanism → `504 5.5.4` | | RFC 4954 §4, §6 | Yes | Also a password mechanism the connection does not offer, before the password is asked for |
 | Invalid credentials → `535 5.7.8`; temporary failure → `454 4.7.0`; success → `235 2.7.0` | SHOULD | RFC 4954 §6 | Yes | |
 | Commands before AUTH → `530 5.7.0` | SHOULD | RFC 4954 §6 | Yes | |
 | Authentication lines up to 12288 octets | | RFC 4954 §4 | Yes | Limit 16384 |
-| Server closes only after QUIT, 421 or a timeout | MUST NOT (otherwise) | RFC 5321 §3.8, §7.8 | Deviation | Closes after a failed or unsupported AUTH. See D-GEN-1. |
+| Server closes only after QUIT, 421 or a timeout | MUST NOT (otherwise) | RFC 5321 §3.8, §7.8 | Yes | After a failed or unsupported AUTH the reply is followed by `421 4.7.0 <domain> closing connection`, then the close. One AUTH per connection, see D-GEN-1. |
 | Unknown commands → `500` | SHOULD | RFC 5321 §4.2.4 | Deviation | `502` (cosmetic) |
 | Server timeout ≥ 5 minutes | SHOULD | RFC 5321 §4.5.3.2.7 | Deviation | Pre-authentication budget. See D-GEN-2. |
 | PIPELINING: responses in order, input not lost | MUST | RFC 2920 §3.2 | Yes | Commands pipelined after AUTH are relayed once authentication succeeds |
@@ -99,21 +99,21 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 |---|---|---|---|---|
 | Capability greeting ending in `OK` | | RFC 5804 §1.7 | Yes | |
 | IMPLEMENTATION and VERSION always returned | MUST | RFC 5804 §1.7 | Yes | Before TLS, IMPLEMENTATION is the configured server name |
-| SIEVE always returned | MUST | RFC 5804 §1.7 | Partial | After TLS always. Before TLS from the last capability probe, so missing until the first probe after startup. D-SIEVE-1. |
+| SIEVE always returned | MUST | RFC 5804 §1.7 | Partial | After TLS always. Before TLS from the last successful capability probe; while none has succeeded, the greeting waits for one. Missing while no probe has succeeded and the current one fails (up to 5 s until the next attempt). D-SIEVE-1. |
 | SASL list empty only if STARTTLS is offered; mechanisms listed must be usable | | RFC 5804 §1.7 | Yes | Empty before TLS; AUTHENTICATE before TLS gets `NO (ENCRYPT-NEEDED)` |
 | STARTTLS; capabilities re-issued after TLS without STARTTLS | MUST | RFC 5804 §2.2 | Yes | The backend's post-TLS capabilities are relayed, with the SASL line rewritten by the legacy rules |
-| AUTHENTICATE, CAPABILITY, STARTTLS, LOGOUT, NOOP valid before authentication; others → NO | MUST | RFC 5804 §2 | Partial | Before TLS, CAPABILITY and NOOP get NO. D-SIEVE-3. |
-| NOOP always OK; TAG response code if a tag is given | MUST | RFC 5804 §2.13 | Partial | No TAG code; NO before TLS |
+| AUTHENTICATE, CAPABILITY, STARTTLS, LOGOUT, NOOP valid before authentication; others → NO | MUST | RFC 5804 §2 | Yes | Before TLS, AUTHENTICATE gets `NO (ENCRYPT-NEEDED)` |
+| NOOP always OK; TAG response code if a tag is given | MUST | RFC 5804 §2.13 | Yes | A malformed argument gets NO |
 | LOGOUT → OK, then close | MUST | RFC 5804 §2.3 (erratum 7825) | Yes | |
-| Initial response as a quoted string or literal `{n+}` | | RFC 5804 §2.1, §4 | Yes | `{n}` is also accepted |
-| Challenge/response as strings (quoted or literal) | MUST | RFC 5804 §2.1 | Deviation | The client's response to the empty challenge must be bare base64. D-SIEVE-2. |
+| Initial response as a quoted string or literal `{n+}` | | RFC 5804 §2.1, §4 | Yes | Only `{n+}` with nothing after the header or the octets; `{n}` is refused |
+| Challenge/response as strings (quoted or literal) | MUST | RFC 5804 §2.1 | Yes | A bare line is also accepted |
 | `"*"` cancels → NO | MUST | RFC 5804 §2.1 | Yes | |
-| Unsupported mechanism → NO | | RFC 5804 §2.1 | Partial | Without an initial response, the NO comes after the empty challenge |
+| Unsupported mechanism → NO | | RFC 5804 §2.1 | Yes | Before any challenge |
 | TRYLATER on temporary failure | | RFC 5804 §1.3 | Yes | |
 | SCRAM-SHA-1 and PLAIN over TLS | MUST | RFC 5804 §2.1 | Partial | PLAIN only where a legacy rule allows it; no SCRAM. D-AUTH-1. |
 | SASL proxy authentication (authzid ≠ authcid) | SHOULD | RFC 5804 §2.1 | No | D-SASL-1 |
 | Pre-authentication timeout may be short | | RFC 5804 §1.2 | Yes | |
-| Quoted strings ≤ 1024 octets | | RFC 5804 §4 (erratum 2655) | Deviation (client role) | The backend login sends the initial response quoted, which can exceed 1024 octets. D-SIEVE-4. |
+| Quoted strings ≤ 1024 octets | | RFC 5804 §4 (erratum 2655) | Yes | Client role: the backend login sends a longer initial response as a literal `{n+}`. Server role: the OAuth error result beyond 1024 octets is sent as a literal. |
 
 ## 5. SASL mechanisms
 
@@ -128,14 +128,15 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 |---|---|---|---|---|
 | PLAIN message `[authzid] NUL authcid NUL passwd` | | RFC 4616 §2 | Yes | |
 | Fields up to 255 octets | MUST | RFC 4616 §2 | Yes | Logins up to 255 bytes, passwords up to 1024 bytes; longer ones are refused like a wrong password |
-| NUL not allowed inside fields | MUST | RFC 4616 §2 | Partial | A NUL inside the password is not rejected |
-| authzid different from authcid | | RFC 4616 §2, RFC 4422 §3.4.1 | Refused | Treated as a malformed response (BAD/501), not NO [AUTHORIZATIONFAILED]/535. D-SASL-1. |
+| NUL not allowed inside fields | MUST | RFC 4616 §2 | Yes | Also refused in SASL LOGIN fields and IMAP `LOGIN` arguments, which reach the backend as PLAIN |
+| authzid different from authcid | | RFC 4616 §2, RFC 4422 §3.4.1 | Refused | A failed authentication (`NO [AUTHENTICATIONFAILED]`, `535`, `NO`) before the gate, logged as `protocol`. D-SASL-1. |
 | LOGIN not advertised where PLAIN and a plaintext login command are prohibited | MUST NOT | draft-murchison-sasl-login §1, §3 | Yes | SMTP offers LOGIN only together with PLAIN. IMAP offers SASL LOGIN only where the LOGIN command is allowed (one setting, `LOGIN`). ManageSieve never offers LOGIN. |
-| OAUTHBEARER GS2 header, `auth=` key/value pairs; unknown keys ignored | MUST | RFC 7628 §3.1 | Partial | The GS2 header's channel-binding flag is not checked. D-SASL-4. |
-| `host`/`port` checked against known values | MUST | RFC 7628 §3.2 | No | Ignored. Tokens are bound by audience instead. D-SASL-4. |
-| JSON error result on failure (`status`, optional `scope` and `openid-configuration`), then the dummy response `%x01` (XOAUTH2: empty) or an abort | | RFC 7628 §3.2.2-3.2.3; XOAUTH2 "Error response" | Partial | For a token that fails validation. `status` is always `invalid_token`, also for XOAUTH2 (Google sends `"401"`). An `authzid_mismatch` or backend rejection fails at once. An empty `auth=` (the discovery query of §4.3) is a malformed response. D-SASL-4. |
+| OAUTHBEARER GS2 header, `auth=` key/value pairs; unknown keys ignored | MUST | RFC 7628 §3.1, RFC 5801 §4 | Yes | The flag must be `n` or `y`; `p=` (channel binding) is refused. In `a=`, `=2C` and `=3D` are decoded; any other `=` is malformed. |
+| `host`/`port` checked against known values | MUST | RFC 7628 §3.2 | Partial | `host` must match the TLS server name (SNI), ASCII case-insensitive, a trailing dot ignored; a mismatch is refused like a rejected token (`bad_token`). Without SNI `host` is not checked, `port` never. D-SASL-4. |
+| JSON error result on failure (`status`, optional `scope` and `openid-configuration`), then the dummy response `%x01` (XOAUTH2: empty) or an abort | | RFC 7628 §3.2.2-3.2.3; XOAUTH2 "Error response" | Yes | For a token that fails validation ([protocols.md](protocols.md#oauth-error-result)). The result is the same for every such token and names the IdP from the configuration, never from the token. `status` is always `invalid_token`, also for XOAUTH2 (Google sends `"401"`). An `authzid_mismatch` or backend rejection fails at once: `status` has no code for a valid token that is refused. |
+| Empty `auth=` asks for the error result | | RFC 7628 §4.3 | Yes | Answered with the same error result, then the failure. Logged as `protocol`; not a failed login, not counted by the rate limit. |
 | Abort after the error result: `*` → tagged BAD / `501` / `NO` | MUST | RFC 9051 §6.2.2, RFC 4954 §4, RFC 5804 §2.1 | Yes | An undecodable answer gets the same reply; any other answer the final failure |
-| Authorisation identity (`a=`, `user=`) | | RFC 4422 §3.4.1, §3.6 | Yes | Must be empty, the token's identity or its local part. D-SASL-1. |
+| Authorisation identity (`a=`, `user=`) | | RFC 4422 §3.4.1, §3.6 | Yes | Must be empty, the token's identity or its local part. Longer than 255 bytes or with control characters it is malformed. D-SASL-1. |
 | Bearer scheme name case-insensitive | | RFC 7628 §4, RFC 9110 §11.1 | Yes | |
 | TLS required for OAUTHBEARER | MUST | RFC 7628 §3 | Yes | Neither offered nor accepted before TLS |
 
@@ -150,18 +151,19 @@ Bearer tokens are validated locally as signed JWTs (JWS compact serialisation) a
 | Only current algorithms | MUST | RFC 8725 §3.2 | Yes | RS256/384/512, PS256/384/512, ES256, ES384; RSA keys ≥ 2048 bits |
 | UTF-8 JSON | MUST | RFC 8725 §3.7 | Yes | |
 | Keys bound to the issuer that published them | MUST | RFC 8725 §3.8 | Yes | A key is valid only for its own issuer's `iss` |
-| `iss` a single string that matches exactly | | RFC 7519 §4.1.1, RFC 9068 §4 | Partial | An array-valued `iss` containing the issuer is accepted. D-JWT-2. |
+| `iss` a single string that matches exactly | | RFC 7519 §4.1.1, RFC 9068 §4 | Yes | An array-valued `iss` is refused |
 | `aud` required and must contain a configured audience | MUST | RFC 8725 §3.9, RFC 9068 §4 | Yes | |
 | `exp` required; `nbf` checked when present; small leeway | MUST / MAY | RFC 7519 §4.1.4-4.1.5, RFC 9068 §4 | Yes | Leeway 60 s by default, at most 300 s |
-| `crit` header understood and processed | MUST | RFC 7515 §4.1.11 | No | Ignored. D-JWT-1. |
+| `crit` header understood and processed | MUST | RFC 7515 §4.1.11 | Yes | The proxy understands no JWS extension, so a token with any `crit` member is refused |
 | `jku`, `x5u`, `jwk` headers not followed | SHOULD | RFC 8725 §3.10 | Yes | |
 | Explicit typing `typ` = `at+jwt` / `application/at+jwt` | MUST | RFC 9068 §4, RFC 8725 §3.11 | Yes (`token_type = "rfc9068"`) | Other modes: an IdP-specific `typ` claim, or no check (warned) |
 | Separate rules for different token kinds | MUST | RFC 8725 §3.12 | Yes (except `token_type = "any"`) | |
+| The client is identified by `client_id` | | RFC 9068 §2.2 | Yes | `allowed_clients` is compared with `client_claim`: by default `client_id` for `token_type = "rfc9068"`, `azp` for the other modes |
 | `email_verified` is boolean `true` when the email is the identity | | OIDC Core §5.1 | Yes | |
 | email not used as a unique identifier across issuers | MUST NOT (RP) | OIDC Core §5.7 | Deviation | The configured identity claim (default `email`) is the mailbox login for all issuers. D-JWT-3. |
 | JWKS `keys` required; unknown members ignored | MUST | RFC 7517 §5 | Yes | |
-| Unusable JWKs ignored | SHOULD | RFC 7517 §5 | Partial | Unknown `kty` and non-`sig` `use` are skipped; a key with missing members fails the whole set. D-JWT-4. |
-| JWKS only over https | | RFC 8725 §3.8 (example) | Yes | http only for loopback; no redirects; 256 KiB cap |
+| Unusable JWKs ignored | SHOULD | RFC 7517 §5 | Yes | Unknown `kty` and non-`sig` `use` are skipped; a key with missing or undecodable members is skipped with a warning and counted in `mail_auth_proxy_jwks_keys_skipped_total` |
+| JWKS only over https | | RFC 8725 §3.8 (example) | Yes | http only for loopback; only a 2xx response is used; no redirects; 256 KiB cap |
 
 ## 7. Backend connections
 
@@ -173,9 +175,9 @@ Bearer tokens are validated locally as signed JWTs (JWS compact serialisation) a
 | EHLO again after XCLIENT's `220` | | XCLIENT_README | Yes | |
 | STARTTLS to the backend, EHLO again after TLS | MUST | RFC 3207 §4.2 | Yes | |
 | SMTP client: no initial response if the AUTH line would exceed the command-line limit | MUST | RFC 4954 §4, RFC 5321 §4.5.3.1.4 | Yes | The response is always sent after `334`. A reply 500-509 (syntax class) to the response is a rejection for a password and an outage for a token. |
-| IMAP client: initial response only if the backend advertises SASL-IR | MUST | RFC 4959 §3 | Deviation | Not checked. D-IMAP-4. |
+| IMAP client: initial response only if the backend advertises SASL-IR | MUST | RFC 4959 §3 | Yes | Taken from the greeting's CAPABILITY code; without SASL-IR the response follows the backend's empty challenge |
 | XOAUTH2 error challenge answered with an empty response (IMAP and SMTP client) | | Google XOAUTH2 "Error response" | Yes | The following `NO` / `5xx` is a rejection |
-| EHLO domain is a resolvable FQDN or an address literal | MUST | RFC 5321 §2.3.5, §4.1.4 | Depends on configuration | The configured server name is used. Its syntax is checked (D-SMTP-4); whether it resolves is not |
+| EHLO domain is a resolvable FQDN or an address literal | MUST | RFC 5321 §2.3.5, §4.1.4 | Depends on configuration | The configured server name is used. Its syntax is checked and a single label gives a warning (D-SMTP-4); whether it resolves is not |
 | TCP keepalive switched on per connection by the application; interval configurable | MUST (of the TCP stack) | RFC 9293 §3.8.4 (MUST-24, MUST-27) | Yes | On for client and backend connections (`session.keepalive_*`, default 600 s / 60 s / 5). The stack's 2-hour default (MUST-28) is for connections the application leaves alone. |
 | One unanswered keepalive probe does not mean a dead connection | MUST | RFC 9293 §3.8.4 (MUST-29) | Yes | `session.keepalive_count` must be at least 2 |
 | Post-login autologout at least 30 minutes | MUST | RFC 9051 §5.4, RFC 5804 §1.2 | Depends on configuration | No autologout by default. `session.idle_limit_secs` and `session.max_session_secs` below 1800 give a warning. |
@@ -208,16 +210,17 @@ Metric names follow the Prometheus naming guidelines: an application prefix (`ma
 | `mail_auth_proxy_tls_cert_expiry_timestamp_seconds` | gauge |
 | `mail_auth_proxy_jwks_last_success_timestamp_seconds{issuer}` | gauge |
 | `mail_auth_proxy_jwks_refresh_failures_total{issuer}` | counter |
+| `mail_auth_proxy_jwks_keys_skipped_total{issuer}` | counter |
 | `mail_auth_proxy_backend_login_duration_seconds{proto,le}` | histogram |
 
 ## Known deviations
 
 ### D-GEN-1: one authentication attempt per connection
 
-- Behaviour: any failed or unsupported authentication, and any command not valid before authentication, is answered and then the connection closes.
+- Behaviour: any failed or unsupported authentication, and any command not valid before authentication, is answered and then the connection closes. In SMTP the reply to a refused AUTH is followed by `421 4.7.0 <hostname> closing connection`.
 - What the specifications say:
   - IMAP (RFC 9051 §6.2.2) and ManageSieve (RFC 5804 §2.1) let the client try another mechanism after NO.
-  - SMTP servers must not close except after QUIT, a 421 reply or a timeout (RFC 5321 §3.8). RFC 5321 §7.8 allows servers to defend against attacks.
+  - SMTP servers must not close except after QUIT, a 421 reply or a timeout (RFC 5321 §3.8); with the 421 the SMTP close conforms. RFC 5321 §7.8 allows servers to defend against attacks.
 - Rationale: this limits online guessing and keeps unauthenticated sessions short. Clients that fall back from one mechanism to another on the same connection must reconnect.
 
 ### D-GEN-2: short pre-authentication timeouts
@@ -245,23 +248,18 @@ Metric names follow the Prometheus naming guidelines: an application prefix (`ma
 ### D-SASL-1: authorisation identity
 
 - For OAuth, the backend login is always the identity claim of the validated token. A client-supplied authorisation identity (`a=` in OAUTHBEARER, `user=` in XOAUTH2) must be empty, equal that identity, or be its local part without a domain (compared ASCII case-insensitively). Any other value fails the exchange with `NO [AUTHORIZATIONFAILED]` (RFC 5530) in IMAP, `535` in SMTP or `NO` in ManageSieve.
-- For PLAIN, an authzid that differs from the authcid is refused as a malformed response (BAD or 501), without an authorisation failure code.
 - Acting as another user (SASL proxy authentication, RFC 5804 §2.1) is not supported.
-
-### D-SASL-2: `=` is not recognised as an empty initial response
-
-RFC 4959 §3, RFC 9051 §6.2.2 and RFC 4954 §4 define `=` as a zero-length initial response. The supported mechanisms never use an empty initial response, so this only changes the error reply: BAD or 501 instead of a failed authentication.
 
 ### D-SASL-3: an initial response to LOGIN is accepted as the user name
 
 The LOGIN mechanism is server-first, so RFC 4954 §4 and RFC 4959 §3 require the command to be rejected. Several widely deployed clients send the user name this way, and asking for it again would make them send the password as the user name.
 
-### D-SASL-4: RFC 7628 and XOAUTH2 error flows
+### D-SASL-4: OAUTHBEARER `host` without SNI, and `port`
 
-- A token that fails validation gets the JSON error result as a challenge, and the failure reply after the client's answer ([protocols.md](protocols.md#oauth-error-result)). The result is the same for every such token and names the IdP from the configuration, never from the token.
-- A valid token with a foreign authorisation identity (`authzid_mismatch`) and a token the backend rejects fail at once, without the error result. RFC 7628 §3.2 leaves the decision whether the authenticated identity may access the resource to the application, not the mechanism, and `status` has no code for a valid token that is refused.
-- An empty `auth=` value, which RFC 7628 §4.3 shows as a way to ask for the needed scope, is a malformed response (BAD or 501), not a failed token.
-- The `host` and `port` keys and the GS2 channel-binding flag (RFC 5801 §4) are not checked. Tokens are bound to the service by their audience.
+- RFC 7628 §3.2 requires the server to check `host` and `port` against the values it knows.
+- `host` is compared with the TLS server name when the client sent SNI. Without SNI (a client that connects by IP address) the proxy does not know which name the client used, so `host` is not compared.
+- `port` is never compared: behind NAT or port forwarding the port the client dialed differs from the one the proxy listens on.
+- Tokens are bound to the service by their audience.
 
 ### D-TLS-1: SNI and ALPN
 
@@ -272,18 +270,10 @@ The LOGIN mechanism is server-first, so RFC 4954 §4 and RFC 4959 §3 require th
 
 Passwords that a client would send as a literal (for example, some with 8-bit characters) cannot be used with the LOGIN command. `AUTHENTICATE PLAIN` works.
 
-### D-IMAP-2: ID is answered but not advertised
-
-RFC 2971 §3 expects clients to send ID only when `ID` is advertised.
-
 ### D-IMAP-3: `IMAP4rev2` is advertised before login regardless of the backend
 
 - After login the backend's real capability list is relayed, which RFC 9051 §6.2.2 allows.
 - A backend without IMAP4rev2 (for example, Dovecot with default settings) will not honour `ENABLE IMAP4rev2`.
-
-### D-IMAP-4: IMAP backend client role
-
-The initial response is sent without checking that the backend advertises SASL-IR.
 
 ### D-SMTP-1: no implicit TLS for submission (465)
 
@@ -299,39 +289,17 @@ The extensions advertised after STARTTLS come from configuration, not from the b
 
 ### D-SMTP-4: server name
 
-The configured server name is used in greetings and in the backend EHLO. It must be a resolvable FQDN (RFC 5321 §4.1.4). The configuration accepts only the `Domain` syntax (RFC 5321 §4.1.2): address literals are refused because the proxy also sends the name in its EHLO reply, whose grammar (`ehlo-ok-rsp`, §4.1.1.1) takes a Domain only. The single-label default `mail-auth-proxy` passes the syntax check but is not an FQDN.
+The configured server name is used in greetings and in the backend EHLO. It must be a resolvable FQDN (RFC 5321 §4.1.4). The configuration accepts only the `Domain` syntax (RFC 5321 §4.1.2): address literals are refused because the proxy also sends the name in its EHLO reply, whose grammar (`ehlo-ok-rsp`, §4.1.1.1) takes a Domain only. A single-label name, such as the default `mail-auth-proxy`, passes the syntax check but is not an FQDN; `--check-config` and the startup log warn about it.
 
-### D-SIEVE-1: SIEVE in the pre-TLS greeting
+### D-SIEVE-1: SIEVE missing from the pre-TLS greeting while the backend is down
 
-The greeting takes the backend's `"SIEVE"` line from the capability cache without opening a backend connection for an unencrypted client. Until the first capability probe after startup the line is missing, which RFC 5804 §1.7 does not allow.
-
-### D-SIEVE-2: response to an empty challenge must be bare base64
-
-A response sent as a quoted string or literal, as RFC 5804 §2.1 prescribes, is rejected. Clients that send the initial response on the AUTHENTICATE line are not affected.
-
-### D-SIEVE-3: CAPABILITY and NOOP before TLS get NO
-
-NOOP also ignores its tag argument (RFC 5804 §2, §2.13).
-
-### D-SIEVE-4: long quoted strings
-
-The backend login sends the initial response as a quoted string. RFC 5804 §4 limits quoted strings to 1024 octets; longer values should be sent as `{n+}` literals.
-
-### D-JWT-1: `crit` is ignored
-
-The `crit` header is not processed (RFC 7515 §4.1.11).
-
-### D-JWT-2: array-valued `iss` is accepted
-
-An `iss` array is accepted if it contains the issuer (RFC 7519 §4.1.1).
+- Behaviour: the plaintext greeting takes the backend's `"SIEVE"` line from the last successful capability probe. While no probe has succeeded since startup, the greeting waits for one; if that probe fails, the greeting goes out without the line. After a failed probe the next attempt waits 5 s, and greetings in that time also lack it. Once a probe has succeeded, its line is used whatever its age.
+- What the specification says: SIEVE MUST be returned in every capability response (RFC 5804 §1.7).
+- Rationale: the line only goes missing while the backend cannot be reached, and then a login fails anyway with `NO (TRYLATER)`. Inventing a SIEVE list would show the client extensions the backend may not have; holding the greeting until the backend returns would tie up pre-auth slots for the whole outage.
 
 ### D-JWT-3: identity namespace across issuers
 
 With more than one issuer configured, a given identity-claim value maps to the same backend login regardless of issuer. Every configured issuer is trusted for every identity (compare OIDC Core §5.7).
-
-### D-JWT-4: one malformed JWK makes the whole JWK set fail to load
-
-At startup the proxy then refuses to start; on refresh the issuer keeps its previous keys (RFC 7517 §5).
 
 ## References
 
@@ -349,7 +317,7 @@ At startup the proxy then refuses to start; on refresh the issuer keeps its prev
 - RFC 5321 SMTP: https://www.rfc-editor.org/rfc/rfc5321.html#section-3.8 , #section-4.2.4 , #section-4.5.3.1.4 , #section-4.5.3.2.7
 - RFC 5530 IMAP Response Codes: https://www.rfc-editor.org/rfc/rfc5530.html#section-3
 - RFC 5801 GS2: https://www.rfc-editor.org/rfc/rfc5801.html#section-4
-- RFC 5804 ManageSieve: https://www.rfc-editor.org/rfc/rfc5804.html#section-1.2 , #section-1.7 , #section-2.1 , #section-2.2 , #section-4 (errata 2655, 7825)
+- RFC 5804 ManageSieve: https://www.rfc-editor.org/rfc/rfc5804.html#section-1.2 , #section-1.7 , #section-2.1 , #section-2.2 , #section-2.13 , #section-4 (errata 2655, 7825)
 - RFC 6066 TLS Extensions (SNI): https://www.rfc-editor.org/rfc/rfc6066.html#section-3
 - RFC 6409 Message Submission: https://www.rfc-editor.org/rfc/rfc6409.html#section-7
 - RFC 7301 ALPN: https://www.rfc-editor.org/rfc/rfc7301.html#section-3.2
@@ -362,7 +330,7 @@ At startup the proxy then refuses to start; on refresh the issuer keeps its prev
 - RFC 8446 TLS 1.3: https://www.rfc-editor.org/rfc/rfc8446.html
 - RFC 8725 JWT BCP: https://www.rfc-editor.org/rfc/rfc8725.html#section-3
 - RFC 9051 IMAP4rev2: https://www.rfc-editor.org/rfc/rfc9051.html#section-6.1.1 , #section-6.2.2 , #section-6.2.3 , #section-5.4 , #section-3.4 , #section-6.3.13
-- RFC 9068 JWT Access Tokens: https://www.rfc-editor.org/rfc/rfc9068.html#section-4
+- RFC 9068 JWT Access Tokens: https://www.rfc-editor.org/rfc/rfc9068.html#section-2.2 , #section-4
 - RFC 9110 HTTP Semantics (auth-scheme): https://www.rfc-editor.org/rfc/rfc9110.html#section-11.1
 - RFC 9293 TCP: https://www.rfc-editor.org/rfc/rfc9293.html#section-3.8.4
 - RFC 9325 TLS BCP: https://www.rfc-editor.org/rfc/rfc9325.html#section-3

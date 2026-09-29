@@ -42,13 +42,14 @@ relays bytes. It never holds a master password or any other credential of its ow
 | Forged or foreign tokens (`alg=none`, HS*, key confusion, a key of one realm signing for another, ID tokens, expired tokens) | local validation: algorithm from the key, key bound to its issuer, required `iss`/`aud`/`exp`, access-token marker, `email_verified` |
 | A valid token used for another mailbox | the backend login is the token's identity claim; a different SASL user name is refused |
 | Password guessing and spraying from the internet | no password mechanism unless a legacy rule matches the source network; per-account throttle; a failed-login rate limit per source address; `authresult` lines with keyed password fingerprints for log-based blocking |
-| Token guessing and scanning with new connections per attempt | a failed-login rate limit per source address (IPv4 address, IPv6 /64) that closes a blocked source's connections at accept |
+| Token guessing and scanning with new connections per attempt | a failed-login rate limit per source address (IPv4 address; IPv6 network of `limits.ipv6_source_prefix`, by default /64) that closes a blocked source's connections at accept |
 | Account and domain enumeration | refusals and wrong passwords get the same reply and similar timing (see [Hardening](#hardening)) |
 | Resource exhaustion before login | connection caps, per-IP cap on unauthenticated connections, one pre-authentication time budget, command, line, literal, token and password size limits |
 | STARTTLS command injection | nothing is read ahead of the TLS switch, so plaintext pipelined after `STARTTLS` cannot reach the encrypted session |
 | Log injection | client text escaped or reduced to a fixed character set in every log field |
 | A rogue or intercepted backend | backend TLS always verified; no option to disable it |
 | An authenticated SMTP client sending its own `XCLIENT` to impersonate another user | the proxy never relays into a session in which the backend still offers `XCLIENT`. A backend that advertises it while `submission.xclient = false`, or still advertises it after the proxy's own `XCLIENT` with `submission.xclient = true` (the client's address is itself authorized), is treated as misconfigured, and the login fails as an outage |
+| A logged-in client returning to the unauthenticated state (`UNAUTHENTICATE`, RFC 8437) to try passwords directly at the backend | the proxy never relays into such a session: a backend that offers `UNAUTHENTICATE` gets no login (an outage), and the capability is not passed to clients |
 | Bans of legitimate users during an outage | outages are answered with retry-later and never logged as failed logins |
 | One issuer asserting identities that belong to another | **not mitigated:** all configured issuers share one identity namespace, so an account name valid at issuer A can be asserted by issuer B. Configure only issuers you trust for all your domains ([D-JWT-3](docs/standards.md#d-jwt-3-identity-namespace-across-issuers)) |
 
@@ -92,7 +93,9 @@ relays bytes. It never holds a master password or any other credential of its ow
 
 - Pre-authentication limits: a global connection cap (at most half unauthenticated), a
   per-source-IP cap on unauthenticated connections, one total time budget from accept to
-  credential, a command limit, line and literal size limits.
+  the backend's verdict (token validation, account check and backend login included; a
+  slow IdP or backend holds a slot no longer, and running out is an outage), a command
+  limit, line and literal size limits.
 - Failed-login rate limit (on by default): a source with too many refused credentials is
   closed at accept, before TLS, for a growing time. Every refusal reason counts alike and
   refusal timing is unchanged, so a block does not reveal whether an account exists;
@@ -139,14 +142,21 @@ relays bytes. It never holds a master password or any other credential of its ow
   folds logins to lower case, so differently-cased logins share one counter.
 - **Backend validation.** The backend (e.g. Dovecot `oauth2` passdb) must validate tokens
   itself. The proxy's check is a filter in front of it and does not replace it.
+- **No `UNAUTHENTICATE` at the backend.** The IMAP and ManageSieve backends must not offer
+  `UNAUTHENTICATE` (RFC 8437, RFC 5804 §2.14.1). After login the proxy relays bytes
+  blindly, so a client could leave its login and try passwords for any account past the
+  password gate and the rate limit. While a backend offers it, every login there is an
+  outage (retry-later, counted in `mail_auth_proxy_backend_errors_total`), with a
+  journal line that names the capability.
 - **Audiences.** Give the mail audience only to mail clients. Any token with an accepted
   audience, issuer and identity opens that mailbox.
 - **`token_type = "any"`** also accepts ID tokens that carry an accepted audience; use it
   only for IdPs that mark access tokens neither way.
 - **Metrics** have no authentication; bind them to loopback or a management network.
 - **Shared source addresses.** The failed-login rate limit counts per address (IPv6 per
-  /64). Everyone behind one NAT, webmail server or IPv6 /64 shares that count, so one
-  guesser there can block the others. Put such relays you trust into
+  network of `limits.ipv6_source_prefix`, by default /64). Everyone behind one NAT,
+  webmail server or IPv6 network shares that count, so one guesser there can block the
+  others; a shorter prefix such as 48 widens that group. Put such relays you trust into
   `auth_ratelimit.exempt_networks`; the default exempts only loopback.
 - **Session lifetime.** A revoked token, or an account locked in the directory or the
   IdP, does not end an open session: the credential is checked once, at login. Set

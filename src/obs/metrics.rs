@@ -148,11 +148,11 @@ pub fn record_legacy_list_error(list: &str) {
 // Accounts whose live throttle window was dropped because the table was full.
 static THROTTLE_EVICTIONS: AtomicU64 = AtomicU64::new(0);
 
-/// Record that the full throttle table dropped an account whose failure
-/// window was still running (its count starts over).
+/// Record that the full throttle table dropped `n` accounts whose failure
+/// windows were still running (their counts start over).
 #[inline]
-pub fn record_throttle_eviction() {
-    THROTTLE_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+pub fn record_throttle_evictions(n: u64) {
+    THROTTLE_EVICTIONS.fetch_add(n, Ordering::Relaxed);
 }
 
 // ratelimit_blocks[proto]: connections closed at accept because their
@@ -353,6 +353,8 @@ struct IssuerStats {
     last_success: AtomicU64,
     /// Fetches that failed or produced no usable key.
     failures: AtomicU64,
+    /// Keys skipped because a member was missing or undecodable.
+    keys_skipped: AtomicU64,
 }
 
 // The configured issuers, set once at startup; the label set is fixed then.
@@ -368,10 +370,20 @@ pub fn register_issuers<'a>(issuers: impl IntoIterator<Item = &'a str>) {
                 issuer: i.to_string(),
                 last_success: AtomicU64::new(0),
                 failures: AtomicU64::new(0),
+                keys_skipped: AtomicU64::new(0),
             })
             .collect(),
     );
 }
+
+/// The issuers every unit test registers: only the first registration in the
+/// test process counts, so all tests must pass the same list.
+#[cfg(test)]
+pub const TEST_ISSUERS: [&str; 2] = [
+    // Needs escaping in the label value.
+    "https://idp.test/\"realm\"\\x",
+    "https://idp.test/realms/skipped-keys",
+];
 
 /// Record one JWKS fetch of `issuer`: `ok` when it produced usable keys.
 /// An issuer that was not registered is ignored.
@@ -386,6 +398,17 @@ pub fn record_jwks_fetch(issuer: &str, ok: bool) {
         s.last_success.store(unix_now(), Ordering::Relaxed);
     } else {
         s.failures.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record `n` keys of `issuer`'s JWKS that were skipped because a member was
+/// missing or undecodable. An issuer that was not registered is ignored.
+pub fn record_jwks_keys_skipped(issuer: &str, n: u64) {
+    if let Some(s) = ISSUERS
+        .get()
+        .and_then(|v| v.iter().find(|s| s.issuer == issuer))
+    {
+        s.keys_skipped.fetch_add(n, Ordering::Relaxed);
     }
 }
 
@@ -553,7 +576,7 @@ fn render() -> String {
         "mail_auth_proxy_ratelimit_bans_total {}\n",
         RATELIMIT_BANS.load(Ordering::Relaxed)
     ));
-    o.push_str("# HELP mail_auth_proxy_ratelimit_active_blocks Sources blocked now (updated every few seconds).\n");
+    o.push_str("# HELP mail_auth_proxy_ratelimit_active_blocks Sources blocked now (updated every 10 s and when a block starts).\n");
     o.push_str("# TYPE mail_auth_proxy_ratelimit_active_blocks gauge\n");
     o.push_str(&format!(
         "mail_auth_proxy_ratelimit_active_blocks {}\n",
@@ -622,6 +645,15 @@ fn render() -> String {
             "mail_auth_proxy_jwks_refresh_failures_total{{issuer=\"{}\"}} {}\n",
             escape_label(&s.issuer),
             s.failures.load(Ordering::Relaxed)
+        ));
+    }
+    o.push_str("# HELP mail_auth_proxy_jwks_keys_skipped_total JWKS keys skipped because a member was missing or undecodable; the other keys are used.\n");
+    o.push_str("# TYPE mail_auth_proxy_jwks_keys_skipped_total counter\n");
+    for s in issuers {
+        o.push_str(&format!(
+            "mail_auth_proxy_jwks_keys_skipped_total{{issuer=\"{}\"}} {}\n",
+            escape_label(&s.issuer),
+            s.keys_skipped.load(Ordering::Relaxed)
         ));
     }
 
@@ -912,13 +944,18 @@ mod tests {
     #[test]
     fn exposition_is_well_formed() {
         // An issuer label that needs escaping (the only free-text label).
-        let issuer = "https://idp.test/\"realm\"\\x";
-        register_issuers([issuer]);
+        let issuer = TEST_ISSUERS[0];
+        register_issuers(TEST_ISSUERS);
         record_jwks_fetch(issuer, false);
         record_jwks_fetch("https://unregistered.test", false);
+        record_jwks_keys_skipped("https://unregistered.test", 1);
         let out = render();
         assert!(out.contains(
             "mail_auth_proxy_jwks_refresh_failures_total{issuer=\"https://idp.test/\\\"realm\\\"\\\\x\"} 1\n"
+        ));
+        // Every issuer is exported from the start, skipped keys or not.
+        assert!(out.contains(
+            "mail_auth_proxy_jwks_keys_skipped_total{issuer=\"https://idp.test/\\\"realm\\\"\\\\x\"} 0\n"
         ));
         assert!(!out.contains("unregistered"));
         assert!(out.ends_with('\n'));

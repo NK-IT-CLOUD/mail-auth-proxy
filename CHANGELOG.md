@@ -10,6 +10,9 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `limits.ipv6_source_prefix` (default 64, 32-64): the prefix length by which IPv6
   sources are grouped for `max_preauth_per_ip` and the auth rate limit; 48 treats a
   whole site as one source.
+- Metric `mail_auth_proxy_jwks_keys_skipped_total` by `issuer`: JWKS keys skipped because
+  a member was missing or undecodable, counted on every fetch. Such a key was visible
+  only as a journal warning.
 
 ### Changed
 - A `server.hostname` that is a single label, the default `mail-auth-proxy` included,
@@ -22,6 +25,8 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `domains_file`, `doveadm_key_file`, `doveadm_ca_file`, `users_file`) are a validation
   error: they resolved against the working directory, so `--check-config` in a shell
   could pass on files the service never reads. Use absolute paths.
+- The HELP text of `mail_auth_proxy_ratelimit_active_blocks` names the update interval:
+  every 10 s and when a block starts.
 
 ### Fixed
 - A token whose JWS header has a `crit` parameter is refused: the proxy understands no

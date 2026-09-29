@@ -9,8 +9,8 @@ What the proxy sends and accepts on each protocol before authentication, how it 
 On connect, the proxy completes the TLS handshake (inside the pre-auth budget) and then sends a greeting:
 
 ```
-* OK [CAPABILITY IMAP4rev1 IMAP4rev2 SASL-IR LOGINDISABLED AUTH=XOAUTH2 AUTH=OAUTHBEARER] <hostname> ready
-* OK [CAPABILITY IMAP4rev1 IMAP4rev2 SASL-IR AUTH=XOAUTH2 AUTH=OAUTHBEARER AUTH=PLAIN AUTH=LOGIN] <hostname> ready   (PLAIN and LOGIN offered by a legacy rule)
+* OK [CAPABILITY IMAP4rev1 IMAP4rev2 SASL-IR ID LOGINDISABLED AUTH=XOAUTH2 AUTH=OAUTHBEARER] <hostname> ready
+* OK [CAPABILITY IMAP4rev1 IMAP4rev2 SASL-IR ID AUTH=XOAUTH2 AUTH=OAUTHBEARER AUTH=PLAIN AUTH=LOGIN] <hostname> ready   (PLAIN and LOGIN offered by a legacy rule)
 ```
 
 A line is split as `<tag> SP <command> [SP <rest>]`. Commands are case-insensitive, and the tag is any non-empty token.
@@ -22,7 +22,7 @@ A line is split as `<tag> SP <command> [SP <rest>]`. Commands are case-insensiti
 | `t ID …` | `* ID NIL` + `t OK ID completed` | stays open |
 | `t LOGOUT` | `* BYE <hostname> signing off` + `t OK LOGOUT completed` | closed; no authlog line |
 | `t LOGIN <user> <pass>` (atom or quoted string with `\"` `\\` escapes) | goes to the credential phase | |
-| `t LOGIN` with a literal `{n}` or bad quoting | `t BAD LOGIN arguments` | closed |
+| `t LOGIN` with a literal `{n}`, bad quoting or a NUL | `t BAD LOGIN arguments` | closed |
 | `t LOGIN "" x` | `t NO LOGIN empty field` | closed |
 | `t AUTHENTICATE <mech> [<ir>]` with a supported mech | SASL exchange, [below](#imap-sasl-exchange) | |
 | `t AUTHENTICATE` (no mech) | `t BAD AUTHENTICATE needs a mechanism` | closed |
@@ -37,22 +37,29 @@ A client that reads the greeting and disconnects before its first command (a hea
 
 ### IMAP: SASL exchange
 
-- Initial response: the SASL-IR on the command line is used if it is non-empty. Otherwise the proxy sends `+ ` (plus and a space) and reads one line. An IR of `=` is not read as "empty initial response" (RFC 4959); it is base64-decoded, which fails.
+- Initial response: the SASL-IR on the command line is used if there is one; `=` is the empty response (RFC 4959 §3). Otherwise the proxy sends `+ ` (plus and a space) and reads one line.
 - LOGIN: `+ VXNlcm5hbWU6`, then `+ UGFzc3dvcmQ6`. Each answer is base64. An IR on the command line is the username, and only the password prompt follows.
-- Cancel: a line that is only `*` cancels. Any decoding or parse error also ends the exchange. Both are answered with `t BAD AUTHENTICATE failed: invalid or cancelled response`, and the connection closes.
+- PLAIN or LOGIN on a connection that does not offer it: the password is never asked for. Without an initial response (for LOGIN: after decoding the username from it) the answer is at once `t NO password authentication not available on this endpoint` ([below](#imap-decision-and-backend-login)).
+- Cancel: a line that is only `*` cancels. It and a response that is not base64 get `t BAD AUTHENTICATE failed: invalid or cancelled response` (RFC 9051 §6.2.2).
+- A response that decodes but holds no valid credential gets `t NO [AUTHENTICATIONFAILED] Authentication failed`: a PLAIN message without two NULs, with a NUL in the password or an authzid other than the login, a NUL in a LOGIN field, an OAuth response without `auth=Bearer <token>`, a malformed OAUTHBEARER GS2 header (the flag must be `n` or `y`, `p=` is refused), a malformed `host`, or a SASL user over 255 bytes or with control characters. Such a response carries no usable credential: the `authresult` line is `protocol`.
+- An OAuth response with an empty `auth` value (`auth=`, or `Bearer` without a token) is a discovery request (RFC 7628 §4.3): it gets the [OAuth error result](#oauth-error-result) like a rejected token, and its `authresult` line is `protocol` with the mechanism and the SASL user. It is not a failed login and does not count in the rate limit.
+
+Each of these ends the connection.
 
 ### IMAP: decision and backend login
 
 | Situation | Client sees | authlog `reason` |
 |---|---|---|
-| password with a mechanism the connection does not offer | `t NO password authentication not available on this endpoint` | `blocked_endpoint` (with `pwfp`) |
+| password with a mechanism the connection does not offer | `t NO password authentication not available on this endpoint` | `blocked_endpoint`: with `pwfp` when the password was sent (the `LOGIN` command, a PLAIN initial response), otherwise without |
 | password refused by the legacy gate (user not allowed, unknown domain or account, throttled, password over 1024 bytes) | `t NO [AUTHENTICATIONFAILED] backend rejected credentials`, after `failure_delay_ms` (see below) | `blocked_endpoint`, `unknown_domain`, `unknown_account`, `throttled`, `oversize` (with `pwfp`) |
 | account check unavailable | `t NO [UNAVAILABLE] Backend temporarily unavailable` | none (counted in `mail_auth_proxy_backend_errors_total`) |
-| OAuth token fails validation | `+ <error result>`; after the client's answer `t NO [AUTHENTICATIONFAILED] Authentication failed`, or `t BAD AUTHENTICATE failed: invalid or cancelled response` for `*` and undecodable answers ([OAuth error result](#oauth-error-result)) | `bad_token` |
+| OAuth token fails validation, or an OAUTHBEARER `host` that is not the SNI name | `+ <error result>`; after the client's answer `t NO [AUTHENTICATIONFAILED] Authentication failed`, or `t BAD AUTHENTICATE failed: invalid or cancelled response` for `*` and undecodable answers ([OAuth error result](#oauth-error-result)) | `bad_token` |
+| the pre-auth budget runs out during token validation, the account check or the backend login | `t NO [UNAVAILABLE] Backend temporarily unavailable` | none (counted in `mail_auth_proxy_backend_errors_total`) |
 | OAuth token valid, but `user=` / `a=` names another identity | `t NO [AUTHORIZATIONFAILED] Authorization failed` | `authzid_mismatch` |
 | OAuth valid, backend answers `NO` (after its XOAUTH2 error challenge) | `t NO [AUTHENTICATIONFAILED] backend rejected token` | `backend_reject` |
 | password, backend answers `NO` | `t NO [AUTHENTICATIONFAILED] backend rejected credentials`, after `failure_delay_ms` | `backend_reject` (with `pwfp`) |
 | backend unreachable, TLS or greeting failure, or the backend answers `NO` with a temporary RFC 5530 code (`[UNAVAILABLE]`, e.g. its passdb is down; `[INUSE]`, `[SERVERBUG]`, `[LIMIT]`) or `BAD` | `t NO [UNAVAILABLE] Backend temporarily unavailable` | none (counted in `mail_auth_proxy_backend_errors_total`) |
+| backend offers `UNAUTHENTICATE` (RFC 8437) in its greeting or after the login | `t NO [UNAVAILABLE] Backend temporarily unavailable`; the journal names the capability | none (counted in `mail_auth_proxy_backend_errors_total`) |
 | success | `t ` + the backend's own tagged reply text, e.g. `t OK [CAPABILITY IMAP4rev1 IDLE MOVE] Logged in` | `ok` |
 
 Every failure closes the connection; there is one authentication attempt per connection.
@@ -62,8 +69,8 @@ Backend login steps:
 1. TCP connect.
 2. PROXY v2 header (optional).
 3. TLS handshake, verified.
-4. Read the greeting; it must start with `* OK`.
-5. Send `P1 AUTHENTICATE XOAUTH2 <ir>` or `P1 AUTHENTICATE PLAIN <ir>`.
+4. Read the greeting; it must start with `* OK`. Its `[CAPABILITY …]` code decides the next step; a greeting that lists `UNAUTHENTICATE` ends the login as an outage before the credential is sent.
+5. With `SASL-IR` in the greeting: `P1 AUTHENTICATE XOAUTH2 <ir>` or `P1 AUTHENTICATE PLAIN <ir>`. Without it (or without a capability code): `P1 AUTHENTICATE XOAUTH2` or `P1 AUTHENTICATE PLAIN`, and the response on its own line after the backend's `+` (RFC 4959 §3); any other reply to the bare command is an outage.
 6. Read up to 32 lines:
    - `P1 OK…` means success; its text is relayed.
    - `P1 NO` means rejection, except with `[UNAVAILABLE]`, `[INUSE]`, `[SERVERBUG]` or `[LIMIT]`, which mean an outage.
@@ -71,6 +78,9 @@ Backend login steps:
    - An untagged `* BYE` (e.g. Dovecot's connection limit, shutdown) is an outage.
    - For XOAUTH2, the first `+` continuation is the error challenge (`+ <base64 JSON>`) and is answered with an empty line, after which the backend sends its tagged `NO`. Any other continuation is answered with `*` (cancel).
    - Untagged backend lines before the tagged reply are discarded.
+7. After `P1 OK`: the capabilities from its `[CAPABILITY …]` code or, without one, from a `P2 CAPABILITY` the proxy sends itself (the client never sees it). `UNAUTHENTICATE` among them is an outage: the logged-in client could otherwise return to the unauthenticated state and try passwords directly at the backend.
+
+Every step runs within the pre-auth budget (`timeouts.preauth_secs`, from the accept); running out is an outage.
 
 ### IMAP: sequence
 
@@ -139,11 +149,17 @@ The banner is `220 <hostname> ESMTP`.
 | `EHLO` | `250-<hostname>`, one `250-` line per `submission.ehlo_extensions` entry (default PIPELINING, ENHANCEDSTATUSCODES, 8BITMIME, DSN, SMTPUTF8, CHUNKING), `250 AUTH XOAUTH2 OAUTHBEARER[ PLAIN LOGIN]` |
 | `NOOP`, `RSET`, `QUIT`, other | as before TLS (`STARTTLS` now gets `502`) |
 | after the 8th command (sent unprompted) | `421 4.7.0 Too many commands before AUTH` (closed) |
-| `AUTH` without mech | `501 5.5.4 Syntax: AUTH mechanism [initial-response]` (closed) |
-| `AUTH <other mech>` | `504 5.5.4 Unrecognized authentication type` (closed) |
+| `AUTH` without mech | `501 5.5.4 Syntax: AUTH mechanism [initial-response]` |
+| `AUTH <other mech>` | `504 5.5.4 Unrecognized authentication type` |
+| `AUTH PLAIN` or `AUTH LOGIN` where the connection does not offer it | `504 5.5.4 password authentication not available on this endpoint`, without asking for the password (`AUTH LOGIN <b64user>`: after decoding the username) |
 | `AUTH <mech>` without IR | `334 ` (with a trailing space), then one response line |
+| `AUTH <mech> =` | the empty response (RFC 4954 §4) |
 | `AUTH LOGIN` | `334 VXNlcm5hbWU6`, `334 UGFzc3dvcmQ6`. With an IR (`AUTH LOGIN <b64user>`) only `334 UGFzc3dvcmQ6` follows. |
-| `*` cancel, bad base64, bad SASL, `AUTH PLAIN =` | `501 5.5.2 Invalid or cancelled authentication response` (closed) |
+| `*` cancel, a response that is not base64 | `501 5.5.2 Invalid or cancelled authentication response` |
+| a response that decodes but holds no valid credential (the cases listed for [IMAP](#imap-sasl-exchange), `AUTH PLAIN =` included) | `535 5.7.8 Authentication credentials invalid` |
+| an OAuth response with an empty `auth` value (discovery, RFC 7628 §4.3) | `334 <error result>`, then after the client's answer `535 5.7.8 …` or, for `*` and undecodable answers, `501 5.5.2 …` ([OAuth error result](#oauth-error-result)); `authresult` `protocol`, not a failed login |
+
+Every reply to an AUTH that does not succeed, here and in the [decision table](#smtp-decision-and-backend-login), is followed by `421 4.7.0 <hostname> closing connection`, and the connection closes (RFC 5321 §3.8): the proxy takes one AUTH per connection.
 
 The EHLO extension list is static: it does not come from the backend, and `SIZE` is left out. The client keeps this view for the whole session, because it does not send EHLO again after AUTH.
 
@@ -151,10 +167,11 @@ The EHLO extension list is static: it does not come from the backend, and `SIZE`
 
 | Situation | Client sees | authlog `reason` |
 |---|---|---|
-| password with a mechanism the connection does not offer | `504 5.5.4 password authentication not available on this endpoint` | `blocked_endpoint` |
+| password with a mechanism the connection does not offer | `504 5.5.4 password authentication not available on this endpoint` | `blocked_endpoint`: with `pwfp` when a PLAIN initial response carried the password, otherwise without |
 | password refused by the legacy gate (including a password over 1024 bytes) | `535 5.7.8 Authentication credentials invalid`, after `failure_delay_ms` (see below) | `blocked_endpoint`, `unknown_domain`, `unknown_account`, `throttled`, `oversize` |
 | account check unavailable | `454 4.7.0 Temporary authentication failure` | none (counted in `mail_auth_proxy_backend_errors_total`) |
-| token invalid | `334 <error result>`; after the client's answer `535 5.7.8 Authentication credentials invalid`, or `501 5.5.2 Invalid or cancelled authentication response` for `*` and undecodable answers ([OAuth error result](#oauth-error-result)) | `bad_token` |
+| token invalid, or an OAUTHBEARER `host` that is not the SNI name | `334 <error result>`; after the client's answer `535 5.7.8 Authentication credentials invalid`, or `501 5.5.2 Invalid or cancelled authentication response` for `*` and undecodable answers ([OAuth error result](#oauth-error-result)) | `bad_token` |
+| the pre-auth budget runs out during token validation, the account check or the backend login | `454 4.7.0 Temporary authentication failure` | none (counted in `mail_auth_proxy_backend_errors_total`) |
 | token valid, but `user=` / `a=` names another identity | `535 5.7.8 Authentication credentials invalid` | `authzid_mismatch` |
 | backend connect, greeting, EHLO, STARTTLS, TLS or XCLIENT fails | `454 4.7.0 Temporary authentication failure` | none (counted in `mail_auth_proxy_backend_errors_total`) |
 | backend advertises `XCLIENT` but `submission.xclient = false`, or still advertises it after the proxy's `XCLIENT` (misconfiguration, no credential is sent) | `454 4.7.0 Temporary authentication failure` | none (counted in `mail_auth_proxy_backend_errors_total`) |
@@ -164,7 +181,7 @@ The EHLO extension list is static: it does not come from the backend, and `SIZE`
 | backend AUTH reply 510 to 599 (e.g. `535`) | `535 5.7.8 Authentication credentials invalid` (password: after `failure_delay_ms`) | `backend_reject` |
 | backend `235` | `235 2.7.0 Authentication successful`, then relay | `ok` |
 
-Every failure closes the connection. Backend login steps:
+Every failure is followed by `421 4.7.0 <hostname> closing connection`, and the connection closes. Backend login steps, all within the pre-auth budget:
 
 1. Connect; expect `220`.
 2. `EHLO <hostname>`; expect `250` and `STARTTLS` among the extensions.
@@ -198,7 +215,7 @@ sequenceDiagram
     opt invalid
         P-->>C: 334 base64(error result)
         C->>P: empty line (XOAUTH2) / AQ== (OAUTHBEARER) / *
-        P-->>C: 535 5.7.8 Authentication credentials invalid (501 for *) (close)
+        P-->>C: 535 5.7.8 Authentication credentials invalid (501 for *) + 421 (close)
     end
     P->>B: TCP connect
     B-->>P: 220
@@ -214,9 +231,9 @@ sequenceDiagram
         P-->>C: 235 2.7.0 Authentication successful
         C-->>B: byte relay
     else other code
-        P-->>C: 535 5.7.8 … (close)
+        P-->>C: 535 5.7.8 … + 421 (close)
     else backend unreachable / TLS failure
-        P-->>C: 454 4.7.0 Temporary authentication failure (close)
+        P-->>C: 454 4.7.0 Temporary authentication failure + 421 (close)
     end
 ```
 
@@ -235,51 +252,56 @@ The greeting is the same for every endpoint, including the internal one. It list
 OK "ready"
 ```
 
-The `"SIEVE"` line is the backend's, from the last successful capability probe ([after TLS](#managesieve-after-tls)) whatever its age; the greeting never opens a backend connection itself. Until the first probe after startup it is missing.
+The `"SIEVE"` line is the backend's, from the last successful capability probe ([after TLS](#managesieve-after-tls)) whatever its age (RFC 5804 §1.7 requires it). While no probe has succeeded since startup, the greeting waits for one: probes run one at a time, and clients that arrive together share one. A failed probe counts in `mail_auth_proxy_backend_errors_total{proto="sieve"}`, the next one waits 5 s, and in the meantime the greeting goes out without the `"SIEVE"` line ([standards: D-SIEVE-1](standards.md#d-sieve-1-sieve-missing-from-the-pre-tls-greeting-while-the-backend-is-down)). All of this runs within the pre-auth budget.
 
 | Client sends | Proxy replies |
 |---|---|
 | `STARTTLS` | `OK "Begin TLS negotiation now"`, then TLS handshake |
 | `LOGOUT` | `OK "Bye"` (closed) |
+| `CAPABILITY` | the greeting again, ending in `OK "ready"` |
+| `NOOP` | `OK "NOOP completed."`; with a string argument `OK (TAG "<arg>") "Done"` (RFC 5804 §2.13); a malformed argument gets `NO "Invalid NOOP argument"` |
 | `AUTHENTICATE …` | `NO (ENCRYPT-NEEDED) "STARTTLS required"` (the connection stays open) |
-| anything else, including `CAPABILITY` | `NO "Command not permitted before STARTTLS"` |
+| anything else | `NO "Command not permitted before STARTTLS"` |
 | after the 8th command (sent unprompted) | `NO "Too many commands before STARTTLS"` (closed) |
 
 ### ManageSieve: after TLS
 
 1. The proxy fetches the backend's post-TLS capabilities from a cache (`sieve.capability_cache_secs`, default 600 s). On a cache miss it opens a probe session: connect, PROXY v2 `LOCAL` header, greeting, `STARTTLS`, TLS, capabilities, `LOGOUT`.
-2. It relays those lines with two changes:
-   - `"STARTTLS"` is dropped.
+2. It relays those lines with these changes:
+   - `"STARTTLS"` and `"UNAUTHENTICATE"` are dropped.
    - The `"SASL"` line is replaced by `"SASL" "XOAUTH2 OAUTHBEARER"` or, when a legacy rule offers PLAIN, `"SASL" "XOAUTH2 OAUTHBEARER PLAIN"`. If the backend sends no SASL line, the client gets none.
    - Everything else (`IMPLEMENTATION`, `SIEVE`, `NOTIFY`, `VERSION`, …) is relayed unchanged, including the backend's implementation string, which unauthenticated clients can see.
 3. It sends `OK "TLS negotiation successful."`.
 4. If the probe fails, the client gets `BYE "Service temporarily unavailable"` and the connection closes.
 
-Before `AUTHENTICATE`, `CAPABILITY` (the capability list again, then `OK "Capability completed."`), `NOOP` (`OK "NOOP completed."`) and `LOGOUT` (`OK "Logout completed."`, clean end, no authlog line) are answered; after `limits.max_preauth_commands` commands the client gets `BYE "Too many commands before AUTHENTICATE"`. Any other command is taken as the authentication attempt:
+Before `AUTHENTICATE`, `CAPABILITY` (the capability list again, then `OK "Capability completed."`), `NOOP` (as before TLS) and `LOGOUT` (`OK "Logout completed."`, clean end, no authlog line) are answered; after `limits.max_preauth_commands` commands the client gets `BYE "Too many commands before AUTHENTICATE"`. Any other command is taken as the authentication attempt:
 
 | Form | Handling |
 |---|---|
 | `AUTHENTICATE "MECH" "base64"` | quoted IR (`\"` escapes handled) |
-| `AUTHENTICATE "MECH" {n+}` CRLF `<n bytes>` CRLF (also `{n}`) | literal IR, n ≤ 65536, trailing CRLF consumed |
-| `AUTHENTICATE "MECH"` | proxy sends the empty challenge `""` and reads one raw line as bare base64. A quoted string or a literal response (the RFC 5804 forms) is not unquoted and fails. |
-| mech not in `XOAUTH2`, `OAUTHBEARER`, `PLAIN` (e.g. `LOGIN`) | `NO "Authentication mechanism not supported"`. With no IR, this comes *after* the `""` challenge has been sent and answered. |
+| `AUTHENTICATE "MECH" {n+}` CRLF `<n bytes>` CRLF | literal IR, n ≤ 65536. Only `{n+}` (RFC 5804 §4): `{n}`, `{n++}`, text after the header or after the octets are refused. |
+| `AUTHENTICATE "MECH"` | proxy sends the empty challenge `""` and reads the response as a string: quoted, a literal `{n+}`, or a bare line (RFC 5804 §2.1). |
+| mech not in `XOAUTH2`, `OAUTHBEARER`, `PLAIN` (e.g. `LOGIN`) | `NO "Authentication mechanism not supported"`, before any challenge |
+| `AUTHENTICATE "PLAIN"` without IR where the connection does not offer PLAIN | `NO "password authentication not available on this endpoint"`, without a challenge |
 | anything else (another command, unquoted mech, bad literal, literal > 64 KiB) | `NO "Invalid AUTHENTICATE"` (closed) |
-| undecodable SASL, or `"*"` / `*` as the response | `NO "Invalid authentication response"` (closed) |
+| `"*"` / `*` as the response, a response that is not base64 or holds no valid credential (the cases listed for [IMAP](#imap-sasl-exchange)) | `NO "Invalid authentication response"` (closed) |
+| an OAuth response with an empty `auth` value (discovery, RFC 7628 §4.3) | the [OAuth error result](#oauth-error-result), then `NO "Authentication failed"`; `authresult` `protocol`, not a failed login |
 
 ### ManageSieve: decision and backend login
 
 | Situation | Client sees | authlog `reason` |
 |---|---|---|
-| token invalid | `"<error result>"`; after the client's answer `NO "Authentication failed"` ([OAuth error result](#oauth-error-result)) | `bad_token` |
+| token invalid, or an OAUTHBEARER `host` that is not the SNI name | `"<error result>"`; after the client's answer `NO "Authentication failed"` ([OAuth error result](#oauth-error-result)) | `bad_token` |
 | token valid, but `user=` / `a=` names another identity | `NO "Authorization failed"` | `authzid_mismatch` |
-| PLAIN and the connection does not offer it | `NO "password authentication not available on this endpoint"` | `blocked_endpoint` |
+| PLAIN and the connection does not offer it | `NO "password authentication not available on this endpoint"` | `blocked_endpoint`: with `pwfp` when the initial response carried the password, otherwise without |
 | PLAIN refused by the legacy gate (including a password over 1024 bytes) | `NO "Authentication failed"`, after `failure_delay_ms` (see below) | `blocked_endpoint`, `unknown_domain`, `unknown_account`, `throttled`, `oversize` |
 | account check unavailable | `NO (TRYLATER) "Service temporarily unavailable"` | none (counted in `mail_auth_proxy_backend_errors_total`) |
-| backend reply does not start with `OK` | `NO "Authentication failed"` | `backend_reject` |
-| backend session fails (connect, TLS, capabilities) or answers `NO (TRYLATER)` | `NO (TRYLATER) "Service temporarily unavailable"` | none (counted in `mail_auth_proxy_backend_errors_total`) |
+| the pre-auth budget runs out during token validation, the account check or the backend login | `NO (TRYLATER) "Service temporarily unavailable"` | none (counted in `mail_auth_proxy_backend_errors_total`) |
+| backend reply `NO` (except `NO (TRYLATER)`), `BYE (AUTH-TOO-WEAK)`, `BYE (TRANSITION-NEEDED)`, or any other reply that is neither `OK` nor `BYE` | `NO "Authentication failed"` | `backend_reject` |
+| backend session fails (connect, TLS, capabilities), its capabilities list `UNAUTHENTICATE` (RFC 5804 §2.14.1, checked before the credential is sent), or it answers `NO (TRYLATER)` or any other `BYE` (shutdown, connection limit) | `NO (TRYLATER) "Service temporarily unavailable"` | none (counted in `mail_auth_proxy_backend_errors_total`) |
 | backend `OK …` | the backend's reply line verbatim (e.g. `OK "Logged in."`), then relay | `ok` |
 
-The backend session is opened only after the credential has passed the local checks. It sends `AUTHENTICATE "XOAUTH2" "<ir>"` or `AUTHENTICATE "PLAIN" "<ir>"` and reads one reply line. An authenticated session therefore uses one backend connection, plus one probe connection when the capability cache is cold.
+The backend session is opened only after the credential has passed the local checks. It sends `AUTHENTICATE "XOAUTH2" "<ir>"` or `AUTHENTICATE "PLAIN" "<ir>"`, with a response over 1024 octets (any sizable token) as a literal `{n+}` instead of the quoted string (RFC 5804 §4), and reads one reply line. An authenticated session therefore uses one backend connection, plus one probe connection when the capability cache is cold.
 
 ### ManageSieve: sequence
 
@@ -326,7 +348,8 @@ answers it, and only then comes the failure. XOAUTH2 follows the same pattern (G
 XOAUTH2 protocol description), with an empty answer instead of `%x01`.
 
 The error result is built once at startup and is the same for every rejected token,
-whatever the cause and whatever issuer the token claims:
+whatever the cause (an OAUTHBEARER `host` that does not match the SNI name included) and
+whatever issuer the token claims:
 
 ```
 {"status":"invalid_token","scope":"<scope>","openid-configuration":"<url>"}
@@ -356,17 +379,25 @@ the result is `{"status":"invalid_token"}`.
 - A valid token, a valid token with another `user=` / `a=` (`authzid_mismatch`), a
   backend rejection (`backend_reject`) and keys that could not be refreshed (retry-later)
   get their reply at once, without a challenge.
+- An OAuth response with an empty `auth` value (`auth=`, or `Bearer` without a token)
+  asks for this result (RFC 7628 §4.3) and gets the same exchange. It carries no
+  credential: its `authresult` line is `reason="protocol"` with the mechanism and the
+  SASL user, and it counts neither as a failed login nor in the rate limit.
 
 ## Surprising and client-incompatible behaviour
 
-1. **One authentication attempt per connection.** Any failed or unsupported AUTH/AUTHENTICATE, and any unknown pre-auth command, closes the connection. Python `smtplib.login()` falls back from PLAIN to LOGIN on the same connection after a 535, so it raises `SMTPServerDisconnected` instead of `SMTPAuthenticationError`.
+1. **One authentication attempt per connection.** Any failed or unsupported AUTH/AUTHENTICATE, and any unknown pre-auth command, closes the connection; SMTP announces the close with `421 4.7.0 <hostname> closing connection`. A client that falls back to another mechanism on the same connection, such as Python `smtplib.login()` from PLAIN to LOGIN after a 535, gets the 421 instead of a second attempt.
 2. **The client's SASL username must match the token for OAuth.** The backend login is always the token's `identity_claim` (default `email`). An XOAUTH2 `user=` (required by the mechanism) or OAUTHBEARER `a=` must be empty, the identity itself, or its local part without a domain (`alice` for `alice@example.org`), all ASCII case-insensitive; anything else, in particular another full address, fails the exchange. OAUTHBEARER is converted to XOAUTH2 for the backend.
 3. **A legacy rule with `sni` needs SNI.** Clients connecting by IP (no SNI) or with a different hostname or alias only get OAuth from such a rule, even from its networks.
-4. **IMAP:** `IMAP4rev2` is always advertised before authentication whatever the backend supports (after login the backend's real list is relayed). `STARTTLS` on the implicit-TLS port closes the connection. IMAP literals in `LOGIN` are not supported. `AUTHENTICATE PLAIN =` (RFC 4959 empty response) is rejected.
-5. **SMTP:** the EHLO list is static (no `SIZE`; `CHUNKING`, `DSN` and `SMTPUTF8` are claimed whatever the backend supports). `AUTH PLAIN =` gets `501`.
-6. **ManageSieve:** after STARTTLS only `CAPABILITY`, `NOOP`, `LOGOUT` and `AUTHENTICATE` are accepted, and `CAPABILITY` is refused before TLS. The response to the empty challenge must be bare base64 (RFC-conformant quoted or literal strings fail); only the answer to the OAuth error result is read as a string. There is no `LOGIN`. The plaintext greeting lists no mechanism (`"SASL" ""`); the mechanisms appear only after TLS.
-7. **Token rules are per issuer.** A wrong `token_type` either rejects every token (`keycloak` for an IdP without the `typ` claim) or lets ID tokens with an accepted audience in (`any`); `email_verified` must be a real boolean when required.
-8. **Connection-limit, rate-limit and timeout closes are silent:** no `421`/`554`/`BYE`. The one exception is a client that does not answer the [OAuth error result](#oauth-error-result): it still gets the failure reply. A source blocked after too many failed logins ([architecture.md](architecture.md#failed-login-rate-limit)) has every new connection closed at accept, before TLS or any greeting, on all three protocols, until the block ends; the client sees a connection failure, not an authentication error. The replies to the failed logins before the block are unchanged; a rejected token with its error-result round trip counts once.
-9. **Session limits after authentication are off by default and close silently.** TCP keepalive is on; `session.idle_limit_secs` and `session.max_session_secs` are off. When one of them ends a session, the connection closes without `BYE`/`421`. A session does not end at the token's `exp` ([architecture.md](architecture.md#after-authentication)).
-10. **Refused passwords are answered slowly.** Every failed legacy login is answered at least `legacy.failure_delay_ms` (default 2 s) after the credential, except a password sent with a mechanism the connection does not offer (`blocked_endpoint` at step 0), which is refused at once. Refusals by the gate wait for the larger of `failure_delay_ms` and the median time of recent backend rejections, plus random jitter; backend rejections get the same jitter. A retry-later on the password path (account check or backend unavailable) is answered no earlier than a refusal. OAuth failures are not delayed. Details in [architecture.md](architecture.md#legacy-gate).
-11. **A token with an unknown `kid` can get retry-later.** It is a `bad_token` when the last on-demand JWKS refresh succeeded for the issuer the token claims (also while further refreshes are held back for 30 s). If that refresh failed for the issuer, the client gets retry-later ([architecture.md](architecture.md#oauth-token-validation)).
+4. **IMAP:** `IMAP4rev2` is always advertised before authentication whatever the backend supports (after login the backend's real list is relayed). `STARTTLS` on the implicit-TLS port closes the connection. IMAP literals in `LOGIN` are not supported.
+5. **SMTP:** the EHLO list is static (no `SIZE`; `CHUNKING`, `DSN` and `SMTPUTF8` are claimed whatever the backend supports).
+6. **ManageSieve:** before login only `CAPABILITY`, `NOOP`, `LOGOUT`, `STARTTLS` (before TLS) and `AUTHENTICATE` are accepted. There is no `LOGIN`. The plaintext greeting lists no mechanism (`"SASL" ""`); the mechanisms appear only after TLS. Client literals must be non-synchronising (`{n+}`); `{n}` is refused. Right after a start, the first greetings wait for the backend's capability probe; while no probe has succeeded and the current one fails, the plaintext greeting lacks the `"SIEVE"` line ([standards: D-SIEVE-1](standards.md#d-sieve-1-sieve-missing-from-the-pre-tls-greeting-while-the-backend-is-down)).
+7. **Password mechanisms that are not offered are refused before the password.** `AUTHENTICATE PLAIN` / `AUTH PLAIN` without an initial response, and SASL `LOGIN`, on a connection without a matching legacy rule get IMAP `NO`, SMTP `504 5.5.4` or ManageSieve `NO` at once; the client is never asked for a password the proxy would not use. A password already sent (IMAP `LOGIN`, a PLAIN initial response) is still logged with its fingerprint.
+8. **OAUTHBEARER `host` must be the name the client connected to.** When the client sent SNI, a different `host` (another name or alias of the server) is refused like an invalid token. XOAUTH2 has no `host`; without SNI nothing is compared.
+9. **Slow IdPs and backends count against the pre-auth budget.** Token validation (including a JWKS refresh for an unknown `kid`), the legacy account check and the backend login all have to finish within `timeouts.preauth_secs` (default 60 s) from the accept. A login that runs out gets the retry-later reply, not a failure, and is not logged as a failed login.
+10. **A backend that offers `UNAUTHENTICATE` (RFC 8437) gets no logins.** IMAP (greeting or post-login capabilities) and ManageSieve (capabilities before the credential) logins then end as an outage, with a journal line that names the capability; ManageSieve clients never see the capability.
+11. **Token rules are per issuer.** A wrong `token_type` either rejects every token (`keycloak` for an IdP without the `typ` claim) or lets ID tokens with an accepted audience in (`any`); `email_verified` must be a real boolean when required.
+12. **Connection-limit, rate-limit and timeout closes are silent:** no `421`/`554`/`BYE`. The one exception is a client that does not answer the [OAuth error result](#oauth-error-result): it still gets the failure reply. A source blocked after too many failed logins ([architecture.md](architecture.md#failed-login-rate-limit)) has every new connection closed at accept, before TLS or any greeting, on all three protocols, until the block ends; the client sees a connection failure, not an authentication error. The replies to the failed logins before the block are unchanged; a rejected token with its error-result round trip counts once.
+13. **Session limits after authentication are off by default and close silently.** TCP keepalive is on; `session.idle_limit_secs` and `session.max_session_secs` are off. When one of them ends a session, the connection closes without `BYE`/`421`. A session does not end at the token's `exp` ([architecture.md](architecture.md#after-authentication)).
+14. **Refused passwords are answered slowly.** Every failed legacy login is answered at least `legacy.failure_delay_ms` (default 2 s) after the credential, except a password sent with a mechanism the connection does not offer (`blocked_endpoint` at step 0), which is refused at once. Refusals by the gate wait for the larger of `failure_delay_ms` and the median time of recent backend rejections, plus random jitter; backend rejections get the same jitter. A retry-later on the password path (account check or backend unavailable) is answered no earlier than a refusal. OAuth failures are not delayed. Details in [architecture.md](architecture.md#legacy-gate).
+15. **A token with an unknown `kid` can get retry-later.** It is a `bad_token` when the last on-demand JWKS refresh succeeded for the issuer the token claims (also while further refreshes are held back for 30 s). If that refresh failed for the issuer, the client gets retry-later ([architecture.md](architecture.md#oauth-token-validation)).
