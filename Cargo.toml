@@ -1,6 +1,6 @@
 [package]
 name = "mail-auth-proxy"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Authentication proxy for IMAP, SMTP submission and ManageSieve: local OAuth2 token validation and an optional password gate"
 rust-version = "1.88"
