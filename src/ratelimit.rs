@@ -23,6 +23,9 @@
 //! - A successful login does not reset the count: one valid account must not
 //!   clear the way for guesses at others.
 //!
+//! A configuration reload keeps every count and block and changes only the
+//! settings (`AuthRateLimit::reconfigured`).
+//!
 //! Bounded: at most `CAPACITY` sources. When full, entries with nothing left
 //! to remember go first; if that is not enough, the least valuable ones
 //! (unblocked before blocked, oldest first), and only those count as
@@ -33,7 +36,7 @@ use crate::config;
 use crate::obs::authlog::Reason;
 use crate::obs::metrics::{self, Proto};
 use ipnet::IpNet;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -113,15 +116,26 @@ struct Ban {
     strikes: u32,
 }
 
-/// The rate limit shared by all listeners.
+/// The rate limit of one configuration, over the sources table of the
+/// process: a configuration reload makes a new one (`reconfigured`) that
+/// keeps every running count and block.
 pub struct AuthRateLimit {
     /// `None`: disabled.
     settings: Option<Settings>,
-    /// Sources that are never counted.
+    /// Sources that are never counted nor blocked.
     exempt: Vec<IpNet>,
     /// Prefix length IPv6 sources are grouped by (`limits::preauth_key`).
     v6_prefix: u8,
-    sources: Mutex<HashMap<IpAddr, Source>>,
+    sources: Arc<Mutex<Sources>>,
+}
+
+/// The tracked sources, each under the network it was counted as.
+#[derive(Default)]
+struct Sources {
+    map: HashMap<IpNet, Source>,
+    /// The IPv6 prefix lengths of the entries: more than one after a reload
+    /// changed `limits.ipv6_source_prefix`, until the older entries expire.
+    v6_prefixes: BTreeSet<u8>,
 }
 
 /// Whether a refusal reason counts. Exhaustive, so a new reason needs a
@@ -190,6 +204,28 @@ impl AuthRateLimit {
         internal: &[IpNet],
         v6_prefix: u8,
     ) -> anyhow::Result<AuthRateLimit> {
+        Self::with_sources(cfg, internal, v6_prefix, Arc::default())
+    }
+
+    /// The same, over the sources of `self` (a configuration reload): counts
+    /// and blocks go on with the new settings. A source that the new
+    /// settings exempt is no longer blocked; a disabled limit drops the
+    /// table at the next sweep.
+    pub fn reconfigured(
+        &self,
+        cfg: &config::AuthRateLimit,
+        internal: &[IpNet],
+        v6_prefix: u8,
+    ) -> anyhow::Result<AuthRateLimit> {
+        Self::with_sources(cfg, internal, v6_prefix, self.sources.clone())
+    }
+
+    fn with_sources(
+        cfg: &config::AuthRateLimit,
+        internal: &[IpNet],
+        v6_prefix: u8,
+        sources: Arc<Mutex<Sources>>,
+    ) -> anyhow::Result<AuthRateLimit> {
         let mut exempt = crate::auth::policy::parse_internal_nets(&cfg.exempt_networks)?;
         if cfg.exempt_internal {
             exempt.extend_from_slice(internal);
@@ -203,12 +239,16 @@ impl AuthRateLimit {
             }),
             exempt,
             v6_prefix,
-            sources: Mutex::new(HashMap::new()),
+            sources,
         })
     }
 
     pub fn is_enabled(&self) -> bool {
         self.settings.is_some()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Sources> {
+        self.sources.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Whether new connections from `peer` are refused.
@@ -220,12 +260,19 @@ impl AuthRateLimit {
         if self.settings.is_none() {
             return false;
         }
-        let key = crate::limits::preauth_key(peer, self.v6_prefix);
-        self.sources
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&key)
-            .is_some_and(|s| s.blocked(now))
+        let peer = peer.to_canonical();
+        if crate::auth::policy::is_internal(peer, &self.exempt) {
+            return false;
+        }
+        let sources = self.lock();
+        let blocked = |net: IpNet| sources.map.get(&net).is_some_and(|s| s.blocked(now));
+        if peer.is_ipv4() {
+            return blocked(source_net(peer, 32));
+        }
+        // Under every prefix a source may have been counted by.
+        std::iter::once(self.v6_prefix)
+            .chain(sources.v6_prefixes.iter().copied())
+            .any(|p| blocked(source_net(crate::limits::preauth_key(peer, p), p)))
     }
 
     /// A credential from `peer` was refused with `reason`. Counts it (unless
@@ -257,11 +304,16 @@ impl AuthRateLimit {
     /// it starts, if any.
     fn failure_at(&self, key: IpAddr, fp: u64, now: Instant) -> Option<Ban> {
         let s = self.settings.as_ref()?;
-        let mut map = self.sources.lock().unwrap_or_else(|p| p.into_inner());
-        if !map.contains_key(&key) {
-            make_room(&mut map, now, s);
+        let net = source_net(key, self.v6_prefix);
+        let mut sources = self.lock();
+        if !sources.map.contains_key(&net) {
+            make_room(&mut sources.map, now, s);
+            if key.is_ipv6() {
+                sources.v6_prefixes.insert(self.v6_prefix);
+            }
         }
-        let e = map.entry(key).or_insert_with(|| Source::new(now));
+        let map = &mut sources.map;
+        let e = map.entry(net).or_insert_with(|| Source::new(now));
         // Connections opened before the block may still fail; the block
         // already runs.
         if e.blocked(now) {
@@ -301,33 +353,40 @@ impl AuthRateLimit {
         Some(ban)
     }
 
-    /// Drop what is no longer needed; set the active-blocks gauge.
+    /// Drop what is no longer needed (everything when disabled); set the
+    /// active-blocks gauge.
     fn sweep(&self, now: Instant) {
-        let Some(s) = &self.settings else { return };
-        let mut map = self.sources.lock().unwrap_or_else(|p| p.into_inner());
-        map.retain(|_, e| e.live(now, s));
-        let active = map.values().filter(|e| e.blocked(now)).count();
+        let mut sources = self.lock();
+        match &self.settings {
+            Some(s) => sources.map.retain(|_, e| e.live(now, s)),
+            None => sources.map.clear(),
+        }
+        let prefixes = sources
+            .map
+            .keys()
+            .filter(|n| n.addr().is_ipv6())
+            .map(IpNet::prefix_len)
+            .collect();
+        sources.v6_prefixes = prefixes;
+        let active = sources.map.values().filter(|e| e.blocked(now)).count();
         metrics::set_ratelimit_active(active as u64);
     }
 
-    /// Start the periodic sweep. Needs a Tokio runtime.
-    pub fn spawn_sweeper(self: &Arc<Self>) {
-        if self.settings.is_none() {
-            return;
-        }
-        let this = self.clone();
+    /// Start the periodic sweep of the rate limit `current` returns (the one
+    /// of the configuration in use). Needs a Tokio runtime.
+    pub fn spawn_sweeper(current: impl Fn() -> Arc<AuthRateLimit> + Send + 'static) {
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(SWEEP_INTERVAL);
             loop {
                 tick.tick().await;
-                this.sweep(Instant::now());
+                current().sweep(Instant::now());
             }
         });
     }
 }
 
 /// Make room for one more source in a full table.
-fn make_room(map: &mut HashMap<IpAddr, Source>, now: Instant, s: &Settings) {
+fn make_room(map: &mut HashMap<IpNet, Source>, now: Instant, s: &Settings) {
     if map.len() < CAPACITY {
         return;
     }
@@ -336,7 +395,7 @@ fn make_room(map: &mut HashMap<IpAddr, Source>, now: Instant, s: &Settings) {
     if map.len() <= target {
         return;
     }
-    let mut order: Vec<((bool, Instant), IpAddr)> =
+    let mut order: Vec<((bool, Instant), IpNet)> =
         map.iter().map(|(k, e)| (e.rank(now), *k)).collect();
     let n = map.len() - target;
     order.select_nth_unstable(n - 1);
@@ -572,7 +631,7 @@ mod tests {
         let l = limit(&c);
         fail(&l, "192.0.2.1", 5);
         assert!(!l.is_blocked(ip("192.0.2.1")));
-        assert!(l.sources.lock().unwrap().is_empty());
+        assert!(l.lock().map.is_empty());
     }
 
     /// The table stays within `CAPACITY`; a full table drops unblocked
@@ -596,17 +655,20 @@ mod tests {
             let k = IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i));
             l.failure_at(k, 1, t + Duration::from_millis(u64::from(i)));
         }
-        let map = l.sources.lock().unwrap();
-        assert!(map.len() <= CAPACITY);
+        let sources = l.lock();
+        assert!(sources.map.len() <= CAPACITY);
         assert!(
-            map.get(&blocked).is_some_and(|s| s.blocked(t)),
+            sources
+                .map
+                .get(&source_net(blocked, 64))
+                .is_some_and(|s| s.blocked(t)),
             "block kept"
         );
         assert!(
-            !map.contains_key(&ip("10.0.0.0")),
+            !sources.map.contains_key(&source_net(ip("10.0.0.0"), 64)),
             "oldest unblocked source dropped"
         );
-        drop(map);
+        drop(sources);
         assert!(l.is_blocked_at(blocked, t));
         assert!(evictions() - e0 >= EVICT_BATCH as u64);
     }
@@ -666,6 +728,55 @@ token_type = "keycloak"
         assert!(off.errors.is_empty() && !off.config.auth_ratelimit.enabled);
     }
 
+    /// A reload keeps every count and block and swaps the settings: the new
+    /// threshold applies to the running count, a source the new settings
+    /// exempt is free, a block counted under the old IPv6 prefix still holds
+    /// until it expires, and a disabled limit blocks nothing and drops the
+    /// table at the next sweep.
+    #[test]
+    fn reconfigured_keeps_counts_and_blocks() {
+        let old = limit(&cfg(3, 60, 100, 100));
+        let t = Instant::now();
+        let v4 = ip("192.0.2.1");
+        old.failure_at(v4, 1, t);
+        old.failure_at(v4, 2, t);
+        let v6 = ip("2001:db8:1:2::1");
+        fail(&old, "2001:db8:1:2::1", 3);
+        assert!(old.is_blocked(v6));
+
+        let new = old.reconfigured(&cfg(2, 60, 100, 100), &[], 48).unwrap();
+        assert!(!new.is_blocked_at(v4, t), "two failures, not yet blocked");
+        assert!(
+            new.failure_at(v4, 2, t).is_none(),
+            "fingerprint seen before"
+        );
+        assert!(new.failure_at(v4, 3, t).is_some(), "the next one blocks");
+        assert!(new.is_blocked_at(v4, t));
+        assert!(new.is_blocked(v6), "the /64 block holds under /48");
+        assert!(!new.is_blocked(ip("2001:db8:1:3::1")), "not the whole /48");
+        fail(&new, "2001:db8:2:1::1", 1);
+        fail(&new, "2001:db8:2:2::1", 1);
+        assert!(new.is_blocked(ip("2001:db8:2:ffff::1")), "counted per /48");
+        new.sweep(Instant::now());
+        assert_eq!(new.lock().v6_prefixes, BTreeSet::from([48, 64]));
+
+        let mut exempting = cfg(2, 60, 100, 100);
+        exempting.exempt_networks = vec!["192.0.2.0/24".into()];
+        let exempt = new.reconfigured(&exempting, &[], 48).unwrap();
+        assert!(!exempt.is_blocked_at(v4, t), "now exempt");
+        assert!(
+            new.is_blocked_at(v4, t),
+            "still blocked under the old settings"
+        );
+
+        let mut off = cfg(2, 60, 100, 100);
+        off.enabled = false;
+        let off = new.reconfigured(&off, &[], 48).unwrap();
+        assert!(!off.is_blocked(v6));
+        off.sweep(Instant::now());
+        assert!(off.lock().map.is_empty() && new.lock().map.is_empty());
+    }
+
     /// The sweep drops expired entries and keeps running blocks.
     #[test]
     fn sweep_drops_expired() {
@@ -675,10 +786,10 @@ token_type = "keycloak"
         let l2 = limit(&cfg(2, 60, 100, 100));
         l2.failure_at(ip("192.0.2.2"), 1, t);
         l.sweep(t + secs(150));
-        assert_eq!(l.sources.lock().unwrap().len(), 1, "escalation memory");
+        assert_eq!(l.lock().map.len(), 1, "escalation memory");
         l.sweep(t + secs(201));
-        assert!(l.sources.lock().unwrap().is_empty());
+        assert!(l.lock().map.is_empty());
         l2.sweep(t + secs(61));
-        assert!(l2.sources.lock().unwrap().is_empty());
+        assert!(l2.lock().map.is_empty());
     }
 }

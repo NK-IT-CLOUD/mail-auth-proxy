@@ -82,3 +82,5 @@
 "\"[::]:993\""
 "\"127.0.0.1:1143\""
 "\x0a"
+# Separates the two configurations of a reload comparison.
+"\x0a#---\x0a"

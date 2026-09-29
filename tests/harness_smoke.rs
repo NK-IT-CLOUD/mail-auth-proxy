@@ -22,15 +22,19 @@ async fn proxy_starts_and_relays_each_protocol() {
         )],
         1
     );
-    // Timestamps: the process start, the JWKS load, the certificate expiry.
+    // Timestamps: the process start, the configuration and JWKS load, the
+    // certificate expiry.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
     let started = m["process_start_time_seconds"];
     assert!(started <= now && now - started < 60, "{started} vs {now}");
+    let loaded = m["mail_auth_proxy_config_last_reload_success_timestamp_seconds"];
+    assert!(loaded >= started && loaded <= now, "{loaded} vs {started}");
     let timestamps = [
         "process_start_time_seconds",
+        "mail_auth_proxy_config_last_reload_success_timestamp_seconds",
         "mail_auth_proxy_jwks_last_success_timestamp_seconds",
         "mail_auth_proxy_tls_cert_expiry_timestamp_seconds",
     ];

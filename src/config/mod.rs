@@ -11,10 +11,13 @@
 //! `schema` holds the types and defaults (what a file may say and how
 //! `--print-config` shows it), `validate` the checks serde cannot express and
 //! the normalisation of short forms. `parse` runs them in that order.
+//! `reload` compares a new configuration with the one in use (SIGHUP).
 
+mod reload;
 mod schema;
 mod validate;
 
+pub use reload::{plan, Plan};
 pub use schema::*;
 pub use validate::{check_domain_entry, check_service_url, check_user_entry, is_private_net};
 

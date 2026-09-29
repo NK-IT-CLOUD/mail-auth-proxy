@@ -82,8 +82,8 @@ accepts a password only where a rule allows it.
 **Operations**
 - One fixed `authresult` log line per login, made for log-based blocking; CrowdSec parser
   and scenarios in [contrib/crowdsec](contrib/crowdsec/).
-- Optional Prometheus metrics, systemd unit with `Type=notify`, `SIGHUP` reloads certificates
-  and JWKS without dropping connections.
+- Optional Prometheus metrics, systemd unit with `Type=notify`, `SIGHUP` reloads the
+  configuration, certificates and JWKS without dropping connections.
 - Connection caps, per-IP pre-auth cap, a pre-auth time budget and size limits on lines,
   literals, tokens and passwords.
 - Built-in blocking of source addresses after too many failed logins (tokens and passwords,
@@ -179,8 +179,8 @@ journalctl -u mail-auth-proxy -n 20                                     # expect
 ```
 
 Log in with a mail client and look for `authresult result="ok"` in the journal. After a
-certificate renewal, `systemctl reload mail-auth-proxy` loads the new certificates and
-refreshes the JWKS without closing open connections; a configuration change needs a restart.
+configuration change or certificate renewal, `systemctl reload mail-auth-proxy` loads it
+without closing open connections; only listener and metrics addresses need a restart.
 
 <details>
 <summary>Build from source</summary>

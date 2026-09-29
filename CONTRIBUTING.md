@@ -34,8 +34,8 @@ A single crate with a library (`src/lib.rs`) and a thin binary (`src/main.rs`).
 | Path | What |
 |---|---|
 | `src/main.rs` | command line, logging setup, `--check-config` / `--print-config` |
-| `src/config/` | configuration format 2: loading (`mod.rs`), schema and defaults (`schema.rs`), validation, warnings and normalisation (`validate.rs`) |
-| `src/server/` | startup, listeners and accept loop, TLS material, signals, systemd notification |
+| `src/config/` | configuration format 2: loading (`mod.rs`), schema and defaults (`schema.rs`), validation, warnings and normalisation (`validate.rs`), the comparison a reload makes (`reload.rs`) |
+| `src/server/` | startup, listeners and accept loop, configuration reload (`reload.rs`), TLS material, signals, systemd notification |
 | `src/limits.rs` | connection limits at accept |
 | `src/proto/imap/`, `smtp/`, `sieve/` | per protocol: pre-auth dialog (`preauth.rs`), session handler (`mod.rs`), backend login (`backend.rs`) |
 | `src/auth/token.rs` | JWKS fetching and refresh, local JWT validation |
@@ -104,7 +104,7 @@ cargo install cargo-fuzz --locked
 | `sieve_preauth` | `proto/sieve/preauth.rs`: quoted strings, literals `{n+}` (RFC 5804) | literal limit; nothing read past the credential line; quoting roundtrip |
 | `smtp` | `proto/smtp/preauth.rs` (AUTH), `proto/smtp/backend.rs` (replies, RFC 5321 §4.2) | every refusal is answered; reply line limit |
 | `token` | `auth/token.rs`: unverified `iss`, header and payload decoding, claim checks | no token without a valid signature passes; the identity is one plain address; error texts carry no control characters |
-| `config` | `config::parse` | a valid configuration printed with `--print-config` parses again and is valid |
+| `config` | `config::parse`, `config::plan` (the reload comparison) | a valid configuration printed with `--print-config` parses again, is valid and compares as unchanged; two configurations separated by a line `#---` compare symmetrically, with changes exactly when their printed forms differ |
 | `tls_not_after` | `server/tls.rs`: the DER walk to a certificate's `notAfter` (RFC 5280 §4.1) | on raw bytes and as the time value in a certificate skeleton: never a time past year 9999, every well-formed time from 1970 on parses |
 
 Run a target from `fuzz/`. New inputs go to the first directory; keep it outside the

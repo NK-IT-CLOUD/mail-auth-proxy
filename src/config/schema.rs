@@ -103,7 +103,7 @@ impl Tls {
 }
 
 /// A backend the proxy logs in to with the client's own credential.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Backend {
     /// `host:port`.

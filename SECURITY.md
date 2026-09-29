@@ -121,6 +121,11 @@ relays bytes. It never holds a master password or any other credential of its ow
 - Strict configuration: unknown keys, an incomplete password gate or legacy rule, a rule
   open to public networks for every user without `public = true`, non-https JWKS or
   doveadm URLs, or zero limits abort startup.
+- Configuration reload (`SIGHUP`): the new file passes the same checks as at startup and
+  replaces the configuration in use in one step, or is refused as a whole and changes
+  nothing. A connection sees either the whole old or the whole new configuration, never
+  a mix and never a moment without legacy rules or limits; rate-limit blocks and the
+  throttle survive it.
 
 ### Operator responsibilities
 
@@ -171,6 +176,14 @@ relays bytes. It never holds a master password or any other credential of its ow
 - **Certificates.** Send the proxy `SIGHUP` after a renewal and check the log: a
   certificate that fails to load is logged with its file and the old one stays in use
   ([INSTALL.md](INSTALL.md#certificates)).
+- **Tightening by reload.** A reload that makes a rule stricter (a legacy rule removed or
+  narrowed, an issuer removed, a lower limit) applies to connections accepted after it.
+  A connection opened before keeps the rules it was accepted with: before login for at
+  most `timeouts.preauth_secs`, after login until it ends, since a logged-in session is
+  never checked again. To cut off open sessions at once, restart the service or end them
+  at the backend (`doveadm kick`). Check the journal or
+  `mail_auth_proxy_config_reload_total{result="error"}` after each reload: a refused
+  reload leaves the previous configuration in use.
 
 ### Offering legacy passwords to the internet
 

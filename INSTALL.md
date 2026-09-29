@@ -161,10 +161,10 @@ sudo systemctl reload mail-auth-proxy    # sends SIGHUP
 journalctl -u mail-auth-proxy -n 5    # expect "reload: certificate loaded" per certificate
 ```
 
-`SIGHUP` re-reads every certificate and key and refreshes every JWKS without closing open
-connections. It does not re-read the configuration file; a configuration change needs a
-restart. A certificate that fails to load is logged at `ERROR` with its file and the old
-one stays in use; the other certificates are reloaded. For certbot, a deploy hook can run these commands.
+`SIGHUP` re-reads the configuration file, every certificate and key, and refreshes every
+JWKS without closing open connections ([operations.md](docs/operations.md#reload-sighup)).
+A certificate that fails to load is logged at `ERROR` with its file and the old one stays
+in use; the other certificates are reloaded. For certbot, a deploy hook can run these commands.
 
 Backend certificates are always verified, against the system trust store or the CAs in
 the backend's `ca_file`.
@@ -191,6 +191,21 @@ refuses to start. A successful start logs `imap listener up` (and `submission`/`
 with the listen and backend addresses. Test with a mail client and look for
 `authresult result="ok"` in the journal.
 
+A later change to `config.toml` takes effect with a reload, without closing open
+connections: check the file, reload, and look for the result in the journal.
+
+```bash
+sudo mail-auth-proxy --check-config /etc/mail-auth-proxy/config.toml
+sudo systemctl reload mail-auth-proxy
+journalctl -u mail-auth-proxy -n 20    # expect "reload: configuration loaded"
+```
+
+New connections use the new configuration, open ones keep theirs until they end. A change
+of a listener address, a listener added or removed, or of the metrics endpoint is refused
+by the reload (`ERROR … changed <key>: needs a restart`) and needs
+`systemctl restart mail-auth-proxy`. A file the reload refuses as invalid changes nothing;
+fix it and reload again ([configuration.md](docs/configuration.md#reload)).
+
 ## 5. Upgrade
 
 With APT: `sudo apt update && sudo apt upgrade`. With RPM: verify the new RPM and
@@ -203,6 +218,9 @@ conffile: an upgrade never changes it and asks nothing, so unattended upgrades w
 it with `/usr/share/mail-auth-proxy/config.example.toml` for new settings. (Releases up to
 0.2.0 shipped `config.toml` as conffile; upgrading from them keeps your file as it is, and
 `dpkg` lists it as an obsolete conffile.)
+
+An upgrade replaces the binary, so it needs this restart; `systemctl reload` would keep
+the old binary running. A configuration change needs only a reload ([4](#4-check-and-start)).
 
 On `SIGTERM` (stop, restart) the proxy stops accepting and gives open sessions 10 s to
 finish; clients reconnect after that.

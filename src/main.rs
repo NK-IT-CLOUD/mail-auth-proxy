@@ -60,26 +60,24 @@ async fn main() -> Result<()> {
     }
     let path = path.unwrap_or_else(|| DEFAULT_CONFIG.into());
     let loaded = config::load(&path)?;
-    for w in &loaded.warnings {
-        tracing::warn!("config: {w}");
-    }
     match mode {
         Mode::Print => {
+            for w in &loaded.warnings {
+                tracing::warn!("config: {w}");
+            }
             print!("{}", toml::to_string(&loaded.config)?);
             loaded.ensure_valid()?;
             return Ok(());
         }
         Mode::Check => {
             // Validation errors and file errors together, all of them.
-            let mut problems = loaded.errors.clone();
-            problems.extend(server::file_problems(&loaded.config));
-            let file_warnings = server::file_warnings(&loaded.config);
-            for w in &file_warnings {
+            let (problems, warnings) = server::check(&loaded);
+            for w in &warnings {
                 tracing::warn!("config: {w}");
             }
             if problems.is_empty() {
-                println!("{path}: configuration OK ({} warning(s)); JWKS reachability is checked at start",
-                    loaded.warnings.len() + file_warnings.len());
+                println!("{path}: configuration OK ({} warning(s)); JWKS reachability is checked at start and reload",
+                    warnings.len());
                 return Ok(());
             }
             eprintln!(
@@ -88,7 +86,12 @@ async fn main() -> Result<()> {
             );
             std::process::exit(1);
         }
-        Mode::Run => loaded.ensure_valid()?,
+        Mode::Run => {
+            for w in &loaded.warnings {
+                tracing::warn!("config: {w}");
+            }
+            loaded.ensure_valid()?
+        }
     }
-    server::run(loaded.config).await
+    server::run(path, loaded.config).await
 }

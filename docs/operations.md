@@ -60,12 +60,12 @@ When a `protocol` record is written:
   - `legacy list file reloaded` when a users or domains file changes; `ERROR … legacy list file unusable; it matches nothing until it is fixed` when it becomes missing or invalid, and `legacy list file usable again` when it is fixed.
   - `imap listener up`, `submission listener up`, `sieve listener up` (with `listen=` and `backend=`)
   - `TLS server names names=[…]`: every name a client may ask for with SNI ([configuration.md](configuration.md#tls-server-names)).
-  - `reload: certificate loaded cert=<file>` per certificate, `reload: JWKS refreshed` (or `reload: JWKS refresh already running`) after `SIGHUP` (`ERROR reload: certificate unusable; keeping the current one cert=<file> error=…`, `WARN reload: JWKS refresh failed; keeping previous keys` on failure)
+  - After `SIGHUP`: `reload: configuration loaded; new connections use it, open ones keep theirs path=<file> changed=[<section>, …]` (the top-level sections that differ; after it the startup lines on TLS names, legacy rules and the rate limit again), or `ERROR reload: configuration not loaded; the one in use stays path=<file> error=…` with the reason on one line (a TOML error, `invalid configuration: <problem>; <problem>`, `changed <key>: needs a restart`, `JWKS unavailable for: <issuer>`). Then `reload: certificate loaded cert=<file>` per certificate (after a refused reload: `ERROR reload: certificate unusable; keeping the current one cert=<file> error=…` for one that fails), and `reload: JWKS refreshed` (or `reload: JWKS refresh already running`; `WARN reload: JWKS refresh failed; keeping previous keys` on failure)
   - `shutting down: listeners closed, waiting for open sessions drain_secs=10`, then `all sessions ended; exiting` or `WARN sessions still open after the drain time; closing them`
   - `metrics endpoint up`
 - `WARN`:
   - `authlog: ratelimit action="block" proto="<proto>" scope="<internal|external>" peer=<ip> source=<cidr> failures=<n> block_secs=<n> strikes=<n>` when a source is blocked ([architecture.md](architecture.md#failed-login-rate-limit)): `proto`, `scope` and `peer` of the failure that reached the threshold, `source` the blocked address or IPv6 network of `limits.ipv6_source_prefix` (`198.51.100.7/32`, `2001:db8:1:2::/64`), `failures` the counted failures, `block_secs` the length of this block, `strikes` the number of blocks in a row (1 for the first). One line per block, on the `authlog` target like the `authresult` line, but not an `authresult` line: parsers anchored on `authresult result=` do not see it. The connections closed during the block are counted in `mail_auth_proxy_ratelimit_blocks_total` and logged only at `DEBUG`, so a blocked source cannot fill the journal.
-  - `config: …` at startup and with `--check-config`, one line per warning: `token_type = "any"`; `require_email_verified` with an `identity_claim` other than `email`; a public network in `[password_gate]` (one line each); `[password_gate]` disabled but `sni` set; a legacy rule that accepts every user from public networks; `[legacy]` settings without any rule; `failure_delay_ms = 0`; `metrics.listen` not on loopback; a public network in `auth_ratelimit.exempt_networks`; `session.idle_limit_secs` or `session.max_session_secs` below 30 minutes; a default certificate without a DNS name; a `legacy.rules[].sni` name that no certificate carries.
+  - `config: …` at startup, on a reload and with `--check-config`, one line per warning: `token_type = "any"`; `require_email_verified` with an `identity_claim` other than `email`; a public network in `[password_gate]` (one line each); `[password_gate]` disabled but `sni` set; a legacy rule that accepts every user from public networks; `[legacy]` settings without any rule; `failure_delay_ms = 0`; `metrics.listen` not on loopback; a public network in `auth_ratelimit.exempt_networks`; `session.idle_limit_secs` or `session.max_session_secs` below 30 minutes; a default certificate without a DNS name; a `legacy.rules[].sni` name that no certificate carries.
   - `…: TCP keepalive not set` (client, with `peer=`) or `… backend: TCP keepalive not set` (with `backend=`): the socket option was refused; the connection continues without keepalive.
   - `fetching JWKS …`, `parsing JWKS …`, `JWKS has no usable signing keys`, `JWKS refresh failed; keeping previous keys`, `JWKS refresh for unknown kid` (the refresh an unknown `kid` triggered failed)
   - `loading system CA certificates`
@@ -82,12 +82,14 @@ When a `protocol` record is written:
 
 ## Prometheus metrics
 
-Metrics are off by default. They are on with `metrics.enabled = true` or when only `metrics.listen` is set. `metrics.listen` then serves a minimal HTTP/1.1 responder without authentication, so keep it on loopback or a management network (`--check-config` warns about any other address). Only `GET /metrics` gets the exposition text (`Content-Type: text/plain; version=0.0.4`); another path is answered 404, another method 405, a request line that is not HTTP/1.x 400, a request head over 4 KiB 431, each with `Connection: close`. At most 4 scrapes are served at a time, further connections are closed at accept; the request head and the response each have 10 s. The endpoint logs neither requests nor refusals. Every series is present from the start, so `rate()` and `increase()` work from the first scrape: counters and gauges at 0, the timestamps (`process_start_time_seconds`, the JWKS success time, the certificate expiry) set during startup. No label carries a user, an address or other client input; `issuer` and `cert` come from the configuration.
+Metrics are off by default. They are on with `metrics.enabled = true` or when only `metrics.listen` is set. `metrics.listen` then serves a minimal HTTP/1.1 responder without authentication, so keep it on loopback or a management network (`--check-config` warns about any other address). Only `GET /metrics` gets the exposition text (`Content-Type: text/plain; version=0.0.4`); another path is answered 404, another method 405, a request line that is not HTTP/1.x 400, a request head over 4 KiB 431, each with `Connection: close`. At most 4 scrapes are served at a time, further connections are closed at accept; the request head and the response each have 10 s. The endpoint logs neither requests nor refusals. Every series is present from the start, so `rate()` and `increase()` work from the first scrape: counters and gauges at 0, the timestamps (`process_start_time_seconds`, the configuration load time, the JWKS success time, the certificate expiry) set during startup. No label carries a user, an address or other client input; `issuer` and `cert` come from the configuration in use: a reload that adds an issuer or certificate adds its series, one that removes it removes them.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `mail_auth_proxy_build_info` | gauge | `version`, `commit` (12 hex digits, `unknown` for a plain `cargo build`) | always 1 |
 | `process_start_time_seconds` | gauge | | start time of the process, Unix seconds |
+| `mail_auth_proxy_config_reload_total` | counter | `result` (ok, error) | configuration reloads (`SIGHUP`): `ok` when the new configuration is in use, `error` when it was refused and the previous one stays ([signals](#signals-and-service-manager)). Alert on `increase(…{result="error"}[1h]) > 0`: the file on disk is not what runs. |
+| `mail_auth_proxy_config_last_reload_success_timestamp_seconds` | gauge | | Unix time the configuration in use was loaded: at startup, then at each successful reload |
 | `mail_auth_proxy_auth_attempts_total` | counter | `proto` (imap, smtp, sieve), `scope` (internal, external), `mechanism` (xoauth2, oauthbearer, plain, login, other), `result` (ok, fail) | a credential was evaluated. `fail` counts every refused credential, one per `authresult` line with reason `bad_token`, `authzid_mismatch`, `blocked_endpoint`, `unknown_domain`, `unknown_account`, `throttled`, `oversize` or `backend_reject`. Backend and account-check outages (no `authresult` line) and `protocol` (counted in `mail_auth_proxy_preauth_aborts_total`) are not counted. |
 | `mail_auth_proxy_auth_refusals_total` | counter | `proto`, `reason` (`blocked_endpoint`, `bad_token`, `authzid_mismatch`, `backend_reject`, `unknown_domain`, `unknown_account`, `throttled`, `oversize`) | a refused credential, by the `reason` of its `authresult` line ([above](#the-authresult-line)). The sum over `reason` equals the `fail` side of `mail_auth_proxy_auth_attempts_total`. |
 | `mail_auth_proxy_preauth_aborts_total` | counter | `proto`, `scope` | the connection ended before a credential was presented. Not counted: a clean `LOGOUT`/`QUIT`, an IMAP client that disconnects right after the greeting (a health check), Sieve capability-probe and SMTP EHLO-probe failures. |
@@ -102,7 +104,7 @@ Metrics are off by default. They are on with `metrics.enabled = true` or when on
 | `mail_auth_proxy_ratelimit_active_blocks` | gauge | | sources blocked now; set when a block starts and by a sweep every 10 s, so an ended block leaves it up to 10 s later |
 | `mail_auth_proxy_ratelimit_evictions_total` | counter | | sources dropped from the full rate-limit table (65,536 sources) while they still had failures, a block or its escalation to remember. Rising means failed logins from that many distinct sources at once, a volume the rate limit cannot track per source |
 | `mail_auth_proxy_active_connections` | gauge | `proto` | admitted connections currently open |
-| `mail_auth_proxy_tls_cert_expiry_timestamp_seconds` | gauge | `cert` (the file of `tls.cert` and of each `tls.certificates` entry) | `notAfter` of the certificate in use from that file, Unix seconds; follows a `SIGHUP` reload, stays when the reload of that certificate is refused; 0 if it cannot be read. With several certificates, alert on the earliest: `min(…) - time()`, in Zabbix the Prometheus pattern with the function `min`. Alert on `… - time() < 14 * 86400`: a renewed file that was never reloaded still shows the old date. |
+| `mail_auth_proxy_tls_cert_expiry_timestamp_seconds` | gauge | `cert` (the file of `tls.cert` and of each `tls.certificates` entry) | `notAfter` of the certificate in use from that file, Unix seconds; follows a `SIGHUP` reload, stays when the reload of that certificate is refused; 0 if it cannot be read. The series of a file removed from the configuration by a reload disappears. With several certificates, alert on the earliest: `min(…) - time()`, in Zabbix the Prometheus pattern with the function `min`. Alert on `… - time() < 14 * 86400`: a renewed file that was never reloaded still shows the old date. |
 | `mail_auth_proxy_jwks_last_success_timestamp_seconds` | gauge | `issuer` (each `oauth.issuers` entry) | Unix time of the last JWKS fetch of the issuer that produced usable keys: at startup, periodic, on `SIGHUP`, or for an unknown `kid`. Alert when it is older than a few `oauth.refresh_secs`: the proxy still validates with the previous keys, but misses a key rotation. |
 | `mail_auth_proxy_jwks_refresh_failures_total` | counter | `issuer` | JWKS fetches of the issuer that failed (unreachable, HTTP error, oversized, not parsable) or had no usable signing key |
 | `mail_auth_proxy_jwks_keys_skipped_total` | counter | `issuer` | keys in the issuer's JWKS that were skipped because a member was missing or undecodable (such as an EC key without `y`), counted on every fetch that returns them; the other keys of the set are used. Keys skipped by design (a `use` other than `sig`, an algorithm or key type the issuer does not allow) are not counted. A steady rise means the IdP publishes a broken key; tokens signed with it fail. |
@@ -114,14 +116,68 @@ Metrics are off by default. They are on with `metrics.enabled = true` or when on
 
 | Signal | Effect |
 |---|---|
-| `SIGHUP` | Reload every TLS certificate and key (`tls.cert` and each `tls.certificates` entry), and refresh every JWKS in the background (like the periodic refresh). The configuration file is **not** re-read; a configuration change needs a restart. New handshakes get the new certificate; open connections and resumed TLS sessions keep the one they were established with. Each pair is reloaded on its own: one that cannot be loaded, does not belong together, or (in `tls.certificates`) no longer carries a DNS name is logged at `ERROR` with its file and keeps its current certificate; the others are replaced. The names a certificate carries after the reload are the names it is chosen by. A `SIGHUP` while a refresh still runs starts no second one, and `SIGTERM` is handled at once meanwhile. |
+| `SIGHUP` | Reload the configuration file, the certificates and the JWKS, without closing any connection (below). |
 | `SIGTERM`, `SIGINT` | Shutdown: every listener closes at once and new connections are refused. Open sessions, including relayed ones, may continue for up to 10 s; then the process closes whatever is still open and exits with status 0. |
 
 The signal handlers are installed first at startup, so a `SIGHUP` during startup does not end the process.
 
 Under systemd, when `$NOTIFY_SOCKET` is set (`Type=notify`), the proxy sends `READY=1` from its main process once the JWKS are loaded and every listener is bound, and `STOPPING=1` when a shutdown starts. Without the variable nothing is sent.
 
-The shipped unit uses `Type=notify`, so `systemctl start` returns only when the proxy accepts connections and fails if it never gets there. Its `ExecReload=/bin/kill -HUP $MAINPID` makes `systemctl reload mail-auth-proxy` send the `SIGHUP` reload above.
+The shipped unit uses `Type=notify`, so `systemctl start` returns only when the proxy accepts connections and fails if it never gets there. Its `ExecReload=/bin/kill -HUP $MAINPID` makes `systemctl reload mail-auth-proxy` send the `SIGHUP` reload below.
+
+### Reload (`SIGHUP`)
+
+1. The configuration file (the path the service was started with) is read and checked
+   like `--check-config`: every validation error, every certificate, key, CA, list and
+   doveadm key file. Warnings are logged as `config: …`.
+2. It is compared with the configuration in use. A change of a listener address, a
+   listener added or removed (`[submission]`, `[sieve]`) or of the metrics endpoint needs
+   a restart; such a file is refused as a whole.
+3. The new configuration is built next to the one in use: certificates, backends, legacy
+   gate, limits, rate limit, timeouts, session limits and issuers. An issuer that stays
+   (same `issuer` and `jwks_url`) keeps its keys; a new issuer's JWKS is fetched, and one
+   without usable keys refuses the reload.
+4. It replaces the one in use in a single step. Every connection accepted from then on
+   uses it; every connection already open keeps the configuration it was accepted with
+   until it ends. No connection is closed, and there is no moment without legacy rules or
+   limits. Open connections, rate-limit counts and blocks, the legacy throttle and the
+   cached capabilities of a backend that stays are carried over
+   ([configuration.md](configuration.md#reload)).
+5. The result is logged (`reload: configuration loaded …` or `ERROR reload: configuration
+   not loaded …`) and counted in `mail_auth_proxy_config_reload_total{result}`.
+6. Certificates: after a successful reload the new configuration's certificates are the
+   ones just loaded (`reload: certificate loaded` per file). After a refused one each
+   certificate of the configuration in use is re-read on its own, so a renewed
+   certificate is served even while the configuration file is broken: one that cannot be
+   loaded, does not belong together, or (in `tls.certificates`) no longer carries a DNS
+   name is logged at `ERROR` with its file and keeps its current certificate. New
+   handshakes get the new certificate; open connections and resumed TLS sessions keep
+   the one they were established with.
+7. Every JWKS of the configuration in use is refreshed in the background (like the
+   periodic refresh). A `SIGHUP` while a refresh still runs starts no second one.
+
+`SIGHUP`s that arrive during a reload are folded into one more reload after it. `SIGTERM`
+is handled at once meanwhile.
+
+A connection opened before a reload is judged by the rules it was accepted with: a
+stricter legacy rule, a removed issuer or a lower limit reaches it only if it reconnects.
+Before login that lasts at most `timeouts.preauth_secs`. After login the proxy checks no
+credential again (the session relays bytes), and the `[session]` limits it was accepted
+with apply. To end open sessions after a change, restart the service or end them at the
+backend (`doveadm kick`).
+
+### Configuration change or package update
+
+- **Configuration change** (`config.toml`, a certificate, a users or domains file):
+  `mail-auth-proxy --check-config /etc/mail-auth-proxy/config.toml`, then
+  `systemctl reload mail-auth-proxy`, and check the journal for
+  `reload: configuration loaded` (or the `ERROR` line): `systemctl reload` returns once
+  the signal is sent, not when the reload is done. A change the reload refuses as
+  restart-only needs `systemctl restart mail-auth-proxy`. The users and domains files are
+  also re-read by themselves within seconds of a change.
+- **Package update** (a new binary): a restart. The package does it itself for a running
+  service, after checking the configuration ([INSTALL.md](../INSTALL.md#5-upgrade)); a
+  reload would keep the old binary running.
 
 ## Log-based blocking
 
@@ -153,7 +209,7 @@ and an `Environment=` line) while you look for them, and switch back afterwards.
 | Every IMAP or ManageSieve login gets retry-later | `WARN … session ended … error=` naming `UNAUTHENTICATE` | the backend offers `UNAUTHENTICATE` (RFC 8437); disable it there ([SECURITY.md](../SECURITY.md#operator-responsibilities)) |
 | Logins get retry-later under load or with a slow IdP | `WARN … session ended … error=` with `pre-auth budget of <n>s used up during …` | token validation (a JWKS refresh), the account check or the backend login did not finish within `timeouts.preauth_secs` from the accept |
 | Password logins get retry-later although the backend is up | `WARN … session ended … error=` with the account check | doveadm HTTP API unreachable, wrong key, TLS not trusted (`doveadm_ca_file`) |
-| All clients of one address get connection failures (no greeting, no TLS) for minutes or hours | `WARN authlog: ratelimit … source=<cidr>`; `mail_auth_proxy_ratelimit_blocks_total` | the failed-login rate limit blocked the address: many users behind one NAT or webmail server with wrong passwords, or an attacker sharing it. Add the address to `auth_ratelimit.exempt_networks` (or set `exempt_internal`) and restart; a restart also clears all blocks |
+| All clients of one address get connection failures (no greeting, no TLS) for minutes or hours | `WARN authlog: ratelimit … source=<cidr>`; `mail_auth_proxy_ratelimit_blocks_total` | the failed-login rate limit blocked the address: many users behind one NAT or webmail server with wrong passwords, or an attacker sharing it. Add the address to `auth_ratelimit.exempt_networks` (or set `exempt_internal`) and reload: an exempt source is free at once, the blocks of other sources run on. A restart clears all blocks |
 | A password rule suddenly matches nobody | `ERROR … legacy list file unusable` | a `users_file` or `domains_file` became unreadable or invalid; fix it, it is re-read within seconds |
 | Postfix logs the proxy's address instead of the client's | Postfix log | `submission.xclient = true` but the proxy is not in `smtpd_authorized_xclient_hosts`: Postfix does not advertise `XCLIENT` and the step is skipped silently |
 | Every submission login gets `454` retry-later | `WARN … backend advertises XCLIENT to this proxy but submission.xclient = false` | the proxy is in `smtpd_authorized_xclient_hosts` but `submission.xclient` is off; set it to `true` or remove the proxy from that list |
@@ -161,3 +217,4 @@ and an `Environment=` line) while you look for them, and switch back afterwards.
 | A client fails with `unrecognized_name` ("unrecognised name", "SSL alert 112") | `WARN … session ended … TLS server name … is not a name of any configured certificate` | the client asks for a name that no certificate carries: add it to a certificate (or a `[[tls.certificates]]` entry) and reload, or have the client use a configured name |
 | A client reports a connection loss after a wrong password | | `limits.max_auth_attempts` attempts used up, or the rate limit blocked the source; the client must reconnect (see [protocols](protocols.md#surprising-and-client-incompatible-behaviour)) |
 | New certificate not served | `reload: certificate loaded` / `ERROR reload: certificate unusable` | `SIGHUP` not sent after renewal, or the new files are not readable by the service group |
+| A configuration change has no effect | `ERROR reload: configuration not loaded … error=…`; `mail_auth_proxy_config_reload_total{result="error"}` | the reload was refused and the previous configuration runs on: fix what `error=` names (`mail-auth-proxy --check-config` lists every problem) and reload again; `changed <key>: needs a restart`: restart instead. Without an `ERROR` line: no `SIGHUP` was sent, or the client still uses a connection opened before the reload |

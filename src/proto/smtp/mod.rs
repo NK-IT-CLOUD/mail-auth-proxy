@@ -32,8 +32,9 @@ pub struct Submission {
     /// `submission.ehlo_extensions`: the keywords the EHLO reply may list
     /// at most; `None`: every one of `ehlo::RELAYED`.
     pub ehlo_only: Option<Vec<String>>,
-    /// The backend's post-TLS EHLO extensions.
-    pub ehlo: ehlo::EhloCache,
+    /// The backend's post-TLS EHLO extensions; a reload that keeps the
+    /// backend keeps them.
+    pub ehlo: Arc<ehlo::EhloCache>,
     /// How long they are reused.
     pub caps_ttl: std::time::Duration,
 }

@@ -2,6 +2,7 @@
 
 mod listener;
 mod notify;
+mod reload;
 pub(crate) mod tls;
 
 pub(crate) use listener::ACCEPT_BACKOFF;
@@ -9,7 +10,7 @@ pub(crate) use listener::ACCEPT_BACKOFF;
 use crate::config;
 use crate::obs::metrics;
 use crate::proto::imap::Imap;
-use crate::proto::sieve::{CapsCache, Sieve};
+use crate::proto::sieve::Sieve;
 use crate::proto::smtp::Submission;
 use crate::wire::Tuning;
 use anyhow::{Context, Result};
@@ -109,64 +110,202 @@ impl<P> std::ops::Deref for Ctx<P> {
     }
 }
 
-/// Everything built from the configuration without network access.
-struct Local {
+/// Everything built from one configuration: what a connection gets when it
+/// is accepted while that configuration is in use, and keeps to its end. A
+/// reload builds a new one and swaps it in whole (`reload`).
+pub(crate) struct Generation {
+    config: config::Config,
     certs: Arc<tls::CertStore>,
-    nets: Vec<IpNet>,
-    legacy: crate::auth::legacy::Gate,
-    imap: Imap,
-    submission: Option<Submission>,
-    sieve: Option<Sieve>,
+    shared: Arc<Shared>,
+    imap: Arc<Ctx<Imap>>,
+    submission: Option<Arc<Ctx<Submission>>>,
+    sieve: Option<Arc<Ctx<Sieve>>>,
 }
 
-/// Build everything that needs no network: certificates, backends, gate.
-fn build_local(cfg: &config::Config) -> Result<Local> {
-    metrics::register_certs(cfg.tls.pairs().map(|(_, cert, _)| cert));
-    let certs = Arc::new(tls::CertStore::load(&cfg.tls)?);
-    let nets = crate::auth::policy::parse_internal_nets(&cfg.scope.internal_networks)?;
-    let legacy = crate::auth::legacy::Gate::new(
-        &cfg.legacy,
-        std::time::Duration::from_secs(cfg.timeouts.connect_secs),
-    )?;
-    let keepalive = keepalive(&cfg.session);
-    let imap = Imap {
-        acceptor: tls::acceptor(&certs, Some(b"imap")),
-        backend: BackendConn::new(&cfg.imap.backend, keepalive)?,
-    };
-    let submission = cfg
-        .submission
-        .as_ref()
-        .map(|s| -> Result<Submission> {
-            Ok(Submission {
-                acceptor: tls::acceptor(&certs, None),
-                backend: BackendConn::new(&s.backend, keepalive)?,
-                xclient: s.xclient,
-                ehlo_only: s.ehlo_extensions.clone(),
-                ehlo: Default::default(),
-                caps_ttl: std::time::Duration::from_secs(s.capability_cache_secs),
+impl Generation {
+    /// Build from `cfg` (validated): certificates, backends, gate, limits,
+    /// then the token validator. `prev` is the generation in use on a
+    /// reload: what runs across configurations (open connections, rate
+    /// limit counts and blocks, throttle, backend capability caches, known
+    /// JWKS) is carried over from it. Returns the issuers whose JWKS were
+    /// fetched for a reload.
+    async fn build(
+        cfg: config::Config,
+        prev: Option<&Generation>,
+    ) -> Result<(Generation, Vec<String>)> {
+        let certs = Arc::new(tls::CertStore::load(&cfg.tls)?);
+        let nets = crate::auth::policy::parse_internal_nets(&cfg.scope.internal_networks)?;
+        let mut legacy = crate::auth::legacy::Gate::new(
+            &cfg.legacy,
+            std::time::Duration::from_secs(cfg.timeouts.connect_secs),
+        )?;
+        let keepalive = keepalive(&cfg.session);
+        let imap = Imap {
+            acceptor: tls::acceptor(&certs, Some(b"imap")),
+            backend: BackendConn::new(&cfg.imap.backend, keepalive)?,
+        };
+        // The capability caches stay with a backend that stays.
+        let submission = cfg
+            .submission
+            .as_ref()
+            .map(|s| -> Result<Submission> {
+                let kept = prev
+                    .and_then(|p| p.submission.as_ref().zip(p.config.submission.as_ref()))
+                    .filter(|(_, old)| old.backend == s.backend)
+                    .map(|(ctx, _)| ctx.protocol.ehlo.clone());
+                Ok(Submission {
+                    acceptor: tls::acceptor(&certs, None),
+                    backend: BackendConn::new(&s.backend, keepalive)?,
+                    xclient: s.xclient,
+                    ehlo_only: s.ehlo_extensions.clone(),
+                    ehlo: kept.unwrap_or_default(),
+                    caps_ttl: std::time::Duration::from_secs(s.capability_cache_secs),
+                })
             })
-        })
-        .transpose()?;
-    let sieve = cfg
-        .sieve
-        .as_ref()
-        .map(|s| -> Result<Sieve> {
-            Ok(Sieve {
-                acceptor: tls::acceptor(&certs, Some(b"managesieve")),
-                backend: BackendConn::new(&s.backend, keepalive)?,
-                caps: CapsCache::default(),
-                caps_ttl: std::time::Duration::from_secs(s.capability_cache_secs),
+            .transpose()?;
+        let sieve = cfg
+            .sieve
+            .as_ref()
+            .map(|s| -> Result<Sieve> {
+                let kept = prev
+                    .and_then(|p| p.sieve.as_ref().zip(p.config.sieve.as_ref()))
+                    .filter(|(_, old)| old.backend == s.backend)
+                    .map(|(ctx, _)| ctx.protocol.caps.clone());
+                Ok(Sieve {
+                    acceptor: tls::acceptor(&certs, Some(b"managesieve")),
+                    backend: BackendConn::new(&s.backend, keepalive)?,
+                    caps: kept.unwrap_or_default(),
+                    caps_ttl: std::time::Duration::from_secs(s.capability_cache_secs),
+                })
             })
-        })
-        .transpose()?;
-    Ok(Local {
-        certs,
-        nets,
-        legacy,
-        imap,
-        submission,
-        sieve,
-    })
+            .transpose()?;
+        let l = &cfg.limits;
+        let (limits, ratelimit) = match prev {
+            None => (
+                crate::limits::Limits::new(
+                    l.max_connections,
+                    l.max_preauth_per_ip,
+                    l.ipv6_source_prefix,
+                ),
+                crate::ratelimit::AuthRateLimit::new(
+                    &cfg.auth_ratelimit,
+                    &nets,
+                    l.ipv6_source_prefix,
+                )?,
+            ),
+            Some(p) => {
+                legacy.carry_over(&p.shared.legacy);
+                (
+                    p.shared.limits.reconfigured(
+                        l.max_connections,
+                        l.max_preauth_per_ip,
+                        l.ipv6_source_prefix,
+                    ),
+                    p.shared.ratelimit.reconfigured(
+                        &cfg.auth_ratelimit,
+                        &nets,
+                        l.ipv6_source_prefix,
+                    )?,
+                )
+            }
+        };
+        // Last: the only step that may wait for the network.
+        let (validator, fetched) = match prev {
+            None => (
+                crate::auth::token::Validator::new(&cfg.oauth).await?,
+                Vec::new(),
+            ),
+            Some(p) => p.shared.validator.reconfigured(&cfg.oauth).await?,
+        };
+        let shared = Arc::new(Shared {
+            validator: Arc::new(validator),
+            error_challenge: crate::auth::discovery::ErrorChallenge::from_config(&cfg.oauth),
+            nets,
+            legacy,
+            hostname: cfg.server.hostname.clone(),
+            limits,
+            ratelimit: Arc::new(ratelimit),
+            tuning: Tuning {
+                idle: std::time::Duration::from_secs(cfg.timeouts.idle_secs),
+                connect: std::time::Duration::from_secs(cfg.timeouts.connect_secs),
+                preauth: std::time::Duration::from_secs(cfg.timeouts.preauth_secs),
+                max_preauth_commands: cfg.limits.max_preauth_commands,
+                max_auth_attempts: cfg.limits.max_auth_attempts,
+                keepalive,
+                session_idle: cfg
+                    .session
+                    .idle_limit_secs
+                    .map(std::time::Duration::from_secs),
+                max_session: cfg
+                    .session
+                    .max_session_secs
+                    .map(std::time::Duration::from_secs),
+            },
+        });
+        let generation = Generation {
+            imap: Arc::new(Ctx {
+                shared: shared.clone(),
+                protocol: imap,
+            }),
+            submission: submission.map(|protocol| {
+                Arc::new(Ctx {
+                    shared: shared.clone(),
+                    protocol,
+                })
+            }),
+            sieve: sieve.map(|protocol| {
+                Arc::new(Ctx {
+                    shared: shared.clone(),
+                    protocol,
+                })
+            }),
+            certs,
+            shared,
+            config: cfg,
+        };
+        Ok((generation, fetched))
+    }
+
+    /// Start what a generation runs while it is in use: the list file
+    /// reloader of its gate, the capability probes of its backends (a no-op
+    /// while a kept cache is fresh). Needs a Tokio runtime.
+    fn start(&self) {
+        self.shared.legacy.spawn_reloader();
+        if let Some(ctx) = &self.submission {
+            tokio::spawn(crate::proto::smtp::probe_at_startup(ctx.clone()));
+        }
+        if let Some(ctx) = &self.sieve {
+            tokio::spawn(crate::proto::sieve::probe_at_startup(ctx.clone()));
+        }
+    }
+
+    /// Log what the configuration allows: the TLS names and their warnings,
+    /// the legacy rules and gate, the auth rate limit.
+    fn announce(&self) {
+        let cfg = &self.config;
+        tracing::info!(target: crate::obs::target::MAIN, names=?self.certs.names(), "TLS server names");
+        for w in tls_warnings(cfg, &self.certs) {
+            tracing::warn!(target: crate::obs::target::MAIN, "config: {w}");
+        }
+        if self.shared.legacy.is_off() {
+            tracing::info!(target: crate::obs::target::MAIN, "password auth disabled: OAuth only");
+        } else {
+            for r in &cfg.legacy.rules {
+                tracing::info!(target: crate::obs::target::MAIN, rule=%r.name, networks=?r.networks, sni=?r.sni, users=?r.users, users_file=?r.users_file,
+                    protocols=?r.protocols, mechanisms=?r.mechanisms, "legacy password rule");
+            }
+            let l = &cfg.legacy;
+            tracing::info!(target: crate::obs::target::MAIN, domain_gate=l.has_domain_gate(), account_check=?l.account_check,
+                throttle=?l.throttle, failure_delay_ms=l.failure_delay_ms, "legacy password gate");
+        }
+        if self.shared.ratelimit.is_enabled() {
+            let r = &cfg.auth_ratelimit;
+            tracing::info!(target: crate::obs::target::MAIN, failures=r.failures, window_secs=r.window_secs, block_secs=r.block_secs,
+                max_block_secs=r.max_block_secs, exempt_internal=r.exempt_internal, exempt_networks=?r.exempt_networks, "auth rate limit");
+        } else {
+            tracing::info!(target: crate::obs::target::MAIN, "auth rate limit disabled");
+        }
+    }
 }
 
 /// `[session]` keepalive, for client and backend connections alike.
@@ -288,15 +427,26 @@ fn tls_warnings(cfg: &config::Config, store: &tls::CertStore) -> Vec<String> {
 /// How long a shutdown waits for open sessions to end before it closes them.
 const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Serve `cfg` (already validated): build the listeners' shared context,
-/// fetch the JWKS, start the metrics endpoint and the configured listeners, then
-/// serve until SIGTERM or SIGINT.
+/// Everything `--check-config` finds in a loaded configuration: the
+/// problems (validation errors and file problems, all of them) and the
+/// warnings (validation and certificate files). A reload checks the same.
+pub fn check(loaded: &config::Loaded) -> (Vec<String>, Vec<String>) {
+    let mut problems = loaded.errors.clone();
+    problems.extend(file_problems(&loaded.config));
+    let mut warnings = loaded.warnings.clone();
+    warnings.extend(file_warnings(&loaded.config));
+    (problems, warnings)
+}
+
+/// Serve `cfg` (already validated, read from `path`): build the listeners'
+/// shared context, fetch the JWKS, start the metrics endpoint and the
+/// configured listeners, then serve until SIGTERM or SIGINT.
 ///
-/// SIGHUP reloads the client certificate and refreshes every JWKS without
-/// touching open connections. SIGTERM/SIGINT stop accepting, give open
+/// SIGHUP reloads the configuration from `path` without touching open
+/// connections (`reload`). SIGTERM/SIGINT stop accepting, give open
 /// sessions up to `SHUTDOWN_DRAIN` to end, then return. Under systemd
 /// (`$NOTIFY_SOCKET`) readiness and shutdown are notified.
-pub async fn run(cfg: config::Config) -> Result<()> {
+pub async fn run(path: String, cfg: config::Config) -> Result<()> {
     // First, before anything slow: SIGHUP's default action terminates the
     // process, and a reload sent during startup must not.
     use tokio::signal::unix::{signal, SignalKind};
@@ -308,87 +458,37 @@ pub async fn run(cfg: config::Config) -> Result<()> {
     // not start, rather than fail on the first refused login.
     crate::obs::authlog::init_fingerprint_key().context("password fingerprint key")?;
     crate::ratelimit::init_fingerprint_key().context("rate limit fingerprint key")?;
-    let Local {
-        certs,
-        nets,
-        legacy,
-        imap,
-        submission,
-        sieve,
-    } = build_local(&cfg)?;
-    tracing::info!(target: crate::obs::target::MAIN, names=?certs.names(), "TLS server names");
-    for w in tls_warnings(&cfg, &certs) {
-        tracing::warn!(target: crate::obs::target::MAIN, "config: {w}");
-    }
-    if legacy.is_off() {
-        tracing::info!(target: crate::obs::target::MAIN, "password auth disabled: OAuth only");
-    } else {
-        for r in &cfg.legacy.rules {
-            tracing::info!(target: crate::obs::target::MAIN, rule=%r.name, networks=?r.networks, sni=?r.sni, users=?r.users, users_file=?r.users_file,
-                protocols=?r.protocols, mechanisms=?r.mechanisms, "legacy password rule");
-        }
-        let l = &cfg.legacy;
-        tracing::info!(target: crate::obs::target::MAIN, domain_gate=l.has_domain_gate(), account_check=?l.account_check,
-            throttle=?l.throttle, failure_delay_ms=l.failure_delay_ms, "legacy password gate");
-    }
-    legacy.spawn_reloader();
-    let ratelimit = Arc::new(crate::ratelimit::AuthRateLimit::new(
-        &cfg.auth_ratelimit,
-        &nets,
-        cfg.limits.ipv6_source_prefix,
-    )?);
-    if ratelimit.is_enabled() {
-        let r = &cfg.auth_ratelimit;
-        tracing::info!(target: crate::obs::target::MAIN, failures=r.failures, window_secs=r.window_secs, block_secs=r.block_secs,
-            max_block_secs=r.max_block_secs, exempt_internal=r.exempt_internal, exempt_networks=?r.exempt_networks, "auth rate limit");
-    } else {
-        tracing::info!(target: crate::obs::target::MAIN, "auth rate limit disabled");
-    }
-    ratelimit.spawn_sweeper();
-    let validator = Arc::new(crate::auth::token::Validator::new(&cfg.oauth).await?);
-    // IdPs rotate signing keys; without a refresh the proxy stops accepting
-    // every token minted after a rotation until it is restarted.
-    validator.clone().spawn_refresher();
-    let shared = Arc::new(Shared {
-        validator,
-        error_challenge: crate::auth::discovery::ErrorChallenge::from_config(&cfg.oauth),
-        nets,
-        legacy,
-        hostname: cfg.server.hostname.clone(),
-        limits: crate::limits::Limits::new(
-            cfg.limits.max_connections,
-            cfg.limits.max_preauth_per_ip,
-            cfg.limits.ipv6_source_prefix,
-        ),
-        ratelimit,
-        tuning: Tuning {
-            idle: std::time::Duration::from_secs(cfg.timeouts.idle_secs),
-            connect: std::time::Duration::from_secs(cfg.timeouts.connect_secs),
-            preauth: std::time::Duration::from_secs(cfg.timeouts.preauth_secs),
-            max_preauth_commands: cfg.limits.max_preauth_commands,
-            max_auth_attempts: cfg.limits.max_auth_attempts,
-            keepalive: keepalive(&cfg.session),
-            session_idle: cfg
-                .session
-                .idle_limit_secs
-                .map(std::time::Duration::from_secs),
-            max_session: cfg
-                .session
-                .max_session_secs
-                .map(std::time::Duration::from_secs),
-        },
-    });
+    let (generation, _) = Generation::build(cfg, None).await?;
+    metrics::register_certs(generation.config.tls.pairs().map(|(_, cert, _)| cert));
+    generation.certs.record_expiry();
+    metrics::mark_config_loaded();
+    generation.announce();
+    generation.start();
+    let generation = Arc::new(generation);
 
     // Optional Prometheus /metrics endpoint. Runs in its own task and owns its
     // errors — a bind failure here must never take down the mail listeners.
-    if let Some(addr) = cfg
-        .metrics
-        .listen
-        .clone()
-        .filter(|_| cfg.metrics.is_enabled())
-    {
+    let m = &generation.config.metrics;
+    if let Some(addr) = m.listen.clone().filter(|_| m.is_enabled()) {
         tokio::spawn(async move {
             metrics::serve(addr).await;
+        });
+    }
+
+    // The generation in use: each accept takes it, a reload replaces it.
+    let (current, _) = tokio::sync::watch::channel(generation.clone());
+    // IdPs rotate signing keys; without a refresh the proxy stops accepting
+    // every token minted after a rotation until it is restarted.
+    {
+        let current = current.subscribe();
+        crate::auth::token::Validator::spawn_refresher(move || {
+            current.borrow().shared.validator.clone()
+        });
+    }
+    {
+        let current = current.subscribe();
+        crate::ratelimit::AuthRateLimit::spawn_sweeper(move || {
+            current.borrow().shared.ratelimit.clone()
         });
     }
 
@@ -399,64 +499,57 @@ pub async fn run(cfg: config::Config) -> Result<()> {
         alive,
     };
 
+    let cfg = &generation.config;
     let listener = TcpListener::bind(&cfg.imap.listen).await?;
     tracing::info!(target: crate::obs::target::MAIN, listen=%cfg.imap.listen, backend=%cfg.imap.backend.address, "imap listener up");
     listener::spawn_listener(
         listener,
         metrics::Proto::Imap,
         "session ended",
-        Arc::new(Ctx {
-            shared: shared.clone(),
-            protocol: imap,
-        }),
+        current.subscribe(),
+        |g| Some(g.imap.clone()),
         crate::proto::imap::handle,
         life.clone(),
     );
 
-    if let Some((sub, protocol)) = cfg.submission.as_ref().zip(submission) {
+    if let Some(sub) = &cfg.submission {
         let sub_listener = TcpListener::bind(&sub.listen).await?;
         tracing::info!(target: crate::obs::target::MAIN, listen=%sub.listen, backend=%sub.backend.address, "submission listener up");
-        let ctx = Arc::new(Ctx {
-            shared: shared.clone(),
-            protocol,
-        });
-        tokio::spawn(crate::proto::smtp::probe_at_startup(ctx.clone()));
         listener::spawn_listener(
             sub_listener,
             metrics::Proto::Smtp,
             "submission session ended",
-            ctx,
+            current.subscribe(),
+            |g| g.submission.clone(),
             crate::proto::smtp::handle,
             life.clone(),
         );
     }
 
-    if let Some((sv, protocol)) = cfg.sieve.as_ref().zip(sieve) {
+    if let Some(sv) = &cfg.sieve {
         let sieve_listener = TcpListener::bind(&sv.listen).await?;
         tracing::info!(target: crate::obs::target::MAIN, listen=%sv.listen, backend=%sv.backend.address, "sieve listener up");
-        let ctx = Arc::new(Ctx {
-            shared: shared.clone(),
-            protocol,
-        });
-        tokio::spawn(crate::proto::sieve::probe_at_startup(ctx.clone()));
         listener::spawn_listener(
             sieve_listener,
             metrics::Proto::Sieve,
             "sieve session ended",
-            ctx,
+            current.subscribe(),
+            |g| g.sieve.clone(),
             crate::proto::sieve::handle,
             life.clone(),
         );
     }
+    drop(generation);
 
     drop(life);
     notify::notify(notify::READY);
 
-    // The JWKS refresh of the last SIGHUP, if one ran; at most one at a time.
-    let mut jwks_refresh: Option<tokio::task::JoinHandle<()>> = None;
+    // SIGHUPs that arrive during a reload are folded into one more reload.
+    let wanted = Arc::new(tokio::sync::Notify::new());
+    tokio::spawn(reload::run(path, current, wanted.clone()));
     loop {
         tokio::select! {
-            _ = hangup.recv() => reload(&certs, &shared.validator, &mut jwks_refresh),
+            _ = hangup.recv() => wanted.notify_one(),
             _ = terminate.recv() => break,
             _ = interrupt.recv() => break,
         }
@@ -472,42 +565,4 @@ pub async fn run(cfg: config::Config) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// SIGHUP: re-read the client certificates and refresh every JWKS. Each part
-/// (each certificate on its own) keeps what it had when it fails; open
-/// connections are not touched. The configuration file itself is not
-/// re-read.
-///
-/// The refresh runs in its own task (a slow IdP can take up to the fetch
-/// timeout per issuer), so the signal loop stays free to handle SIGTERM at
-/// once; a SIGHUP while one is still running starts no second one.
-fn reload(
-    certs: &tls::CertStore,
-    validator: &Arc<crate::auth::token::Validator>,
-    running: &mut Option<tokio::task::JoinHandle<()>>,
-) {
-    for (cert, r) in certs.reload() {
-        match r {
-            Ok(()) => {
-                tracing::info!(target: crate::obs::target::MAIN, cert=%cert, "reload: certificate loaded")
-            }
-            Err(e) => {
-                tracing::error!(target: crate::obs::target::MAIN, cert=%cert, error=%format!("{e:#}"), "reload: certificate unusable; keeping the current one")
-            }
-        }
-    }
-    if running.as_ref().is_some_and(|t| !t.is_finished()) {
-        tracing::info!(target: crate::obs::target::MAIN, "reload: JWKS refresh already running");
-        return;
-    }
-    let validator = validator.clone();
-    *running = Some(tokio::spawn(async move {
-        match validator.refresh().await {
-            Ok(()) => tracing::info!(target: crate::obs::target::MAIN, "reload: JWKS refreshed"),
-            Err(e) => {
-                tracing::warn!(target: crate::obs::target::MAIN, error=%e, "reload: JWKS refresh failed; keeping previous keys")
-            }
-        }
-    }));
 }

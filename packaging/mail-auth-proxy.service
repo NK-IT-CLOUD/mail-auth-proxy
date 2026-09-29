@@ -8,7 +8,8 @@ Wants=network-online.target
 # and STOPPING=1 on shutdown (from the main process: NotifyAccess=main).
 Type=notify
 ExecStart=/usr/bin/mail-auth-proxy /etc/mail-auth-proxy/config.toml
-# SIGHUP: reload the TLS certificate and refresh the JWKS (not the config file)
+# SIGHUP: reload the config file (listener and metrics addresses need a
+# restart), the TLS certificates and the JWKS; open connections stay
 ExecReload=/bin/kill -HUP $MAINPID
 Environment=RUST_LOG=info
 # Unprivileged system user from sysusers.d; its group owns the config and the TLS

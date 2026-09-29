@@ -26,12 +26,28 @@ client ──TLS──▶ mail-auth-proxy ────────────�
                  7. relay the backend's verdict; on success relay bytes until either side closes
 ```
 
-Each connection is one tokio task. Connections share only the JWKS key set, the server certificates, the ManageSieve capability and SMTP EHLO caches, the legacy gate's caches and counters, the connection limits, the failed-login counters and the metrics. Trust boundaries and the threat model are in [SECURITY.md](../SECURITY.md#trust-boundaries).
+Each connection is one tokio task. It takes the configuration in use when it is accepted and keeps it to its end ([configuration reload](#configuration-reload)). Connections share only the JWKS key set, the server certificates, the ManageSieve capability and SMTP EHLO caches, the legacy gate's caches and counters, the connection limits, the failed-login counters and the metrics. Trust boundaries and the threat model are in [SECURITY.md](../SECURITY.md#trust-boundaries).
 
 ## Startup
 
 - The configuration is validated before anything else; an error aborts the start, and warnings are logged. File paths (`tls.cert`, `tls.key`, `ca_file`, `domains_file`, `doveadm_key_file`, `doveadm_ca_file`, `users_file`) must be absolute: a relative path would resolve against the working directory, so `--check-config` in a shell could pass on files the service never reads. A relative path is a validation error.
 - The two per-process HMAC keys, for the password fingerprint (`pwfp`) and for the rate limit's fingerprints of repeated credentials, are generated from the system RNG before the certificate, the JWKS and the listeners. Without a system RNG the proxy refuses to start. The keys are never written anywhere; a restart makes new ones.
+
+## Configuration reload
+
+Everything built from one configuration is one generation: the certificate store and the TLS acceptors, the backends with their trust anchors, the legacy gate, the connection limits, the rate limit's settings, the timeouts and session limits, the token validator with its issuers, the hostname. Each listener reads the generation in use at `accept()` and hands the connection its own reference, which the connection keeps until it ends.
+
+`SIGHUP` reads the file again, runs the checks of `--check-config` and compares the result with the generation in use (`config::plan`): a listener address, a listener more or less, or the metrics endpoint cannot change without binding sockets, so such a file is refused. Otherwise a new generation is built next to the old one and replaces it in one step (a `tokio::sync::watch` value); nothing is changed in place, so a connection sees either the whole old or the whole new configuration, never a mix and never a gap. Building fails without effect: a certificate that does not load, a list file, an issuer whose JWKS cannot be fetched.
+
+State that belongs to the process rather than to a configuration is shared by the generations:
+
+- the counts of open and unauthenticated connections (`Limits::reconfigured`): a lowered limit refuses new connections until enough old ones have ended;
+- the rate limit's sources, counts and blocks (`AuthRateLimit::reconfigured`); a block counted under an earlier `ipv6_source_prefix` holds until it expires;
+- the legacy throttle's counts and account turns, and the learned refusal timing (`Gate::carry_over`);
+- the SMTP EHLO and ManageSieve capability caches of a backend whose settings are unchanged;
+- the last JWKS of each issuer: an issuer that stays gets its keys from it under its new rules without a fetch (`Validator::reconfigured`).
+
+The JWKS refresh and the rate limit's sweep run on the generation in use. An old generation lives as long as a connection holds it; the list file reloader of its gate ends with it. The metrics' `issuer` and `cert` label sets follow the generation in use.
 
 ## Client TLS
 
@@ -242,7 +258,7 @@ Limits are checked at `accept()`, before TLS:
 - **Repeats:** a credential identical to one of the source's last 8 failures in the window (same user and same password or token) counts once. A client retrying a stale password or an expired token does not block its address, and repeating a guess gains nothing. The comparison uses a keyed 64-bit fingerprint; the secret is not kept.
 - **Successful logins** do not reset the count: one valid account must not clear the way for guesses at others.
 - **Block:** after `failures` counted failures within `window_secs` (a window starts with the first failure), new connections from the source are closed at accept for `block_secs`, on every listener. An open connection from the source is closed at its next credential, before it is judged. Each further block of the same source doubles, up to `max_block_secs`; the escalation is forgotten once the last block ended `max_block_secs` ago. Failures of connections opened before the block do not extend it.
-- **Exempt:** sources in `exempt_networks` (default: loopback), and with `exempt_internal = true` also sources in `scope.internal_networks`. They are not counted at all.
+- **Exempt:** sources in `exempt_networks` (default: loopback), and with `exempt_internal = true` also sources in `scope.internal_networks`. They are neither counted nor blocked, so a source that a reload exempts is free at once.
 - **Memory:** at most 65,536 sources. A full table first drops entries with nothing left to remember, then the least valuable 1,024 (unblocked before blocked, oldest first); they are counted in `mail_auth_proxy_ratelimit_evictions_total`. Entries are also swept every 10 s.
 
 A blocked connection is closed like one over a connection limit: before TLS, with no greeting, no `421`, no `554` and no `BYE`. RFC 5321 (section 3.1: `554` instead of the greeting) and RFC 9051 (section 7.1.5: `BYE` as the greeting) allow a server to turn a connection away with a reply, but on the implicit-TLS IMAP port that reply needs a full TLS handshake per blocked connection, and a distinct reply would tell a guesser that it was blocked and how fast it may go. A client behind a blocked address sees a connection failure, the same as with a firewall-based ban.

@@ -10,7 +10,7 @@
 
 use super::authlog::Reason;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -357,27 +357,60 @@ struct IssuerStats {
     keys_skipped: AtomicU64,
 }
 
-// The configured issuers, set once at startup; the label set is fixed then.
-static ISSUERS: std::sync::OnceLock<Vec<IssuerStats>> = std::sync::OnceLock::new();
+// The configured issuers: the label set of the JWKS metrics, replaced when
+// a configuration is loaded.
+static ISSUERS: RwLock<Vec<Arc<IssuerStats>>> = RwLock::new(Vec::new());
 
-/// Register the configured issuers (the `issuer` label values of the JWKS
-/// metrics). Only the first call counts.
+/// Set the configured issuers (the `issuer` label values of the JWKS
+/// metrics). An issuer that was already registered keeps its values; one
+/// that is no longer listed is no longer exported.
 pub fn register_issuers<'a>(issuers: impl IntoIterator<Item = &'a str>) {
-    let _ = ISSUERS.set(
-        issuers
-            .into_iter()
-            .map(|i| IssuerStats {
-                issuer: i.to_string(),
-                last_success: AtomicU64::new(0),
-                failures: AtomicU64::new(0),
-                keys_skipped: AtomicU64::new(0),
-            })
-            .collect(),
+    let mut current = ISSUERS.write().unwrap_or_else(|p| p.into_inner());
+    *current = relabel(
+        &current,
+        issuers,
+        |s| &s.issuer,
+        |i| IssuerStats {
+            issuer: i.to_string(),
+            last_success: AtomicU64::new(0),
+            failures: AtomicU64::new(0),
+            keys_skipped: AtomicU64::new(0),
+        },
     );
 }
 
-/// The issuers every unit test registers: only the first registration in the
-/// test process counts, so all tests must pass the same list.
+/// The stats for the label values `names`, in that order: those of
+/// `current` that stay, new ones from `new`.
+fn relabel<'a, T>(
+    current: &[Arc<T>],
+    names: impl IntoIterator<Item = &'a str>,
+    name: impl Fn(&T) -> &str,
+    new: impl Fn(&str) -> T,
+) -> Vec<Arc<T>> {
+    names
+        .into_iter()
+        .map(|n| {
+            current
+                .iter()
+                .find(|s| name(s) == n)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(new(n)))
+        })
+        .collect()
+}
+
+/// The registered stats of `issuer`, if any.
+fn issuer_stats(issuer: &str) -> Option<Arc<IssuerStats>> {
+    ISSUERS
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|s| s.issuer == issuer)
+        .cloned()
+}
+
+/// The issuers every unit test registers: the registration is process-wide,
+/// so all tests must pass the same list.
 #[cfg(test)]
 pub const TEST_ISSUERS: [&str; 2] = [
     // Needs escaping in the label value.
@@ -388,10 +421,7 @@ pub const TEST_ISSUERS: [&str; 2] = [
 /// Record one JWKS fetch of `issuer`: `ok` when it produced usable keys.
 /// An issuer that was not registered is ignored.
 pub fn record_jwks_fetch(issuer: &str, ok: bool) {
-    let Some(s) = ISSUERS
-        .get()
-        .and_then(|v| v.iter().find(|s| s.issuer == issuer))
-    else {
+    let Some(s) = issuer_stats(issuer) else {
         return;
     };
     if ok {
@@ -404,10 +434,7 @@ pub fn record_jwks_fetch(issuer: &str, ok: bool) {
 /// Record `n` keys of `issuer`'s JWKS that were skipped because a member was
 /// missing or undecodable. An issuer that was not registered is ignored.
 pub fn record_jwks_keys_skipped(issuer: &str, n: u64) {
-    if let Some(s) = ISSUERS
-        .get()
-        .and_then(|v| v.iter().find(|s| s.issuer == issuer))
-    {
+    if let Some(s) = issuer_stats(issuer) {
         s.keys_skipped.fetch_add(n, Ordering::Relaxed);
     }
 }
@@ -421,29 +448,51 @@ struct CertStats {
     not_after: AtomicU64,
 }
 
-// The configured certificate files, set once at startup; the label set is
-// fixed then (the configuration is not re-read).
-static CERTS: std::sync::OnceLock<Vec<CertStats>> = std::sync::OnceLock::new();
+// The configured certificate files: the label set of the certificate
+// expiry, replaced when a configuration is loaded.
+static CERTS: RwLock<Vec<Arc<CertStats>>> = RwLock::new(Vec::new());
 
-/// Register the configured certificate files (the `cert` label values of
-/// the certificate expiry). Only the first call counts.
+/// Set the configured certificate files (the `cert` label values of the
+/// certificate expiry). A file that was already registered keeps its value;
+/// one that is no longer listed is no longer exported.
 pub fn register_certs<'a>(certs: impl IntoIterator<Item = &'a str>) {
-    let _ = CERTS.set(
-        certs
-            .into_iter()
-            .map(|c| CertStats {
-                cert: c.to_string(),
-                not_after: AtomicU64::new(0),
-            })
-            .collect(),
+    let mut current = CERTS.write().unwrap_or_else(|p| p.into_inner());
+    *current = relabel(
+        &current,
+        certs,
+        |s| &s.cert,
+        |c| CertStats {
+            cert: c.to_string(),
+            not_after: AtomicU64::new(0),
+        },
     );
 }
 
 /// Record the `notAfter` of the certificate now served from the file `cert`
 /// (Unix seconds, 0 if unknown). A file that was not registered is ignored.
 pub fn set_cert_not_after(cert: &str, unix: u64) {
-    if let Some(s) = CERTS.get().and_then(|v| v.iter().find(|s| s.cert == cert)) {
+    let certs = CERTS.read().unwrap_or_else(|p| p.into_inner());
+    if let Some(s) = certs.iter().find(|s| s.cert == cert) {
         s.not_after.store(unix, Ordering::Relaxed);
+    }
+}
+
+// Configuration reloads (SIGHUP) by result: ok, error.
+static CONFIG_RELOADS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+// Unix time (s) the configuration in use was loaded.
+static CONFIG_LAST_SUCCESS: AtomicU64 = AtomicU64::new(0);
+
+/// Record that a configuration was loaded and is in use: at startup, and
+/// after each successful reload.
+pub fn mark_config_loaded() {
+    CONFIG_LAST_SUCCESS.store(unix_now(), Ordering::Relaxed);
+}
+
+/// Record one configuration reload; `ok` when the new configuration is in use.
+pub fn record_config_reload(ok: bool) {
+    CONFIG_RELOADS[usize::from(!ok)].fetch_add(1, Ordering::Relaxed);
+    if ok {
+        mark_config_loaded();
     }
 }
 
@@ -495,6 +544,21 @@ fn render() -> String {
     o.push_str(&format!(
         "process_start_time_seconds {}\n",
         PROCESS_START.load(Ordering::Relaxed)
+    ));
+
+    o.push_str("# HELP mail_auth_proxy_config_reload_total Configuration reloads (SIGHUP) by result; on error the previous configuration stays in use.\n");
+    o.push_str("# TYPE mail_auth_proxy_config_reload_total counter\n");
+    for (r, rlabel) in ["ok", "error"].iter().enumerate() {
+        let v = CONFIG_RELOADS[r].load(Ordering::Relaxed);
+        o.push_str(&format!(
+            "mail_auth_proxy_config_reload_total{{result=\"{rlabel}\"}} {v}\n"
+        ));
+    }
+    o.push_str("# HELP mail_auth_proxy_config_last_reload_success_timestamp_seconds Unix time the configuration in use was loaded (at start or by the last successful reload).\n");
+    o.push_str("# TYPE mail_auth_proxy_config_last_reload_success_timestamp_seconds gauge\n");
+    o.push_str(&format!(
+        "mail_auth_proxy_config_last_reload_success_timestamp_seconds {}\n",
+        CONFIG_LAST_SUCCESS.load(Ordering::Relaxed)
     ));
 
     o.push_str("# HELP mail_auth_proxy_auth_attempts_total Auth attempts handled by the proxy (oauth + password).\n");
@@ -648,7 +712,7 @@ fn render() -> String {
 
     o.push_str("# HELP mail_auth_proxy_tls_cert_expiry_timestamp_seconds Unix time the served certificate expires (notAfter), by certificate file; 0 if unreadable.\n");
     o.push_str("# TYPE mail_auth_proxy_tls_cert_expiry_timestamp_seconds gauge\n");
-    for c in CERTS.get().map_or(&[][..], |v| &v[..]) {
+    for c in CERTS.read().unwrap_or_else(|p| p.into_inner()).iter() {
         o.push_str(&format!(
             "mail_auth_proxy_tls_cert_expiry_timestamp_seconds{{cert=\"{}\"}} {}\n",
             escape_label(&c.cert),
@@ -656,10 +720,10 @@ fn render() -> String {
         ));
     }
 
-    let issuers = ISSUERS.get().map_or(&[][..], |v| &v[..]);
+    let issuers = ISSUERS.read().unwrap_or_else(|p| p.into_inner()).clone();
     o.push_str("# HELP mail_auth_proxy_jwks_last_success_timestamp_seconds Unix time of the last JWKS fetch with usable keys, by issuer.\n");
     o.push_str("# TYPE mail_auth_proxy_jwks_last_success_timestamp_seconds gauge\n");
-    for s in issuers {
+    for s in &issuers {
         o.push_str(&format!(
             "mail_auth_proxy_jwks_last_success_timestamp_seconds{{issuer=\"{}\"}} {}\n",
             escape_label(&s.issuer),
@@ -668,7 +732,7 @@ fn render() -> String {
     }
     o.push_str("# HELP mail_auth_proxy_jwks_refresh_failures_total JWKS fetches that failed or had no usable key; the issuer keeps its previous keys.\n");
     o.push_str("# TYPE mail_auth_proxy_jwks_refresh_failures_total counter\n");
-    for s in issuers {
+    for s in &issuers {
         o.push_str(&format!(
             "mail_auth_proxy_jwks_refresh_failures_total{{issuer=\"{}\"}} {}\n",
             escape_label(&s.issuer),
@@ -677,7 +741,7 @@ fn render() -> String {
     }
     o.push_str("# HELP mail_auth_proxy_jwks_keys_skipped_total JWKS keys skipped because a member was missing or undecodable; the other keys are used.\n");
     o.push_str("# TYPE mail_auth_proxy_jwks_keys_skipped_total counter\n");
-    for s in issuers {
+    for s in &issuers {
         o.push_str(&format!(
             "mail_auth_proxy_jwks_keys_skipped_total{{issuer=\"{}\"}} {}\n",
             escape_label(&s.issuer),
@@ -1067,6 +1131,59 @@ mod tests {
             assert!(series.insert(key.to_string()), "{key} twice");
         }
         assert!(help.is_none(), "HELP without TYPE");
+
+        // A reload replaces the certificate files: one that stays keeps its
+        // value, one that is gone is no longer exported, a new one starts at 0.
+        register_certs(["/etc/tls/\"odd\"\\.pem", "/etc/tls/new.pem"]);
+        let out = render();
+        assert!(out.contains(
+            "mail_auth_proxy_tls_cert_expiry_timestamp_seconds{cert=\"/etc/tls/\\\"odd\\\"\\\\.pem\"} 1900000000\n"
+        ));
+        assert!(out.contains(
+            "mail_auth_proxy_tls_cert_expiry_timestamp_seconds{cert=\"/etc/tls/new.pem\"} 0\n"
+        ));
+        assert!(!out.contains("default.pem"));
+    }
+
+    /// A reload replaces a label set: a value that stays keeps its stats
+    /// (the same `Arc`), a new one starts fresh, one no longer listed is gone.
+    #[test]
+    fn relabel_keeps_the_stats_of_values_that_stay() {
+        let new = |c: &str| CertStats {
+            cert: c.to_string(),
+            not_after: AtomicU64::new(0),
+        };
+        fn name(s: &CertStats) -> &str {
+            &s.cert
+        }
+        let first = relabel(&[], ["a", "b"], name, new);
+        first[1].not_after.store(7, Ordering::Relaxed);
+        let second = relabel(&first, ["b", "c"], name, new);
+        let names: Vec<&str> = second.iter().map(|s| name(s)).collect();
+        assert_eq!(names, ["b", "c"]);
+        assert!(Arc::ptr_eq(&first[1], &second[0]));
+        assert_eq!(second[0].not_after.load(Ordering::Relaxed), 7);
+        assert_eq!(second[1].not_after.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn config_reload_metrics() {
+        let count = |result: &str| {
+            let key = format!("mail_auth_proxy_config_reload_total{{result=\"{result}\"}} ");
+            render()
+                .lines()
+                .find_map(|l| l.strip_prefix(key.as_str()))
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+        };
+        let (ok, err) = (count("ok"), count("error"));
+        record_config_reload(false);
+        assert_eq!((count("ok"), count("error")), (ok, err + 1));
+        CONFIG_LAST_SUCCESS.store(0, Ordering::Relaxed);
+        record_config_reload(true);
+        assert_eq!(count("ok"), ok + 1);
+        assert!(CONFIG_LAST_SUCCESS.load(Ordering::Relaxed) > 0);
     }
 
     #[test]

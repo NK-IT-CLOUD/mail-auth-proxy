@@ -204,6 +204,9 @@ pub struct Validator {
     /// on-demand refresh and the issuers whose JWKS failed in it; tokens that
     /// arrive during a refresh wait here and re-check before fetching.
     last_kid_refetch: tokio::sync::Mutex<Option<(std::time::Instant, Vec<String>)>>,
+    /// The last JWKS with usable keys of each issuer, with its URL: the
+    /// keys of a reloaded configuration are built from it (`reconfigured`).
+    jwks: std::sync::Mutex<HashMap<String, (String, Arc<Value>)>>,
 }
 
 async fn fetch_jwks(client: &reqwest::Client, url: &str) -> Result<Value> {
@@ -268,6 +271,7 @@ impl Validator {
                 .redirect(reqwest::redirect::Policy::none())
                 .build()?,
             last_kid_refetch: tokio::sync::Mutex::new(None),
+            jwks: Default::default(),
         };
         let (keys, failed) = v.fetch_all().await;
         if !failed.is_empty() {
@@ -293,12 +297,20 @@ impl Validator {
     /// issuer; tokens waiting on the refresh lock wait that long at most.
     /// The results are merged in configuration order.
     async fn fetch_all(&self) -> (HashMap<String, Vec<KeyEntry>>, Vec<String>) {
+        self.fetch(&self.policies).await
+    }
+
+    /// `fetch_all` for the issuers of `policies`.
+    async fn fetch(
+        &self,
+        policies: &[Arc<Policy>],
+    ) -> (HashMap<String, Vec<KeyEntry>>, Vec<String>) {
         let mut fetches = tokio::task::JoinSet::new();
-        for (i, policy) in self.policies.iter().enumerate() {
+        for (i, policy) in policies.iter().enumerate() {
             let (client, url) = (self.client.clone(), policy.jwks_url.clone());
             fetches.spawn(async move { (i, fetch_jwks(&client, &url).await) });
         }
-        let mut fetched: Vec<Option<Result<Value>>> = self.policies.iter().map(|_| None).collect();
+        let mut fetched: Vec<Option<Result<Value>>> = policies.iter().map(|_| None).collect();
         while let Some(done) = fetches.join_next().await {
             // A fetch task that panicked leaves its slot empty: failed below.
             if let Ok((i, result)) = done {
@@ -307,7 +319,7 @@ impl Validator {
         }
         let mut keys: HashMap<String, Vec<KeyEntry>> = HashMap::new();
         let mut failed = Vec::new();
-        for (policy, result) in self.policies.iter().zip(fetched) {
+        for (policy, result) in policies.iter().zip(fetched) {
             let issuer = &policy.issuer;
             let result = result.unwrap_or_else(|| Err(anyhow!("JWKS fetch task failed")));
             match result {
@@ -330,6 +342,10 @@ impl Validator {
                         }
                         Ok(_) => {
                             crate::obs::metrics::record_jwks_fetch(issuer, true);
+                            self.jwks
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .insert(issuer.clone(), (policy.jwks_url.clone(), Arc::new(jwks)));
                             for (kid, entries) in staged {
                                 keys.entry(kid).or_default().extend(entries);
                             }
@@ -412,14 +428,77 @@ impl Validator {
         }
     }
 
-    /// Spawn the periodic refresher. Errors are logged, never fatal.
-    pub fn spawn_refresher(self: Arc<Self>) {
+    /// A validator for the issuers of `oauth` (a configuration reload),
+    /// and the issuers whose JWKS it fetched. An issuer that stays (same
+    /// `issuer` and `jwks_url`) gets its keys from its last JWKS, read under
+    /// its new rules, without a fetch; any other issuer's JWKS is fetched
+    /// now, as at startup. Fails, naming them, if an issuer ends up without a
+    /// usable key: the configuration is then not taken over.
+    pub async fn reconfigured(
+        &self,
+        oauth: &crate::config::OAuth,
+    ) -> Result<(Validator, Vec<String>)> {
+        if oauth.issuers.is_empty() {
+            return Err(anyhow!("no issuers configured"));
+        }
+        let mut policies = Vec::new();
+        for i in &oauth.issuers {
+            check_jwks_url(&i.jwks_url)?;
+            policies.push(Arc::new(Policy::from_config(i)?));
+        }
+        let v = Validator {
+            keys: RwLock::default(),
+            policies,
+            leeway: oauth.leeway_secs,
+            refresh_interval: Duration::from_secs(oauth.refresh_secs),
+            client: self.client.clone(),
+            last_kid_refetch: tokio::sync::Mutex::new(None),
+            jwks: Default::default(),
+        };
+        let cached = self.jwks.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let mut keys: KeyMap = HashMap::new();
+        let mut fetch = Vec::new();
+        for policy in &v.policies {
+            let mut staged = HashMap::new();
+            let known = cached
+                .get(&policy.issuer)
+                .filter(|(url, _)| *url == policy.jwks_url);
+            if let Some((url, jwks)) = known {
+                // Keys the new rules skip are counted by the next refresh.
+                let _ = Self::merge_jwks_keys(jwks, policy, v.leeway, &mut staged);
+                if !staged.is_empty() {
+                    v.jwks
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .insert(policy.issuer.clone(), (url.clone(), jwks.clone()));
+                }
+            }
+            if staged.is_empty() {
+                fetch.push(policy.clone());
+            }
+            for (kid, entries) in staged {
+                keys.entry(kid).or_default().extend(entries);
+            }
+        }
+        let (fetched, failed) = v.fetch(&fetch).await;
+        if !failed.is_empty() {
+            return Err(anyhow!("JWKS unavailable for: {}", failed.join(", ")));
+        }
+        for (kid, entries) in fetched {
+            keys.entry(kid).or_default().extend(entries);
+        }
+        v.set_keys(keys);
+        Ok((v, fetch.iter().map(|p| p.issuer.clone()).collect()))
+    }
+
+    /// Spawn the periodic refresher of the validator `current` returns (the
+    /// one of the configuration in use), every `oauth.refresh_secs` of that
+    /// configuration. Errors are logged, never fatal.
+    pub fn spawn_refresher(current: impl Fn() -> Arc<Validator> + Send + 'static) {
         tokio::spawn(async move {
-            let mut tick = tokio::time::interval(self.refresh_interval);
-            tick.tick().await; // the first tick fires immediately; we just loaded
             loop {
-                tick.tick().await;
-                if let Err(e) = self.refresh().await {
+                tokio::time::sleep(current().refresh_interval).await;
+                if let Err(e) = current().refresh().await {
                     tracing::warn!(target: crate::obs::target::TOKEN, error = %e, "JWKS refresh failed; keeping previous keys");
                 }
             }
@@ -526,9 +605,14 @@ impl Validator {
     pub(crate) fn from_parts(parts: Vec<(Value, Policy)>) -> Result<Validator> {
         let mut keys = HashMap::new();
         let mut policies = Vec::new();
+        let mut jwks = HashMap::new();
         for (v, policy) in parts {
             let policy = Arc::new(policy);
             Self::merge_jwks_keys(&v, &policy, 60, &mut keys)?;
+            jwks.insert(
+                policy.issuer.clone(),
+                (policy.jwks_url.clone(), Arc::new(v)),
+            );
             policies.push(policy);
         }
         if keys.is_empty() {
@@ -545,6 +629,7 @@ impl Validator {
                 reqwest::Client::new()
             },
             last_kid_refetch: tokio::sync::Mutex::new(None),
+            jwks: std::sync::Mutex::new(jwks),
         })
     }
 
@@ -1456,6 +1541,78 @@ mod tests {
 
     fn policy(issuer: &str) -> Policy {
         Policy::keycloak(issuer, "dovecot")
+    }
+
+    /// `[oauth]` with one issuer per `(issuer, jwks_url, audience)`.
+    fn oauth(issuers: &[(&str, &str, &str)]) -> crate::config::OAuth {
+        let mut text = String::new();
+        for (iss, url, aud) in issuers {
+            text.push_str(&format!(
+                "[[issuers]]\nissuer = \"{iss}\"\njwks_url = \"{url}\"\naudiences = [\"{aud}\"]\ntoken_type = \"keycloak\"\n"
+            ));
+        }
+        toml::from_str(&text).unwrap()
+    }
+
+    /// A reload keeps an issuer's keys without a fetch (its JWKS URL is
+    /// unreachable here) under its new rules, fetches a new issuer's JWKS,
+    /// and drops the keys of an issuer no longer configured.
+    #[tokio::test]
+    async fn reconfigured_reuses_known_jwks_and_fetches_new_issuers() {
+        let (pem_a, jwks_a) = test_es256_keypair("kid-a");
+        let (pem_b, jwks_b) = test_es256_keypair("kid-b");
+        let down = "http://127.0.0.1:1/certs";
+        let mut a = policy(ISS_A);
+        a.jwks_url = down.into();
+        let old = Validator::from_parts(vec![(jwks_a, a)]).unwrap();
+        let url_b = serve_jwks(jwks_b).await;
+        let token = |pem: &str, kid: &str, iss: &str, aud: &str| {
+            let mut c = claims();
+            c["iss"] = json!(iss);
+            c["aud"] = json!(aud);
+            mint(pem, kid, c)
+        };
+        assert!(old
+            .validate(&token(&pem_a, "kid-a", ISS_A, "dovecot"))
+            .is_ok());
+
+        let (new, fetched) = old
+            .reconfigured(&oauth(&[(ISS_A, down, "imap"), (ISS_B, &url_b, "dovecot")]))
+            .await
+            .unwrap();
+        assert_eq!(fetched, [ISS_B]);
+        assert!(new.validate(&token(&pem_a, "kid-a", ISS_A, "imap")).is_ok());
+        assert!(
+            new.validate(&token(&pem_a, "kid-a", ISS_A, "dovecot"))
+                .is_err(),
+            "the new audience rule"
+        );
+        assert!(new
+            .validate(&token(&pem_b, "kid-b", ISS_B, "dovecot"))
+            .is_ok());
+        assert!(
+            old.validate(&token(&pem_b, "kid-b", ISS_B, "dovecot"))
+                .is_err(),
+            "the old validator is unchanged"
+        );
+
+        let (only_b, fetched) = new
+            .reconfigured(&oauth(&[(ISS_B, &url_b, "dovecot")]))
+            .await
+            .unwrap();
+        assert!(fetched.is_empty(), "B's JWKS is known");
+        assert!(matches!(
+            only_b.validate(&token(&pem_a, "kid-a", ISS_A, "imap")),
+            Err(TokenError::UnknownKid)
+        ));
+
+        let e = only_b
+            .reconfigured(&oauth(&[(ISS_B, &url_b, "dovecot"), (ISS_A, down, "imap")]))
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(e.contains(ISS_A), "{e}");
     }
 
     /// RFC 9068 mode checks the header `typ`, not the Keycloak claim.

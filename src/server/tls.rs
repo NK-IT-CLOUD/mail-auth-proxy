@@ -78,6 +78,14 @@ impl CertStore {
             .collect()
     }
 
+    /// Set the expiry metric of every certificate, for files registered
+    /// with the metrics after the store was loaded (a reload).
+    pub(crate) fn record_expiry(&self) {
+        for e in &self.entries {
+            crate::obs::metrics::set_cert_not_after(&e.cert, expiry(&e.served()));
+        }
+    }
+
     /// Every name a client may ask for (SNI), in configuration order.
     pub(crate) fn names(&self) -> Vec<String> {
         self.entries
@@ -184,15 +192,19 @@ fn load_served(cert: &str, key: &str, default: bool, provider: &CryptoProvider) 
 /// The certificate now served from the file `cert`; its expiry goes to the
 /// metrics.
 fn in_use(cert: &str, served: Served) -> Arc<Served> {
+    crate::obs::metrics::set_cert_not_after(cert, expiry(&served));
+    Arc::new(served)
+}
+
+/// `notAfter` of a loaded certificate (Unix seconds), 0 if unknown.
+fn expiry(served: &Served) -> u64 {
     // `load_certified_key` never returns an empty chain; the leaf is first.
-    let not_after = served
+    served
         .key
         .cert
         .first()
         .and_then(|c| not_after(c))
-        .unwrap_or(0);
-    crate::obs::metrics::set_cert_not_after(cert, not_after);
-    Arc::new(served)
+        .unwrap_or(0)
 }
 
 /// One DER element: tag, contents and what follows it. Definite lengths of

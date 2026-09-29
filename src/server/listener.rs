@@ -1,6 +1,6 @@
 //! The accept loop shared by all listeners.
 
-use super::Ctx;
+use super::{Ctx, Generation};
 use crate::limits;
 use crate::obs::{authlog, metrics};
 use anyhow::Result;
@@ -27,11 +27,15 @@ pub(super) struct Lifecycle {
 /// Accept on `listener` until shutdown, one task per admitted connection. A
 /// transient accept error (EMFILE, ECONNABORTED) is logged and retried,
 /// never fatal.
+///
+/// Each connection gets this listener's context (`pick`) from the
+/// generation in use when it is accepted (`current`), and keeps it.
 pub(super) fn spawn_listener<P, F, Fut>(
     listener: TcpListener,
     proto: metrics::Proto,
     ended: &'static str,
-    ctx: Arc<Ctx<P>>,
+    current: watch::Receiver<Arc<Generation>>,
+    pick: fn(&Generation) -> Option<Arc<Ctx<P>>>,
     handler: F,
     life: Lifecycle,
 ) where
@@ -49,6 +53,12 @@ pub(super) fn spawn_listener<P, F, Fut>(
             };
             match accepted {
                 Ok((tcp, peer)) => {
+                    // A reload never removes a listener's protocol
+                    // (`config::plan`); a missing one closes the connection.
+                    let Some(ctx) = pick(&current.borrow()) else {
+                        tracing::error!(target: crate::obs::target::MAIN, %peer, "{ended}: no configuration for this listener, closing");
+                        continue;
+                    };
                     // Closed like the connection limits: no TLS, no greeting.
                     // The block itself was logged when it started.
                     if ctx.ratelimit.is_blocked(peer.ip()) {
@@ -66,7 +76,6 @@ pub(super) fn spawn_listener<P, F, Fut>(
                     if let Err(e) = ctx.tuning.keepalive.apply(&tcp) {
                         tracing::warn!(target: crate::obs::target::MAIN, %peer, error=%e, "{ended}: TCP keepalive not set");
                     }
-                    let ctx = ctx.clone();
                     let alive = alive.clone();
                     tokio::spawn(async move {
                         let _alive = alive;

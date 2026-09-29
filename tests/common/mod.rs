@@ -1269,6 +1269,8 @@ pub struct Opts {
     /// TOML lines added to `[submission]` (`ehlo_extensions`,
     /// `capability_cache_secs`).
     pub submission_extra: &'static str,
+    /// `server.hostname`.
+    pub hostname: &'static str,
 }
 
 impl Default for Opts {
@@ -1290,6 +1292,7 @@ impl Default for Opts {
             smtp_down: false,
             max_auth_attempts: 1,
             submission_extra: "",
+            hostname: HOSTNAME,
         }
     }
 }
@@ -1362,6 +1365,14 @@ pub struct Proxy {
 impl Proxy {
     /// Write the config, start the binary and wait until all listeners are up.
     pub async fn start(pki: &Pki, idp: &Idp, backends: [&MockBackend; 3], opts: &Opts) -> Proxy {
+        let config = Self::config_text(pki, idp, backends, opts);
+        let path = pki.dir.path().join("config.toml");
+        std::fs::write(&path, config).unwrap();
+        Self::spawn(&path, opts).await
+    }
+
+    /// The harness configuration for `opts`.
+    pub fn config_text(pki: &Pki, idp: &Idp, backends: [&MockBackend; 3], opts: &Opts) -> String {
         let [imap, smtp, sieve] = backends;
         let ca = pki.ca_file.display();
         let backend = |b: &MockBackend, pp: bool| {
@@ -1370,11 +1381,11 @@ impl Proxy {
                 b.addr
             )
         };
-        let config = format!(
+        format!(
             r#"config_version = 2
 
 [server]
-hostname = "{HOSTNAME}"
+hostname = "{hostname}"
 
 [tls]
 cert = "{cert}"
@@ -1417,6 +1428,7 @@ connect_secs = 3
 
 {ratelimit}
 "#,
+            hostname = opts.hostname,
             cert = pki.proxy_cert.display(),
             key = pki.proxy_key.display(),
             tls_certificates = opts
@@ -1455,10 +1467,28 @@ connect_secs = 3
                 .as_ref()
                 .map(|r| format!("[auth_ratelimit]\n{r}"))
                 .unwrap_or_default(),
-        );
-        let path = pki.dir.path().join("config.toml");
-        std::fs::write(&path, config).unwrap();
-        Self::spawn(&path, opts).await
+        )
+    }
+
+    /// Replace the configuration file with `text` and send SIGHUP; waits for
+    /// the outcome. `Err` holds the log line of a refused reload.
+    pub async fn reload(&self, text: &str) -> Result<(), String> {
+        const OUTCOME: &str = "reload: configuration ";
+        let before = self.count_logs(OUTCOME);
+        std::fs::write(&self.config, text).unwrap();
+        self.signal("HUP");
+        self.wait_logs(OUTCOME, before + 1).await;
+        let line = self
+            .logs()
+            .into_iter()
+            .filter(|l| l.contains(OUTCOME))
+            .nth(before)
+            .unwrap();
+        if line.contains("reload: configuration loaded") {
+            Ok(())
+        } else {
+            Err(line)
+        }
     }
 
     async fn spawn(config: &Path, opts: &Opts) -> Proxy {
@@ -1750,6 +1780,17 @@ impl Harness {
             sieve_be,
             proxy,
         }
+    }
+
+    /// The harness configuration for `opts`, with this harness's PKI, IdP
+    /// and backends.
+    pub fn config(&self, opts: &Opts) -> String {
+        Proxy::config_text(
+            &self.pki,
+            &self.idp,
+            [&self.imap_be, &self.smtp_be, &self.sieve_be],
+            opts,
+        )
     }
 
     pub fn backend(&self, kind: Kind) -> &MockBackend {

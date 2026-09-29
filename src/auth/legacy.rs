@@ -314,9 +314,11 @@ impl Rule {
 struct Throttle {
     failures: u32,
     window: Duration,
-    seen: Mutex<HashMap<String, (u32, Instant)>>,
+    /// Shared with the gate of a reloaded configuration (`Gate::carry_over`),
+    /// like `turns`.
+    seen: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
     /// Accounts with an attempt in flight or waiting.
-    turns: Mutex<HashMap<String, TurnSlot>>,
+    turns: Arc<Mutex<HashMap<String, TurnSlot>>>,
 }
 
 /// One account's turn lock and the number of attempts holding or waiting for
@@ -472,7 +474,7 @@ pub struct Gate {
     /// Every list file, for the reload task.
     files: Vec<Arc<ListFile>>,
     /// Recent backend-rejection latencies per protocol, for refusal timing.
-    reject_latency: [Mutex<std::collections::VecDeque<Duration>>; 3],
+    reject_latency: Arc<[Mutex<std::collections::VecDeque<Duration>>; 3]>,
     account: Option<Doveadm>,
     throttle: Option<Throttle>,
     /// Minimum time from the credential to the reply of a failed legacy login.
@@ -538,28 +540,44 @@ impl Gate {
             throttle: cfg.throttle.as_ref().map(|t| Throttle {
                 failures: t.failures,
                 window: Duration::from_secs(t.window_secs),
-                seen: Mutex::new(HashMap::new()),
-                turns: Mutex::new(HashMap::new()),
+                seen: Arc::default(),
+                turns: Arc::default(),
             }),
             failure_delay: Duration::from_millis(cfg.failure_delay_ms),
         })
     }
 
+    /// Take over the running state of the gate `old` (a configuration
+    /// reload): the throttle's failure counts and turns, when both gates
+    /// throttle, and the learned refusal timing.
+    pub fn carry_over(&mut self, old: &Gate) {
+        if let (Some(new), Some(old)) = (&mut self.throttle, &old.throttle) {
+            new.seen = old.seen.clone();
+            new.turns = old.turns.clone();
+        }
+        self.reject_latency = old.reject_latency.clone();
+    }
+
     /// Start the task that re-reads the list files when they change, with
-    /// the file I/O on the blocking pool. Needs a Tokio runtime.
+    /// the file I/O on the blocking pool. It ends when the gate is dropped
+    /// (after a reload, with the last connection that used it). Needs a
+    /// Tokio runtime.
     pub fn spawn_reloader(&self) {
         if self.files.is_empty() {
             return;
         }
-        let files = self.files.clone();
+        let files: Vec<_> = self.files.iter().map(Arc::downgrade).collect();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(FILE_CHECK_INTERVAL);
             tick.tick().await;
             loop {
                 tick.tick().await;
-                let files = files.clone();
-                let _ = tokio::task::spawn_blocking(move || files.iter().for_each(|f| f.reload()))
-                    .await;
+                let live: Vec<_> = files.iter().filter_map(std::sync::Weak::upgrade).collect();
+                if live.is_empty() {
+                    break;
+                }
+                let _ =
+                    tokio::task::spawn_blocking(move || live.iter().for_each(|f| f.reload())).await;
             }
         });
     }
@@ -981,6 +999,68 @@ mod tests {
         assert!(pass(check("bob@example.org").await).is_some());
     }
 
+    /// A reloaded gate takes over the throttle's counts and turns: the new
+    /// threshold applies to the old count, and an attempt in flight under
+    /// the old gate holds the account's turn under the new one.
+    #[tokio::test]
+    async fn carry_over_keeps_throttle_counts_and_turns() {
+        let throttled = |failures| Legacy {
+            throttle: Some(config::Throttle {
+                failures,
+                window_secs: 3600,
+            }),
+            rules: vec![rule("all", &["127.0.0.0/8"])],
+            ..Legacy::default()
+        };
+        let old = gate_with(throttled(3));
+        old.backend_rejected("bob@example.org");
+        old.backend_rejected("bob@example.org");
+        let in_flight = old
+            .check(
+                Proto::Imap,
+                ip("127.0.0.1"),
+                None,
+                "PLAIN",
+                "eve@example.org",
+            )
+            .await;
+        assert!(matches!(in_flight, Verdict::Pass { .. }));
+
+        let mut new = gate_with(throttled(2));
+        new.carry_over(&old);
+        let check = |u: &'static str| new.check(Proto::Imap, ip("127.0.0.1"), None, "PLAIN", u);
+        assert_eq!(
+            denied(check("bob@example.org").await),
+            Some((Reason::Throttled, "all".into()))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), check("eve@example.org"))
+                .await
+                .is_err(),
+            "waits for the attempt of the old gate"
+        );
+        drop(in_flight);
+        assert!(pass(check("eve@example.org").await).is_some());
+
+        let mut unthrottled = gate_with(Legacy {
+            rules: vec![rule("all", &["127.0.0.0/8"])],
+            ..Legacy::default()
+        });
+        unthrottled.carry_over(&old);
+        assert!(pass(
+            unthrottled
+                .check(
+                    Proto::Imap,
+                    ip("127.0.0.1"),
+                    None,
+                    "PLAIN",
+                    "bob@example.org"
+                )
+                .await
+        )
+        .is_some());
+    }
+
     /// Parallel attempts for one account take turns: no more of them reach the
     /// backend than the throttle allows failures, and no turn is left behind.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1033,8 +1113,8 @@ mod tests {
         let t = Throttle {
             failures: 5,
             window: Duration::from_secs(3600),
-            seen: Mutex::new(HashMap::new()),
-            turns: Mutex::new(HashMap::new()),
+            seen: Arc::default(),
+            turns: Arc::default(),
         };
         let first = t.turn("a@x").await;
         let waited = tokio::time::timeout(Duration::from_millis(20), t.turn("A@x")).await;
@@ -1055,8 +1135,8 @@ mod tests {
         let t = Throttle {
             failures: 1,
             window: Duration::from_millis(1),
-            seen: Mutex::new(HashMap::new()),
-            turns: Mutex::new(HashMap::new()),
+            seen: Arc::default(),
+            turns: Arc::default(),
         };
         t.failure("a@x");
         std::thread::sleep(Duration::from_millis(5));
@@ -1064,8 +1144,8 @@ mod tests {
         let t = Throttle {
             failures: 1,
             window: Duration::from_secs(3600),
-            seen: Mutex::new(HashMap::new()),
-            turns: Mutex::new(HashMap::new()),
+            seen: Arc::default(),
+            turns: Arc::default(),
         };
         let evictions = || {
             crate::obs::metrics::render_for_tests()

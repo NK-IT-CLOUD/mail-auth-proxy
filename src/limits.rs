@@ -14,8 +14,8 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// The source a pre-auth slot is counted against: an IPv4 address (also
 /// IPv4-mapped IPv6) as is, an IPv6 address by its first `v6_prefix` bits
@@ -32,31 +32,79 @@ pub(crate) fn preauth_key(ip: IpAddr, v6_prefix: u8) -> IpAddr {
     }
 }
 
+/// Limits in force, over the open connections of the whole process: a
+/// configuration reload makes new `Limits` (`reconfigured`) that count the
+/// same connections.
 pub struct Limits {
-    total: Arc<Semaphore>,
-    preauth_total: Arc<Semaphore>,
-    preauth: Mutex<HashMap<IpAddr, usize>>,
+    counts: Arc<Counts>,
+    max_connections: usize,
     max_preauth_per_ip: usize,
     /// Prefix length IPv6 sources are grouped by (`preauth_key`).
     v6_prefix: u8,
 }
 
+/// The open connections, shared by every `Limits` of the process.
+#[derive(Default)]
+struct Counts {
+    total: AtomicUsize,
+    preauth_total: AtomicUsize,
+    preauth: Mutex<HashMap<IpAddr, usize>>,
+}
+
+impl Counts {
+    /// Take one of `max` slots of `counter` (`preauth_total` or `total`).
+    fn hold(self: &Arc<Self>, preauth: bool, max: usize) -> Option<Held> {
+        self.counter(preauth)
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < max).then_some(n + 1)
+            })
+            .ok()?;
+        Some(Held {
+            counts: self.clone(),
+            preauth,
+        })
+    }
+
+    fn counter(&self, preauth: bool) -> &AtomicUsize {
+        if preauth {
+            &self.preauth_total
+        } else {
+            &self.total
+        }
+    }
+}
+
+/// One slot of `Counts::total` or `Counts::preauth_total`, given back on drop.
+struct Held {
+    counts: Arc<Counts>,
+    preauth: bool,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.counts
+            .counter(self.preauth)
+            .fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// Held for the whole connection; frees the global slot on drop.
 pub struct ConnPermit {
-    _total: OwnedSemaphorePermit,
+    _total: Held,
     preauth: Option<PreauthSlot>,
 }
 
 struct PreauthSlot {
-    limits: Arc<Limits>,
+    counts: Arc<Counts>,
+    /// The source key the slot was counted under.
     ip: IpAddr,
-    _global: OwnedSemaphorePermit,
+    _global: Held,
 }
 
 impl Drop for PreauthSlot {
     fn drop(&mut self) {
         let mut map = self
-            .limits
+            .counts
             .preauth
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -79,21 +127,41 @@ impl ConnPermit {
 impl Limits {
     pub fn new(max_connections: usize, max_preauth_per_ip: usize, v6_prefix: u8) -> Arc<Limits> {
         Arc::new(Limits {
-            total: Arc::new(Semaphore::new(max_connections)),
-            preauth_total: Arc::new(Semaphore::new((max_connections / 2).max(1))),
-            preauth: Mutex::new(HashMap::new()),
+            counts: Arc::default(),
+            max_connections,
+            max_preauth_per_ip,
+            v6_prefix,
+        })
+    }
+
+    /// New limits over the same open connections (a configuration reload).
+    /// Connections above a lowered limit stay open; new ones are admitted
+    /// once the count is below it.
+    pub fn reconfigured(
+        &self,
+        max_connections: usize,
+        max_preauth_per_ip: usize,
+        v6_prefix: u8,
+    ) -> Arc<Limits> {
+        Arc::new(Limits {
+            counts: self.counts.clone(),
+            max_connections,
             max_preauth_per_ip,
             v6_prefix,
         })
     }
 
     /// Admit a new connection from `ip`, or `None` if a limit is reached.
-    pub fn admit(self: &Arc<Self>, ip: IpAddr) -> Option<ConnPermit> {
+    pub fn admit(&self, ip: IpAddr) -> Option<ConnPermit> {
         let ip = preauth_key(ip, self.v6_prefix);
-        let total = self.total.clone().try_acquire_owned().ok()?;
-        let global = self.preauth_total.clone().try_acquire_owned().ok()?;
+        let total = self.counts.hold(false, self.max_connections)?;
+        let global = self.counts.hold(true, (self.max_connections / 2).max(1))?;
         {
-            let mut map = self.preauth.lock().unwrap_or_else(|p| p.into_inner());
+            let mut map = self
+                .counts
+                .preauth
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
             let n = map.entry(ip).or_insert(0);
             if *n >= self.max_preauth_per_ip {
                 return None;
@@ -103,7 +171,7 @@ impl Limits {
         Some(ConnPermit {
             _total: total,
             preauth: Some(PreauthSlot {
-                limits: self.clone(),
+                counts: self.counts.clone(),
                 ip,
                 _global: global,
             }),
@@ -194,6 +262,37 @@ mod tests {
         let _c = l.admit(ip("3.3.3.3")).expect("slot freed by the login");
     }
 
+    /// Reconfigured limits count the connections admitted before: a lowered
+    /// limit refuses new ones while the old stay open, a raised one admits
+    /// more; slots counted under the old IPv6 prefix are given back.
+    #[test]
+    fn reconfigured_limits_count_the_open_connections() {
+        let old = Limits::new(8, 2, 64);
+        let mut a = old.admit(ip("192.0.2.1")).unwrap();
+        a.authenticated();
+        let b = old.admit(ip("2001:db8:1:2::1")).unwrap();
+        let _c = old.admit(ip("2001:db8:1:2::2")).unwrap();
+
+        let lower = old.reconfigured(2, 2, 64);
+        assert!(lower.admit(ip("192.0.2.9")).is_none(), "3 open, limit 2");
+        assert!(old.admit(ip("192.0.2.9")).is_some(), "old limits unchanged");
+
+        let wider = old.reconfigured(8, 1, 48);
+        let _d = wider
+            .admit(ip("2001:db8:1:ffff::1"))
+            .expect("the /64 slots were counted under another key");
+        assert!(wider.admit(ip("2001:db8:1:fffe::1")).is_none(), "1 per /48");
+        drop(b);
+        assert_eq!(
+            old.counts.preauth.lock().unwrap()[&ip("2001:db8:1:2::")],
+            1,
+            "released under the key it was counted by"
+        );
+        assert!(wider.admit(ip("192.0.2.2")).is_some());
+        drop(a);
+        assert_eq!(old.counts.total.load(Ordering::Relaxed), 2, "c and d");
+    }
+
     #[test]
     fn global_limit_and_release_on_drop() {
         let l = Limits::new(2, 10, 64);
@@ -205,7 +304,12 @@ mod tests {
         drop(a);
         assert!(l.admit(ip("3.3.3.3")).is_some());
         assert!(
-            l.preauth.lock().unwrap().get(&ip("1.1.1.1")).is_none(),
+            l.counts
+                .preauth
+                .lock()
+                .unwrap()
+                .get(&ip("1.1.1.1"))
+                .is_none(),
             "no stale entry"
         );
     }

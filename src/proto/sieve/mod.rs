@@ -98,7 +98,9 @@ pub struct Sieve {
     /// TLS after STARTTLS with ALPN `managesieve`.
     pub acceptor: crate::server::tls::Acceptor,
     pub backend: BackendConn,
-    pub caps: CapsCache,
+    /// The backend's capabilities; a reload that keeps the backend keeps
+    /// them.
+    pub caps: Arc<CapsCache>,
     /// How long cached backend capabilities are relayed.
     pub caps_ttl: std::time::Duration,
 }

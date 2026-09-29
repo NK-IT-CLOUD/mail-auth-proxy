@@ -7,6 +7,22 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- `SIGHUP` (`systemctl reload`) reloads the configuration file without closing any
+  connection. The file passes the checks of `--check-config` (warnings logged) and is
+  taken over as a whole: legacy rules, `[legacy]`, users and domains files, issuers
+  (a new issuer's JWKS is fetched by the reload), `[limits]`, `[auth_ratelimit]`,
+  `[timeouts]`, `[session]`, `[scope]`, `server.hostname`, the certificates in `[tls]`
+  and `[[tls.certificates]]`, the backends and the submission and sieve settings.
+  Connections accepted afterwards use the new configuration; open ones keep the one they
+  were accepted with until they end. Rate-limit counts and blocks, the legacy throttle,
+  the backends' cached capabilities and the keys of issuers that stay are carried over.
+  A change of a listener address, a listener added or removed, or of the metrics
+  endpoint needs a restart: such a file, and one that is invalid, is refused as a whole
+  with one `ERROR reload: configuration not loaded …` line, and the configuration in use
+  stays. Package upgrades still restart the service (a new binary).
+- `mail_auth_proxy_config_reload_total{result="ok|error"}` and
+  `mail_auth_proxy_config_last_reload_success_timestamp_seconds` (set at startup and by
+  each successful reload).
 - IMAP `LOGIN` takes its user name and password as literals (RFC 9051 §6.2.3, §9): a
   synchronising `{n}` after a `+ ` continuation, a non-synchronising `{n+}` at once, up
   to 16384 octets each. A password a client sends as a literal (for example one with
@@ -33,6 +49,13 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   certificate carries. The `[tls] cert`/`key` form is unchanged.
 
 ### Changed
+- `SIGHUP` re-reads the configuration file as well as the certificates and the JWKS.
+  After a refused reload each certificate is still re-read on its own as before, so a
+  renewal works while the configuration file is broken. The series of
+  `mail_auth_proxy_jwks_*` and `mail_auth_proxy_tls_cert_expiry_timestamp_seconds`
+  follow the issuers and certificate files of the configuration in use.
+- A source added to `auth_ratelimit.exempt_networks` (or covered by `exempt_internal`)
+  is no longer blocked, also when its block started before.
 - A client that asks (SNI) for a name that no configured certificate carries is refused
   in the TLS handshake with the fatal alert `unrecognized_name` (RFC 9325 §3.7); it got
   the one certificate before. The accepted names are the subjectAltName DNS names of the
