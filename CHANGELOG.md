@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-29
+
 ### Added
 - `-t`, short form of `--check-config`.
 - Metric `process_start_time_seconds`: start time of the process, so restarts show in
@@ -125,6 +127,7 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - Initial public release.
 
-[Unreleased]: https://github.com/NK-IT-CLOUD/mail-auth-proxy/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/NK-IT-CLOUD/mail-auth-proxy/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/NK-IT-CLOUD/mail-auth-proxy/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/NK-IT-CLOUD/mail-auth-proxy/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/NK-IT-CLOUD/mail-auth-proxy/releases/tag/v0.1.0
