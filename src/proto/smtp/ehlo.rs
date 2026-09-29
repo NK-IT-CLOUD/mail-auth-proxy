@@ -106,7 +106,8 @@ impl EhloCache {
 /// Connect to the backend as the proxy itself, read its post-TLS EHLO reply
 /// and end with QUIT. Returns the extension lines (without the name line).
 async fn probe(sub: &Submission, tuning: &Tuning, name: &str) -> Result<Vec<String>> {
-    let (mut be, mut lines) = super::backend::connect_ehlo(&sub.backend, tuning, name).await?;
+    let (mut be, mut lines) =
+        super::backend::connect_ehlo(&sub.backend, None, tuning, name).await?;
     // End the probe politely; it carries no credential.
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
         be.write_all(b"QUIT\r\n").await?;

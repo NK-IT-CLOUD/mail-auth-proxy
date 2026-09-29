@@ -2,7 +2,7 @@
 //! capabilities, AUTHENTICATE, gate, credential check and backend login, then
 //! a byte relay.
 
-mod backend;
+pub(crate) mod backend;
 pub(crate) mod preauth;
 
 pub use backend::CapsCache;
@@ -122,6 +122,7 @@ pub async fn handle(
     mut permit: ConnPermit,
 ) -> Result<()> {
     let _conn = crate::obs::metrics::ConnGuard::open(crate::obs::metrics::Proto::Sieve);
+    crate::obs::metrics::record_listener_connection(crate::obs::metrics::Listener::Sieve);
     // The address the client dialed, for the PROXY header; `peer` as the
     // fallback keeps both ends in one address family.
     let local = tcp.local_addr().unwrap_or(peer);
@@ -217,6 +218,7 @@ pub async fn handle(
             };
             let session = auth::Session {
                 proto: Proto::Sieve,
+                listener: crate::obs::metrics::Listener::Sieve,
                 peer,
                 internal,
                 scope,

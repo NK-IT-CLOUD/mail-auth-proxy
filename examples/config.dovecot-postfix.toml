@@ -1,0 +1,59 @@
+# Backend profile: Dovecot 2.4 (IMAP, ManageSieve) and Postfix submission with
+# Dovecot SASL. This is the setup the proxy runs in production; the Dovecot and
+# Postfix side is in docs/backend-dovecot-postfix.md. Only the sections that
+# differ between backends are commented; the full list of keys is in
+# config.example.toml and docs/configuration.md.
+
+config_version = 2
+
+[server]
+hostname = "mail.example.org"
+
+[tls]
+cert = "/etc/mail-auth-proxy/tls/fullchain.pem"
+key = "/etc/mail-auth-proxy/tls/privkey.pem"
+
+# Dovecot imap-login listener with `ssl = yes` and `haproxy = yes`, reachable
+# only from the proxy (haproxy_trusted_networks).
+[imap]
+listen = "0.0.0.0:993"
+
+[imap.backend]
+address = "192.0.2.10:10993"
+verify_name = "imap.example.org"
+tls = "implicit"
+client_ip = "proxy_v2"
+auth_forward = "xoauth2"                   # what the production setup uses; oauthbearer is untested with Dovecot
+
+# Postfix submission (587, STARTTLS) with the proxy in
+# smtpd_authorized_xclient_hosts. Clients may use 465 as well: the proxy's own
+# implicit-TLS listener, the backend stays the same.
+[submission]
+listen = "0.0.0.0:587"
+implicit_tls_listen = "0.0.0.0:465"
+
+[submission.backend]
+address = "192.0.2.10:587"
+verify_name = "smtp.example.org"
+tls = "starttls"
+client_ip = "xclient"
+auth_forward = "xoauth2"
+
+# Dovecot managesieve-login listener with `haproxy = yes` (STARTTLS).
+[sieve]
+listen = "0.0.0.0:4190"
+
+[sieve.backend]
+address = "192.0.2.10:14190"
+verify_name = "imap.example.org"
+tls = "starttls"
+client_ip = "proxy_v2"
+auth_forward = "xoauth2"
+
+[oauth]
+[[oauth.issuers]]
+issuer = "https://sso.example.org/realms/mail"
+jwks_url = "https://sso.example.org/realms/mail/protocol/openid-connect/certs"
+audiences = ["mail"]
+token_type = "keycloak"
+identity_claim = "email"                   # Dovecot oauth2 username_attribute = email

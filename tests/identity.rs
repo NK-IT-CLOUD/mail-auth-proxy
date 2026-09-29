@@ -163,3 +163,57 @@ async fn plain_authzid() {
         ("protocol", "other")
     );
 }
+
+/// The success log line of each protocol names the issuer that validated the
+/// token (`issuer=`), and is empty for a password.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn success_lines_name_the_issuer() {
+    let h = Harness::start().await;
+    let token = h.idp.token(EMAIL);
+    for kind in Kind::ALL {
+        let (_c, reply) = h
+            .auth(
+                kind,
+                Src::External,
+                Sni::Public,
+                "XOAUTH2",
+                &xoauth2(EMAIL, &token),
+            )
+            .await;
+        assert!(!reply.contains("NO"), "{kind:?}: {reply}");
+    }
+    let (_c, reply) = h
+        .auth(
+            Kind::Imap,
+            Src::Internal,
+            Sni::Internal,
+            "PLAIN",
+            &plain("bob@example.test", "pw"),
+        )
+        .await;
+    assert!(reply.starts_with("a OK"), "{reply}");
+    for (message, n) in [
+        ("oauth validated; proxying to backend", 1),
+        ("submission auth ok; splicing", 1),
+        ("sieve auth ok; splicing", 1),
+    ] {
+        h.proxy.wait_logs(message, n).await;
+        let line = h
+            .proxy
+            .logs()
+            .into_iter()
+            .find(|l| l.contains(message))
+            .unwrap();
+        assert!(line.ends_with(&format!(" issuer={ISSUER}")), "{line}");
+    }
+    h.proxy
+        .wait_logs("password auth; forwarding to backend", 1)
+        .await;
+    let line = h
+        .proxy
+        .logs()
+        .into_iter()
+        .find(|l| l.contains("password auth; forwarding to backend"))
+        .unwrap();
+    assert!(line.ends_with(" issuer="), "{line}");
+}

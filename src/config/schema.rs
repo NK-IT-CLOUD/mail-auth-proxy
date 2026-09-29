@@ -115,10 +115,69 @@ pub struct Backend {
     /// the system trust store for this backend; default: system store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_file: Option<String>,
-    /// Send a PROXY protocol v2 header with the client's address (IMAP and
-    /// ManageSieve backends only). The backend listener must require it.
+    /// SASL mechanism a validated token is forwarded with.
     #[serde(default)]
+    pub auth_forward: AuthForward,
+    /// How the backend learns the client's address. Default: from the short
+    /// forms `proxy_protocol` and `submission.xclient`, else `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_ip: Option<ClientIp>,
+    /// How the connection to the backend is secured. Default: `implicit` for
+    /// IMAP, `starttls` for submission and ManageSieve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<BackendTls>,
+    /// Short form of `client_ip = "proxy_v2"`. Read only: `--print-config`
+    /// shows `client_ip`.
+    #[serde(default, skip_serializing)]
     pub proxy_protocol: bool,
+}
+
+impl Backend {
+    /// `client_ip` with its default applied; `xclient` is
+    /// `submission.xclient` (false for the other backends).
+    pub fn effective_client_ip(&self, xclient: bool) -> ClientIp {
+        match self.client_ip {
+            Some(c) => c,
+            None if xclient => ClientIp::Xclient,
+            None if self.proxy_protocol => ClientIp::ProxyV2,
+            None => ClientIp::None,
+        }
+    }
+}
+
+/// The SASL mechanism a validated token is forwarded to the backend with.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthForward {
+    /// Google's XOAUTH2 (Dovecot, Postfix through Dovecot SASL).
+    #[default]
+    Xoauth2,
+    /// OAUTHBEARER (RFC 7628).
+    Oauthbearer,
+}
+
+/// How the backend learns the client's address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientIp {
+    /// A PROXY protocol v2 header before anything else; the backend listener
+    /// must require it.
+    ProxyV2,
+    /// The SMTP XCLIENT command (Postfix), submission only.
+    Xclient,
+    /// Nothing: the backend sees the proxy's address.
+    None,
+}
+
+/// How the proxy secures its connection to a backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendTls {
+    /// Plaintext greeting, then STARTTLS (IMAP RFC 9051 §6.2.1, SMTP RFC
+    /// 3207, ManageSieve RFC 5804 §2.2).
+    Starttls,
+    /// TLS from the first byte (RFC 8314).
+    Implicit,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -126,7 +185,6 @@ pub struct Backend {
 pub struct Imap {
     /// Implicit-TLS listener, e.g. `0.0.0.0:993`.
     pub listen: String,
-    /// Implicit-TLS backend.
     pub backend: Backend,
 }
 
@@ -135,10 +193,14 @@ pub struct Imap {
 pub struct Submission {
     /// STARTTLS listener, e.g. `0.0.0.0:587`.
     pub listen: String,
-    /// STARTTLS backend (Postfix submission).
+    /// Implicit-TLS listener (RFC 8314 §3.3), e.g. `0.0.0.0:465`; optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implicit_tls_listen: Option<String>,
+    /// The backend (Postfix submission).
     pub backend: Backend,
-    /// Announce the client address with XCLIENT when the backend offers it.
-    #[serde(default)]
+    /// Short form of `backend.client_ip = "xclient"`. Read only:
+    /// `--print-config` shows `client_ip`.
+    #[serde(default, skip_serializing)]
     pub xclient: bool,
     /// The EHLO extensions advertised after STARTTLS at most (by keyword);
     /// the reply lists those of them the backend offers and the proxy
@@ -155,7 +217,7 @@ pub struct Submission {
 pub struct Sieve {
     /// STARTTLS listener, e.g. `0.0.0.0:4190`.
     pub listen: String,
-    /// STARTTLS backend (Pigeonhole ManageSieve).
+    /// The backend (Pigeonhole ManageSieve).
     pub backend: Backend,
     /// How long the backend's capability list is reused.
     #[serde(default = "default_caps_cache_secs")]

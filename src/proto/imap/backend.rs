@@ -1,7 +1,9 @@
 //! IMAP backend login: connect, then AUTHENTICATE with the client's own
 //! credential and classify the tagged reply.
 
-use crate::auth::{BackendCredential, BackendError, BackendLogin};
+use crate::auth::sasl::ErrorResult;
+use crate::auth::{BackendCredential, BackendError, BackendLogin, Forwarded};
+use crate::config::BackendTls;
 use crate::obs::authlog::sanitize;
 use crate::server::BackendConn;
 use crate::wire::connect;
@@ -19,26 +21,79 @@ use zeroize::Zeroizing;
 /// not pin this task forever.
 const MAX_AUTH_LINES: usize = 32;
 
-/// Connect and read the greeting. Also returns whether the greeting's
-/// capabilities include SASL-IR (without a CAPABILITY code: no).
+/// Connect and secure the connection as the backend's `tls` says, then
+/// read what it offers. Also returns whether its capabilities include
+/// SASL-IR.
+///
+/// Implicit TLS: the greeting comes over TLS; its CAPABILITY code, if any,
+/// is the list (without one: no SASL-IR). STARTTLS (RFC 9051 §6.2.1): the
+/// plaintext greeting, `P0 STARTTLS` and its tagged OK, the handshake, then
+/// `P0 CAPABILITY`: what the server said before TLS is discarded.
 async fn connect_tls(
     backend: &BackendConn,
     client: SocketAddr,
     local: SocketAddr,
     tuning: &Tuning,
 ) -> Result<(TlsStream<TcpStream>, bool)> {
-    let tcp = connect::connect(backend, Some((client, local)), tuning.connect, "backend").await?;
-    let mut stream = connect::tls(backend, tcp, tuning.connect, "backend").await?;
-    let greeting = read_line(&mut stream, tuning.idle).await?;
-    if !greeting.starts_with("* OK") {
-        return Err(anyhow!("backend greeting: {greeting}"));
-    }
-    let caps = capability_code(&greeting[2..]).unwrap_or_default();
+    let mut tcp =
+        connect::connect(backend, Some((client, local)), tuning.connect, "backend").await?;
+    let (stream, caps) = match backend.tls_mode {
+        BackendTls::Implicit => {
+            let mut stream = connect::tls(backend, tcp, tuning.connect, "backend").await?;
+            let greeting = read_line(&mut stream, tuning.idle).await?;
+            check_greeting(&greeting)?;
+            let caps = capability_code(&greeting[2..])
+                .unwrap_or_default()
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            (stream, caps)
+        }
+        BackendTls::Starttls => {
+            let greeting = read_line(&mut tcp, tuning.idle).await?;
+            check_greeting(&greeting)?;
+            tcp.write_all(b"P0 STARTTLS\r\n").await?;
+            let reply = tagged_reply(&mut tcp, "P0 ", tuning.idle).await?;
+            if !reply.get(..2).is_some_and(|s| s.eq_ignore_ascii_case("OK")) {
+                return Err(anyhow!("backend refused STARTTLS: {reply}"));
+            }
+            let mut stream = connect::tls(backend, tcp, tuning.connect, "backend").await?;
+            let caps = query_capabilities(&mut stream, "P0", tuning.idle).await?;
+            (stream, caps)
+        }
+    };
     if offers_unauthenticate(&caps) {
         return Err(anyhow!(crate::auth::UNAUTHENTICATE_OFFERED));
     }
     let sasl_ir = caps.iter().any(|c| c.eq_ignore_ascii_case("SASL-IR"));
     Ok((stream, sasl_ir))
+}
+
+/// A greeting the proxy can log in after: `* OK` (not PREAUTH, not BYE).
+fn check_greeting(greeting: &str) -> Result<()> {
+    if greeting.starts_with("* OK") {
+        Ok(())
+    } else {
+        Err(anyhow!("backend greeting: {greeting}"))
+    }
+}
+
+/// The tagged reply to the command tagged `tag` (with its space), without
+/// the tag; untagged lines before it are skipped, up to `MAX_AUTH_LINES`.
+async fn tagged_reply<S: tokio::io::AsyncRead + Unpin>(
+    s: &mut S,
+    tag: &str,
+    idle: Duration,
+) -> Result<String> {
+    for _ in 0..MAX_AUTH_LINES {
+        let l = read_line(s, idle).await?;
+        if let Some(reply) = l.strip_prefix(tag) {
+            return Ok(reply.to_string());
+        }
+    }
+    Err(anyhow!(
+        "backend sent no tagged reply within {MAX_AUTH_LINES} lines"
+    ))
 }
 
 /// The capabilities of the `[CAPABILITY …]` response code that starts the
@@ -56,18 +111,22 @@ fn offers_unauthenticate<S: AsRef<str>>(caps: &[S]) -> bool {
         .any(|c| c.as_ref().eq_ignore_ascii_case("UNAUTHENTICATE"))
 }
 
-/// Ask a logged-in backend for its capabilities (`P2 CAPABILITY`), for a
-/// tagged OK without a CAPABILITY code. The exchange is the proxy's own; the
-/// client never sees it.
+/// Ask the backend for its capabilities (`<tag> CAPABILITY`): after
+/// STARTTLS, and after a login whose tagged OK has no CAPABILITY code. The
+/// exchange is the proxy's own; the client never sees it.
 async fn query_capabilities(
     stream: &mut TlsStream<TcpStream>,
+    tag: &str,
     idle: Duration,
 ) -> Result<Vec<String>> {
-    stream.write_all(b"P2 CAPABILITY\r\n").await?;
+    stream
+        .write_all(format!("{tag} CAPABILITY\r\n").as_bytes())
+        .await?;
+    let tagged_prefix = format!("{tag} ");
     let mut caps = Vec::new();
     for _ in 0..MAX_AUTH_LINES {
         let l = read_line(stream, idle).await?;
-        if let Some(tagged) = l.strip_prefix("P2 ") {
+        if let Some(tagged) = l.strip_prefix(tagged_prefix.as_str()) {
             if !tagged
                 .get(..3)
                 .is_some_and(|s| s.eq_ignore_ascii_case("OK "))
@@ -130,29 +189,36 @@ fn classify_tagged(reply: &str, bad_is_verdict: bool) -> AuthReply {
 /// reply without its tag (`OK [CAPABILITY …] Logged in`), for relaying to the
 /// client under its own tag.
 ///
-/// `xoauth2`: the exchange is XOAUTH2, whose failure comes as an error
-/// challenge (`+ <base64 JSON>`) that the client answers with an empty line;
-/// the server then sends its tagged `NO` (Google "XOAUTH2 mechanism", RFC 7628
-/// §3.2.3). Any other continuation is cancelled with `*` (RFC 9051 §6.2.2),
-/// which a compliant server answers with `BAD`: an outage, not a verdict.
-/// For a password (`xoauth2` false) a tagged `BAD` that is not the answer to
-/// such a cancel is a rejection (see `classify_tagged`).
+/// For a token (`fwd.error_answer()`), a failure comes as an error challenge
+/// (`+ <base64 JSON>`) that the client answers (empty for XOAUTH2, `%x01` for
+/// OAUTHBEARER); the server then sends its tagged `NO` (Google "XOAUTH2
+/// mechanism", RFC 7628 §3.2.3). An OAUTHBEARER error result is read
+/// (`auth::rejected_after`). Any other continuation is cancelled with `*`
+/// (RFC 9051 §6.2.2), which a compliant server answers with `BAD`: an
+/// outage, not a verdict. For a password a tagged `BAD` that is not the
+/// answer to such a cancel is a rejection (see `classify_tagged`).
 async fn await_auth_ok(
     stream: &mut TlsStream<TcpStream>,
     idle: Duration,
-    xoauth2: bool,
+    fwd: &Forwarded,
 ) -> Result<String, BackendError> {
-    let mut error_challenge_answered = false;
+    // Set once the error challenge is answered.
+    let mut error_result: Option<Option<ErrorResult>> = None;
     let mut cancelled = false;
     for _ in 0..MAX_AUTH_LINES {
         let l = read_line(stream, idle).await?;
         // An untagged BYE (connection limit, shutdown) stays an outage: the
         // backend closes whatever the credential; read_line reports the EOF.
-        let password_verdict = !xoauth2 && !cancelled;
+        let password_verdict = fwd.token.is_none() && !cancelled;
         if let Some(tagged) = l.strip_prefix("P1 ") {
             match classify_tagged(tagged, password_verdict) {
                 AuthReply::Ok => return Ok(tagged.to_string()),
-                AuthReply::Rejected => return Err(BackendError::Rejected(l)),
+                AuthReply::Rejected => {
+                    return Err(crate::auth::rejected_after(
+                        l,
+                        error_result.flatten().as_ref(),
+                    ))
+                }
                 AuthReply::Unavailable => {
                     return Err(anyhow!("backend temporarily unavailable: {l}").into())
                 }
@@ -160,14 +226,17 @@ async fn await_auth_ok(
         }
         // A continuation is "+" optionally followed by text — match the bare
         // form too, not just "+ ".
-        if l.starts_with('+') {
-            if xoauth2 && !error_challenge_answered {
-                // A bare CRLF is the empty response, not a cancel.
-                error_challenge_answered = true;
-                stream.write_all(b"\r\n").await?;
-            } else {
-                cancelled = true;
-                stream.write_all(b"*\r\n").await?;
+        if let Some(challenge) = l.strip_prefix('+') {
+            match fwd.error_answer() {
+                Some(answer) if error_result.is_none() => {
+                    error_result = Some(fwd.error_result(challenge));
+                    // For XOAUTH2 a bare CRLF: the empty response, not a cancel.
+                    stream.write_all(format!("{answer}\r\n").as_bytes()).await?;
+                }
+                _ => {
+                    cancelled = true;
+                    stream.write_all(b"*\r\n").await?;
+                }
             }
         }
     }
@@ -191,27 +260,28 @@ impl BackendLogin for ImapLogin<'_> {
     type Conn = (TlsStream<TcpStream>, String);
 
     async fn login(&self, credential: BackendCredential<'_>) -> Result<Self::Conn, BackendError> {
-        let xoauth2 = matches!(credential, BackendCredential::Token { .. });
-        let (mech, response) = match credential {
+        match credential {
             // The same token the client presented, for its verified identity.
-            BackendCredential::Token { identity, token } => {
-                tracing::info!(target: crate::obs::target::MAIN, peer = %self.peer, user = %sanitize(identity), mech = %self.mech, "oauth validated; proxying to backend");
-                ("XOAUTH2", crate::auth::sasl::build_xoauth2(identity, token))
+            BackendCredential::Token {
+                identity, issuer, ..
+            } => {
+                tracing::info!(target: crate::obs::target::MAIN, peer = %self.peer, user = %sanitize(identity), mech = %self.mech, issuer = %issuer, "oauth validated; proxying to backend");
             }
             // The client's own password; the backend validates it (the proxy
             // never holds a master credential). Never log the password.
-            BackendCredential::Password { user, pass } => {
-                tracing::info!(target: crate::obs::target::MAIN, peer = %self.peer, user = %sanitize(user), mech = %self.mech, "password auth; forwarding to backend");
-                ("PLAIN", crate::auth::sasl::build_plain(user, pass))
+            BackendCredential::Password { user, .. } => {
+                tracing::info!(target: crate::obs::target::MAIN, peer = %self.peer, user = %sanitize(user), mech = %self.mech, issuer = %"", "password auth; forwarding to backend");
             }
-        };
+        }
+        let fwd = credential.forward(self.backend);
+        let (mech, response) = (fwd.mech, &fwd.response);
         let (mut stream, sasl_ir) =
             connect_tls(self.backend, self.peer, self.local, self.tuning).await?;
         if sasl_ir {
             // `concat` sizes the line once; it is zeroized on drop like the
             // response.
             let command =
-                Zeroizing::new(["P1 AUTHENTICATE ", mech, " ", &response, "\r\n"].concat());
+                Zeroizing::new(["P1 AUTHENTICATE ", mech, " ", response, "\r\n"].concat());
             stream.write_all(command.as_bytes()).await?;
         } else {
             // RFC 4959 §3: no initial response to a server that does not
@@ -229,16 +299,16 @@ impl BackendLogin for ImapLogin<'_> {
                 .into());
             }
             stream
-                .write_all(Zeroizing::new([&response, "\r\n"].concat()).as_bytes())
+                .write_all(Zeroizing::new([response, "\r\n"].concat()).as_bytes())
                 .await?;
         }
-        let ok = await_auth_ok(&mut stream, self.tuning.idle, xoauth2).await?;
+        let ok = await_auth_ok(&mut stream, self.tuning.idle, &fwd).await?;
         // RFC 8437 advertises UNAUTHENTICATE in the authenticated state.
         let unauthenticate = match capability_code(&ok) {
             Some(caps) => offers_unauthenticate(&caps),
-            None => {
-                offers_unauthenticate(&query_capabilities(&mut stream, self.tuning.idle).await?)
-            }
+            None => offers_unauthenticate(
+                &query_capabilities(&mut stream, "P2", self.tuning.idle).await?,
+            ),
         };
         if unauthenticate {
             return Err(anyhow!(crate::auth::UNAUTHENTICATE_OFFERED).into());

@@ -313,11 +313,67 @@ fn load_certified_key(cert: &str, key: &str, provider: &CryptoProvider) -> Resul
 /// it is not encrypted in TLS 1.3 either (RFC 8446 §6).
 const UNRECOGNIZED_NAME: [u8; 7] = [21, 3, 3, 0, 2, 2, 112];
 
+/// The fatal `no_application_protocol` alert (RFC 7301 §3.2, alert 120) as
+/// a plaintext record, like `UNRECOGNIZED_NAME`.
+const NO_APPLICATION_PROTOCOL: [u8; 7] = [21, 3, 3, 0, 2, 2, 120];
+
+/// The protocol IDs of the IANA registry "TLS Application-Layer Protocol
+/// Negotiation (ALPN) Protocol IDs" (as of 2026-09-29), byte for byte, without
+/// the GREASE values of RFC 8701, which a server must ignore. SMTP has no ID:
+/// on a submission listener each of these names another protocol.
+const REGISTERED_ALPN: &[&[u8]] = &[
+    b"http/0.9",
+    b"http/1.0",
+    b"http/1.1",
+    b"spdy/1",
+    b"spdy/2",
+    b"spdy/3",
+    b"stun.turn",
+    b"stun.nat-discovery",
+    b"h2",
+    b"h2c",
+    b"webrtc",
+    b"c-webrtc",
+    b"ftp",
+    b"imap",
+    b"pop3",
+    b"managesieve",
+    b"coap",
+    b"co",
+    b"xmpp-client",
+    b"xmpp-server",
+    b"acme-tls/1",
+    b"mqtt",
+    b"dot",
+    b"ntske/1",
+    b"sunrpc",
+    b"h3",
+    b"smb",
+    b"irc",
+    b"nntp",
+    b"nnsp",
+    b"doq",
+    b"sip/2",
+    b"tds/8.0",
+    b"dicom",
+    b"postgresql",
+    b"radius/1.0",
+    b"radius/1.1",
+    b"netperfmeter/control",
+    b"netperfmeter/data",
+    b"n-pamp/2",
+    b"EoQ",
+    b"snifq/1",
+];
+
 /// TLS for one listener with the certificates of a `CertStore`.
 #[derive(Clone)]
 pub(crate) struct Acceptor {
     store: Arc<CertStore>,
     config: Arc<rustls::ServerConfig>,
+    /// The listener has no ALPN ID of its own (SMTP): a client that offers
+    /// a registered one (`REGISTERED_ALPN`) means another protocol.
+    refuse_registered_alpn: bool,
 }
 
 impl Acceptor {
@@ -326,7 +382,11 @@ impl Acceptor {
     /// certificate is sent (RFC 6066 §3; RFC 9325 §3.7: the server SHOULD
     /// NOT continue the handshake), so the legacy gate's `sni` and the
     /// OAUTHBEARER `host` check only ever see names of the proxy. A client
-    /// without SNI gets the default certificate.
+    /// without SNI gets the default certificate. On a listener without an
+    /// ALPN ID (SMTP), a client that offers an ID of another protocol is
+    /// refused first with `no_application_protocol` (RFC 7301 §3.2, RFC 9325
+    /// §3.8: ALPACA); no ALPN, or an unregistered value, is accepted and none
+    /// is selected.
     pub(crate) async fn accept<IO>(
         &self,
         io: IO,
@@ -335,6 +395,24 @@ impl Acceptor {
         IO: AsyncRead + AsyncWrite + Unpin,
     {
         let start = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), io).await?;
+        if self.refuse_registered_alpn {
+            let foreign = start
+                .client_hello()
+                .alpn()
+                .and_then(|mut ids| ids.find(|id| REGISTERED_ALPN.contains(id)))
+                .map(|id| String::from_utf8_lossy(id).into_owned());
+            if let Some(id) = foreign {
+                // A registered ID, so plain printable text in the log line.
+                let err = std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("TLS ALPN {id:?} names another protocol"),
+                );
+                let mut io = start.io;
+                let _ = io.write_all(&NO_APPLICATION_PROTOCOL).await;
+                let _ = io.shutdown().await;
+                return Err(err);
+            }
+        }
         if let Some(sni) = start.client_hello().server_name() {
             if self.store.select(Some(sni)).is_some() {
                 return start.into_stream(self.config.clone()).await;
@@ -360,7 +438,8 @@ impl Acceptor {
 /// (`no_application_protocol`), so a TLS session meant for another protocol
 /// cannot be redirected to this one (RFC 9325 §3.8, ALPACA). A client that
 /// offers no ALPN is accepted. `None` for SMTP, which has no identifier:
-/// ALPN is then ignored.
+/// no ALPN is selected, and a client that offers a registered ID of another
+/// protocol is refused (`Acceptor::accept`).
 pub(super) fn acceptor(store: &Arc<CertStore>, alpn: Option<&[u8]>) -> Acceptor {
     let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -369,6 +448,7 @@ pub(super) fn acceptor(store: &Arc<CertStore>, alpn: Option<&[u8]>) -> Acceptor 
     Acceptor {
         store: store.clone(),
         config: Arc::new(cfg),
+        refuse_registered_alpn: alpn.is_none(),
     }
 }
 
@@ -411,6 +491,55 @@ pub(super) fn backend_connector(ca_file: Option<&str>) -> Result<TlsConnector> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The refused ALPN IDs: the registry without GREASE, the protocols an
+    /// ALPACA attack would redirect from among them.
+    #[test]
+    fn registered_alpn_ids() {
+        for id in [
+            &b"http/0.9"[..],
+            b"http/1.0",
+            b"http/1.1",
+            b"h2",
+            b"h2c",
+            b"h3",
+            b"spdy/1",
+            b"spdy/2",
+            b"spdy/3",
+            b"imap",
+            b"pop3",
+            b"managesieve",
+            b"ftp",
+            b"xmpp-client",
+            b"xmpp-server",
+            b"dot",
+            b"doq",
+            b"acme-tls/1",
+            b"irc",
+            b"nntp",
+            b"nnsp",
+            b"smb",
+            b"coap",
+            b"mqtt",
+            b"sip/2",
+            b"postgresql",
+        ] {
+            assert!(
+                REGISTERED_ALPN.contains(&id),
+                "{:?}",
+                String::from_utf8_lossy(id)
+            );
+        }
+        // GREASE (RFC 8701 §3) is 0x?A 0x?A and must be ignored; nothing for SMTP.
+        assert!(!REGISTERED_ALPN
+            .iter()
+            .any(|id| id.len() == 2 && id[0] == id[1] && id[0] & 0x0f == 0x0a));
+        assert!(!REGISTERED_ALPN.iter().any(|id| id.starts_with(b"smtp")));
+        let mut sorted = REGISTERED_ALPN.to_vec();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), REGISTERED_ALPN.len());
+    }
 
     fn cert_until(year: i32, month: u8, day: u8) -> Vec<u8> {
         let mut p = rcgen::CertificateParams::new(vec!["proxy.test".into()]).unwrap();

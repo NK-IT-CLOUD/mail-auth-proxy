@@ -510,7 +510,8 @@ async fn sieve_pre_tls_command_limit_says_bye() {
 /// identifier and refuse a handshake that offers only other protocols, so a
 /// TLS session meant for another service cannot be redirected to them
 /// (ALPACA). Without ALPN the handshake works as before. SMTP has no
-/// identifier and ignores ALPN.
+/// identifier: it selects none and refuses only registered IDs of other
+/// protocols (`submissions.rs`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn alpn_per_listener() {
     let h = Harness::start().await;
@@ -550,7 +551,7 @@ async fn alpn_per_listener() {
     c.send("STARTTLS").await;
     assert_eq!(c.line().await, "220 2.0.0 Ready to start TLS");
     assert_eq!(
-        c.try_tls_alpn(&h.pki, Sni::Public, &[b"http/1.1"])
+        c.try_tls_alpn(&h.pki, Sni::Public, &[b"smtp"])
             .await
             .unwrap(),
         None

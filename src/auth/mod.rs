@@ -97,11 +97,98 @@ impl std::error::Error for Refused {}
 
 /// What the backend is asked to log in with.
 pub enum BackendCredential<'a> {
-    /// A validated token, forwarded as XOAUTH2 for `identity`, the token's
-    /// verified identity claim.
-    Token { identity: &'a str, token: &'a str },
+    /// A validated token, forwarded for `identity`, the token's verified
+    /// identity claim, as the backend's `auth_forward` mechanism. `issuer`
+    /// is the issuer that validated it, for the log.
+    Token {
+        identity: &'a str,
+        token: &'a str,
+        issuer: &'a str,
+    },
     /// The client's password, forwarded as PLAIN; the backend validates it.
     Password { user: &'a str, pass: &'a str },
+}
+
+impl BackendCredential<'_> {
+    /// The credential as it goes to `backend`: a token as the backend's
+    /// `auth_forward` mechanism, a password as PLAIN.
+    pub fn forward(&self, backend: &crate::server::BackendConn) -> Forwarded {
+        use crate::config::AuthForward;
+        match *self {
+            BackendCredential::Token {
+                identity, token, ..
+            } => match backend.auth_forward {
+                AuthForward::Xoauth2 => Forwarded {
+                    mech: "XOAUTH2",
+                    response: sasl::build_xoauth2(identity, token),
+                    token: Some(AuthForward::Xoauth2),
+                },
+                AuthForward::Oauthbearer => Forwarded {
+                    mech: "OAUTHBEARER",
+                    response: sasl::build_oauthbearer(
+                        identity,
+                        &backend.host(),
+                        backend.port(),
+                        token,
+                    ),
+                    token: Some(AuthForward::Oauthbearer),
+                },
+            },
+            BackendCredential::Password { user, pass } => Forwarded {
+                mech: "PLAIN",
+                response: sasl::build_plain(user, pass),
+                token: None,
+            },
+        }
+    }
+}
+
+/// A credential as it goes to the backend.
+pub struct Forwarded {
+    pub mech: &'static str,
+    /// The base64 response; zeroized on drop.
+    pub response: zeroize::Zeroizing<String>,
+    /// For a token, the mechanism it goes as; `None` for a password.
+    pub token: Option<crate::config::AuthForward>,
+}
+
+impl Forwarded {
+    /// The client response to the backend's error challenge after a token
+    /// (base64, without the protocol's framing): empty for XOAUTH2 (Google
+    /// "XOAUTH2 mechanism"), `%x01` for OAUTHBEARER (RFC 7628 §3.2.3).
+    /// `None` for a password, whose exchange is cancelled instead.
+    pub fn error_answer(&self) -> Option<&'static str> {
+        use crate::config::AuthForward;
+        match self.token? {
+            AuthForward::Xoauth2 => Some(""),
+            AuthForward::Oauthbearer => Some(sasl::OAUTHBEARER_DUMMY),
+        }
+    }
+
+    /// The error result of an error challenge (`b64`), for OAUTHBEARER; the
+    /// XOAUTH2 one is not read.
+    pub fn error_result(&self, b64: &str) -> Option<sasl::ErrorResult> {
+        (self.token == Some(crate::config::AuthForward::Oauthbearer))
+            .then(|| sasl::parse_error_result(b64))
+    }
+}
+
+/// The backend's rejection `reply` of a token after its error result: an
+/// `invalid_request` judged no token (the request did not suit the backend),
+/// so it is an outage; any other result stays a verdict and is noted.
+pub fn rejected_after(reply: String, result: Option<&sasl::ErrorResult>) -> BackendError {
+    match result {
+        Some(sasl::ErrorResult::BadRequest) => BackendError::Unavailable(anyhow::anyhow!(
+            "backend refused the OAUTHBEARER request as invalid_request (RFC 7628 section 3.2.2): {reply}"
+        )),
+        Some(sasl::ErrorResult::Status(status)) => {
+            BackendError::Rejected(format!("{reply} (error result: {status})"))
+        }
+        Some(sasl::ErrorResult::Malformed) => {
+            BackendError::Rejected(format!("{reply} (malformed error result)"))
+        }
+        None => BackendError::Rejected(reply),
+    }
 }
 
 /// A protocol's backend login with the client's own credential (never a
@@ -144,6 +231,8 @@ pub fn backend_name(proto: Proto) -> &'static str {
 /// The facts about a connection that decide and label an auth attempt.
 pub struct Session<'a> {
     pub proto: Proto,
+    /// The listener the client connected to.
+    pub listener: metrics::Listener,
     pub peer: SocketAddr,
     /// Source inside `scope.internal_networks`.
     pub internal: bool,
@@ -206,9 +295,10 @@ fn record(
         reason,
         pwfp,
         rule,
+        listener: s.listener,
     }
     .record();
-    metrics::record_auth(s.proto, s.internal, mech, reason == Reason::Ok);
+    metrics::record_auth(s.proto, s.listener, s.internal, mech, reason == Reason::Ok);
     metrics::record_refusal(s.proto, reason);
     ctx.ratelimit
         .failure(s.proto, s.scope, s.peer.ip(), reason, credential);
@@ -276,6 +366,7 @@ pub fn discovery(s: &Session<'_>, d: &sasl::Discovery) {
         reason: Reason::Protocol,
         pwfp: "",
         rule: "",
+        listener: s.listener,
     }
     .record();
 }
@@ -391,6 +482,7 @@ fn no_credential(s: &Session<'_>) {
         reason: Reason::Protocol,
         pwfp: "",
         rule: "",
+        listener: s.listener,
     }
     .record();
 }
@@ -558,6 +650,7 @@ pub async fn authorize<B: BackendLogin>(
             let login = BackendCredential::Token {
                 identity: &identity,
                 token,
+                issuer: &issuer,
             };
             let login_started = tokio::time::Instant::now();
             match within_budget(ctx, s, backend.login(login)).await {

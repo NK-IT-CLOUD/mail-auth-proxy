@@ -118,7 +118,7 @@ key = "/etc/mail-auth-proxy/tls/privkey.pem"
 
 [imap]
 listen = "0.0.0.0:993"
-backend = { address = "192.0.2.10:10993", verify_name = "imap.example.org", proxy_protocol = true }
+backend = { address = "192.0.2.10:10993", verify_name = "imap.example.org", client_ip = "proxy_v2" }
 
 [[oauth.issuers]]
 issuer = "https://sso.example.org/realms/mail"

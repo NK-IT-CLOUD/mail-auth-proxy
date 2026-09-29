@@ -62,9 +62,14 @@ The file is strict. Startup fails, and `--check-config` reports, when:
 - a network (`scope.internal_networks`, a rule's `networks`,
   `password_gate.internal_networks`) is not a CIDR, or an `identity_domains`,
   `allowed_domains` or `users` entry is not a domain or login;
-- `submission.backend.proxy_protocol` is set, or a `submission.ehlo_extensions` entry is
-  not an EHLO line, repeats a keyword or is `AUTH` or `STARTTLS` (an entry the proxy never
-  advertises, or one with parameters, is a warning);
+- a backend sets `client_ip` together with its short form (`proxy_protocol`, or
+  `submission.xclient` for the submission backend), the submission backend sets both
+  short forms, or `client_ip = "xclient"` is set on the IMAP or ManageSieve backend
+  (XCLIENT is an SMTP extension); a backend whose `client_ip` is `none`, set or by default,
+  is a warning;
+- a `submission.ehlo_extensions` entry is not an EHLO line, repeats a keyword or is `AUTH`
+  or `STARTTLS` (an entry the proxy never advertises, or one with parameters, is a
+  warning);
 - an issuer is listed twice, has no audience, or lists an unsupported algorithm;
 - `openid_configuration_url` is not `https://` or contains `user:password@` or a
   fragment, `scope` is not an RFC 6749 scope, or more than one issuer sets
@@ -84,7 +89,8 @@ bind. A reload fails the same way for the JWKS of an issuer it adds ([Reload](#r
 `--check-config`, warnings included. Every key can change this way except those that bind
 a socket at startup:
 
-- `imap.listen`, `submission.listen`, `sieve.listen`;
+- `imap.listen`, `submission.listen`, `submission.implicit_tls_listen` (added, removed or
+  changed), `sieve.listen`;
 - whether `[submission]` and `[sieve]` exist (a listener more or less);
 - `metrics.enabled` and, while it is on, `metrics.listen`.
 
@@ -120,7 +126,7 @@ by that group and by nobody else, for example `root:mail-auth-proxy` mode `0640`
 |---|---|
 | `[server]` | the name used in greetings and EHLO |
 | `[tls]`, `[[tls.certificates]]` | the default certificate and key, and more certificates chosen by SNI |
-| `[imap]`, `[submission]`, `[sieve]` | listener and backend per protocol; `[imap]` is required, omit `[submission]` or `[sieve]` to disable them (a restart, not a reload) |
+| `[imap]`, `[submission]`, `[sieve]` | listener(s) and backend with its profile (`tls`, `client_ip`, `auth_forward`) per protocol; `[imap]` is required, omit `[submission]` or `[sieve]` to disable them (a restart, not a reload) |
 | `[oauth]`, `[[oauth.issuers]]` | JWKS refresh and clock skew; one entry per issuer with its token rules |
 | `[[legacy.rules]]` | legacy passwords: which source networks, names, protocols, mechanisms and users may use them |
 | `[legacy]` | settings of the legacy gate: allowed domains, account check, throttle, failure delay |
@@ -145,19 +151,24 @@ key over (`yes`) or it needs a restart ([Reload](#reload)).
 | `tls.cert`, `tls.key` | path | required | yes | PEM chain and key of the default certificate: served to clients without SNI and to those that ask for one of its DNS names |
 | `tls.certificates[].cert`, `.key` | path | none | yes | more certificates (`[[tls.certificates]]`, one table each), each served to clients that ask for one of its DNS names. Each must carry at least one DNS name ([TLS server names](#tls-server-names)) |
 | `imap.listen` | `ip:port` | required | restart | implicit-TLS listener |
-| `imap.backend` | backend | required | yes | implicit-TLS IMAP backend |
+| `imap.backend` | backend | required | yes | IMAP backend (`tls` default `implicit`) |
 | `submission.listen` | `ip:port` | section optional | restart | STARTTLS listener; omit the section to disable SMTP |
-| `submission.backend` | backend | required in section | yes | STARTTLS backend (Postfix); `proxy_protocol` is not supported here |
-| `submission.xclient` | bool | `false` | yes | send XCLIENT if the backend advertises it. With `false`, a backend that advertises XCLIENT to the proxy is a misconfiguration: every login is an outage (454) until the key is set or the proxy is removed from `smtpd_authorized_xclient_hosts`, because the client could otherwise send its own XCLIENT after login |
+| `submission.implicit_tls_listen` | `ip:port` | unset | restart | a second submission listener with implicit TLS (port 465, RFC 8314 §3.3): TLS from the first byte, then the greeting and the same dialog, gate and backend as the STARTTLS listener. Logs and metrics tell the two apart (`listener`) |
+| `submission.backend` | backend | required in section | yes | submission backend (`tls` default `starttls`) |
+| `submission.xclient` | bool | `false` | yes | short form of `submission.backend.client_ip = "xclient"`; `--print-config` shows `client_ip` |
+| `submission.ehlo_extensions` | array | unset | yes | the most the EHLO reply after STARTTLS may list, by keyword. The reply lists the extensions of the backend's own EHLO reply that the proxy handles (`PIPELINING`, `SIZE`, `8BITMIME`, `SMTPUTF8`, `DSN`, `ENHANCEDSTATUSCODES`, `CHUNKING`), with the backend's parameters; this list narrows them further. Each entry is an EHLO line (RFC 5321 §4.1.1.1): a keyword of letters, digits and hyphens that does not start with a hyphen, then optional parameters of printable ASCII, all separated by single spaces; each keyword once (case-insensitive); not `AUTH` or `STARTTLS`. Parameters are ignored (warning), as is a keyword the proxy never passes on (warning). |
 | `submission.ehlo_extensions` | array | unset | yes | the most the EHLO reply after STARTTLS may list, by keyword. The reply lists the extensions of the backend's own EHLO reply that the proxy handles (`PIPELINING`, `SIZE`, `8BITMIME`, `SMTPUTF8`, `DSN`, `ENHANCEDSTATUSCODES`, `CHUNKING`), with the backend's parameters; this list narrows them further. Each entry is an EHLO line (RFC 5321 §4.1.1.1): a keyword of letters, digits and hyphens that does not start with a hyphen, then optional parameters of printable ASCII, all separated by single spaces; each keyword once (case-insensitive); not `AUTH` or `STARTTLS`. Parameters are ignored (warning), as is a keyword the proxy never passes on (warning). |
 | `submission.capability_cache_secs` | integer | 600 | yes | reuse of the backend's EHLO extensions, read by a probe connection; ≥ 1 |
 | `sieve.listen` | `ip:port` | section optional | restart | STARTTLS listener; omit the section to disable ManageSieve |
-| `sieve.backend` | backend | required in section | yes | STARTTLS ManageSieve backend |
+| `sieve.backend` | backend | required in section | yes | ManageSieve backend (`tls` default `starttls`) |
 | `sieve.capability_cache_secs` | integer | 600 | yes | reuse of the backend capability list; ≥ 1 |
 | backend `.address` | `host:port` | required | yes | where to connect |
 | backend `.verify_name` | string | host of `address` | yes | name verified on the backend certificate |
 | backend `.ca_file` | path | system store | yes | PEM CAs the backend certificate must chain to; replaces the system store for this backend |
-| backend `.proxy_protocol` | bool | `false` | yes | PROXY v2 header with the client address (IMAP, Sieve) |
+| backend `.tls` | `starttls` \| `implicit` | `implicit` for IMAP, `starttls` for submission and ManageSieve | yes | how the proxy secures its connection to the backend. `starttls`: the plaintext greeting, then STARTTLS (IMAP RFC 9051 §6.2.1, SMTP RFC 3207, ManageSieve RFC 5804 §2.2); what the backend offered before TLS is discarded and asked again over TLS. `implicit`: TLS from the first byte (RFC 8314). Either way the certificate is verified. The EHLO and capability probes take the same way |
+| backend `.auth_forward` | `xoauth2` \| `oauthbearer` | `xoauth2` | yes | the SASL mechanism a validated token is forwarded with, whatever the client used. `oauthbearer` (RFC 7628): the verified identity as GS2 authzid, the backend's `verify_name` (or host of `address`) as `host` and its port as `port`. Passwords always go as PLAIN |
+| backend `.client_ip` | `proxy_v2` \| `xclient` \| `none` | from the short forms, else `none` | yes | how the backend learns the client address: a PROXY protocol v2 header before anything else (the backend listener must require it; the proxy's own probe connections send a LOCAL header), the SMTP XCLIENT command (submission only, sent when the backend advertises it), or nothing. With `none` the backend sees the proxy's address for every client: its per-address rate limits, bans and logs treat all clients as one, and a ban there locks everyone out; warning. A submission backend that advertises XCLIENT to the proxy while `client_ip` is not `xclient` is a misconfiguration: every login is an outage (454) until it is set or the proxy is removed from `smtpd_authorized_xclient_hosts`, because the client could otherwise send its own XCLIENT after login |
+| backend `.proxy_protocol` | bool | `false` | yes | short form of `client_ip = "proxy_v2"`; `--print-config` shows `client_ip` |
 | `oauth.refresh_secs` | integer | 300 | yes | periodic JWKS refresh; 1-86400. Unknown key ids trigger a refresh sooner, but a key removed from the JWKS is dropped only by this one |
 | `oauth.leeway_secs` | integer | 60 | yes | clock skew on `exp`/`nbf`; 0-300 (RFC 7519 §4.1.4 allows a small leeway, "usually no more than a few minutes") |
 | `oauth.issuers[].issuer` | string | required | yes | exact `iss`; keys from this issuer's JWKS are accepted only with it |

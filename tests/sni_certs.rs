@@ -200,7 +200,7 @@ hostname = "{HOSTNAME}"
 {tls}
 [imap]
 listen = "127.0.0.10:0"
-backend = {{ address = "127.0.0.1:1", verify_name = "{BACKEND_NAME}", ca_file = "{}" }}
+backend = {{ address = "127.0.0.1:1", verify_name = "{BACKEND_NAME}", ca_file = "{}", client_ip = "proxy_v2" }}
 [oauth]
 [[oauth.issuers]]
 issuer = "{ISSUER}"

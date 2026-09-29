@@ -18,7 +18,10 @@
 //!   accepted, then every line is echoed as `ECHO <line>` until the line
 //!   `BACKEND-CLOSE`, on which the backend drops the connection. A rejected XOAUTH2
 //!   login first gets an error challenge (IMAP `+ <json>`, SMTP `334 <json>`)
-//!   that must be answered with an empty line.
+//!   that must be answered with an empty line; a rejected OAUTHBEARER login
+//!   gets one on all three (ManageSieve: a string) that must be answered with
+//!   `%x01`, its status `invalid_request` for `badreq…` logins. A `MockMode`
+//!   picks implicit TLS or STARTTLS, a PROXY v2 header or none, XCLIENT.
 //! - `MockDoveadm`: the doveadm HTTP API `user` command (exists / EX_NOUSER
 //!   / EX_TEMPFAIL by login prefix), over http or https, for the legacy
 //!   gate's account check.
@@ -60,6 +63,8 @@ pub const EMAIL: &str = "alice@example.test";
 pub const IMAP_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 10);
 pub const SMTP_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 11);
 pub const SIEVE_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 12);
+/// The implicit-TLS submission listener (`Opts::submissions`).
+pub const SMTPS_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 13);
 pub const METRICS_IP: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 1);
 
 /// `notAfter` of `Pki::renewed_cert` (2049-12-31T00:00:00Z), Unix seconds.
@@ -188,6 +193,7 @@ impl Pki {
             IMAP_IP.to_string(),
             SMTP_IP.to_string(),
             SIEVE_IP.to_string(),
+            SMTPS_IP.to_string(),
         ]);
         let (renewed_cert, renewed_key) = {
             let key = KeyPair::generate().unwrap();
@@ -467,8 +473,11 @@ pub struct Seen {
     pub mech: Option<String>,
     /// Decoded login: XOAUTH2 `user=` or the PLAIN authcid.
     pub login: Option<String>,
-    /// PLAIN authzid (must stay empty).
+    /// PLAIN authzid (must stay empty), OAUTHBEARER GS2 authzid.
     pub authzid: Option<String>,
+    /// OAUTHBEARER `host` and `port` (RFC 7628 §3.1).
+    pub oauth_host: Option<String>,
+    pub oauth_port: Option<String>,
     /// The bearer token or the password.
     pub secret: Option<String>,
     /// What the proxy answered to an XOAUTH2 error challenge (empty line
@@ -476,6 +485,8 @@ pub struct Seen {
     pub error_answer: Option<String>,
     /// Lines received after a successful login.
     pub relayed: Vec<String>,
+    /// The connection was secured with STARTTLS, not implicit TLS.
+    pub starttls: bool,
     /// A capability probe: ManageSieve LOGOUT or SMTP QUIT without
     /// authenticating.
     pub probe: bool,
@@ -522,7 +533,8 @@ async fn verdict_after(login: &str) -> Verdict {
 }
 
 fn verdict(login: &str) -> Verdict {
-    if login.starts_with("reject") || login.starts_with("slowreject") {
+    if login.starts_with("reject") || login.starts_with("slowreject") || login.starts_with("badreq")
+    {
         Verdict::Reject
     } else if login.starts_with("unavail") {
         Verdict::Unavailable
@@ -532,6 +544,41 @@ fn verdict(login: &str) -> Verdict {
 }
 
 type Log = Arc<Mutex<Vec<Seen>>>;
+
+/// How a mock backend serves: the transport the proxy must use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MockMode {
+    /// TLS from the first byte; otherwise a plaintext greeting and STARTTLS.
+    pub implicit_tls: bool,
+    /// Every connection starts with a PROXY v2 header; otherwise none is
+    /// read (a header would then break the dialog).
+    pub proxy_header: bool,
+    /// SMTP: the EHLO reply advertises XCLIENT to the proxy.
+    pub xclient: bool,
+}
+
+impl MockMode {
+    /// The harness default of `kind`: the Dovecot/Postfix profile.
+    pub fn default_for(kind: Kind) -> MockMode {
+        match kind {
+            Kind::Imap => MockMode {
+                implicit_tls: true,
+                proxy_header: true,
+                xclient: false,
+            },
+            Kind::Smtp => MockMode {
+                implicit_tls: false,
+                proxy_header: false,
+                xclient: true,
+            },
+            Kind::Sieve => MockMode {
+                implicit_tls: false,
+                proxy_header: true,
+                xclient: false,
+            },
+        }
+    }
+}
 
 pub struct MockBackend {
     pub kind: Kind,
@@ -578,6 +625,14 @@ pub const SMTP_EHLO: &[&str] = &[
 
 impl MockBackend {
     pub async fn start(kind: Kind, tls: Arc<rustls::ServerConfig>) -> MockBackend {
+        Self::start_mode(kind, tls, MockMode::default_for(kind)).await
+    }
+
+    pub async fn start_mode(
+        kind: Kind,
+        tls: Arc<rustls::ServerConfig>,
+        mode: MockMode,
+    ) -> MockBackend {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen: Log = Arc::default();
@@ -614,6 +669,7 @@ impl MockBackend {
                     caps_untagged: untagged.load(Ordering::SeqCst),
                     no_sasl_ir: no_ir.load(Ordering::SeqCst),
                     smtp_ehlo: ehlo.lock().unwrap().clone(),
+                    mode,
                 };
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
@@ -683,6 +739,7 @@ struct Rec {
     no_sasl_ir: bool,
     /// `MockBackend::smtp_ehlo` when the connection was accepted.
     smtp_ehlo: Option<Vec<String>>,
+    mode: MockMode,
 }
 
 impl Rec {
@@ -738,6 +795,30 @@ async fn read_proxy_header(tcp: &mut TcpStream, wait: Duration) -> Option<ProxyH
 /// Decode the SASL initial response the proxy sent to a backend.
 fn decode_ir(rec: &Rec, mech: &str, ir: &str) -> String {
     let raw = String::from_utf8(unb64(ir)).unwrap();
+    let field = |p: &str| {
+        raw.split('\x01')
+            .find_map(|f| f.strip_prefix(p))
+            .map(str::to_string)
+    };
+    if mech.eq_ignore_ascii_case("OAUTHBEARER") {
+        // `n,a=<saslname>,` then the kvpairs; the login is the authzid.
+        let gs2 = raw.split('\x01').next().unwrap_or("");
+        let authzid = gs2
+            .strip_prefix("n,a=")
+            .and_then(|a| a.strip_suffix(','))
+            .unwrap_or("")
+            .replace("=2C", ",")
+            .replace("=3D", "=");
+        rec.update(|s| {
+            s.mech = Some(mech.to_string());
+            s.login = Some(authzid.clone());
+            s.authzid = Some(authzid.clone());
+            s.oauth_host = field("host=");
+            s.oauth_port = field("port=");
+            s.secret = field("auth=Bearer ");
+        });
+        return authzid;
+    }
     let (authzid, login, secret) = if mech.eq_ignore_ascii_case("PLAIN") {
         let mut it = raw.splitn(3, '\0');
         let authzid = it.next().unwrap_or("").to_string();
@@ -745,12 +826,7 @@ fn decode_ir(rec: &Rec, mech: &str, ir: &str) -> String {
         let pass = it.next().unwrap_or("").to_string();
         (Some(authzid), login, pass)
     } else {
-        let field = |p: &str| {
-            raw.split('\x01')
-                .find_map(|f| f.strip_prefix(p))
-                .unwrap_or("")
-                .to_string()
-        };
+        let field = |p: &str| field(p).unwrap_or_default();
         (None, field("user="), field("auth=Bearer "))
     };
     rec.update(|s| {
@@ -760,6 +836,18 @@ fn decode_ir(rec: &Rec, mech: &str, ir: &str) -> String {
         s.secret = Some(secret);
     });
     login
+}
+
+/// The OAUTHBEARER error result (RFC 7628 §3.2.2) the mocks send for a
+/// rejected login, base64: `invalid_request` for `badreq…` logins,
+/// `invalid_token` otherwise.
+fn oauthbearer_error(login: &str) -> String {
+    let status = if login.starts_with("badreq") {
+        "invalid_request"
+    } else {
+        "invalid_token"
+    };
+    b64(format!(r#"{{"status":"{status}","scope":"mail"}}"#))
 }
 
 /// After a successful login: record and echo every line as `ECHO <line>`;
@@ -786,18 +874,43 @@ async fn mock_imap(
     acceptor: tokio_rustls::TlsAcceptor,
     rec: Rec,
 ) -> std::io::Result<()> {
-    // The proxy speaks first (PROXY header or ClientHello).
-    let hdr = read_proxy_header(&mut tcp, IO_TIMEOUT).await;
-    rec.update(|s| s.proxy_header = hdr);
-    let mut s = acceptor.accept(tcp).await?;
+    if rec.mode.proxy_header {
+        let hdr = read_proxy_header(&mut tcp, IO_TIMEOUT).await;
+        rec.update(|s| s.proxy_header = hdr);
+    }
     let sasl_ir = if rec.no_sasl_ir { "" } else { " SASL-IR" };
-    s.write_all(
-        format!(
-            "* OK [CAPABILITY IMAP4rev1{sasl_ir} AUTH=PLAIN AUTH=XOAUTH2] mock dovecot ready\r\n"
+    let caps = format!("IMAP4rev1{sasl_ir} AUTH=PLAIN AUTH=XOAUTH2 AUTH=OAUTHBEARER");
+    let mut s = if rec.mode.implicit_tls {
+        let mut s = acceptor.accept(tcp).await?;
+        s.write_all(format!("* OK [CAPABILITY {caps}] mock dovecot ready\r\n").as_bytes())
+            .await?;
+        s
+    } else {
+        // Dovecot on 143: no AUTH before TLS, then the capabilities anew
+        // (RFC 9051 §6.2.1).
+        tcp.write_all(b"* OK [CAPABILITY IMAP4rev1 STARTTLS LOGINDISABLED] mock dovecot ready\r\n")
+            .await?;
+        let Some(l) = read_line_raw(&mut tcp).await else {
+            return Ok(());
+        };
+        let tag = l.split(' ').next().unwrap_or("").to_string();
+        assert_eq!(l, format!("{tag} STARTTLS"), "mock imap");
+        tcp.write_all(format!("{tag} OK Begin TLS negotiation now.\r\n").as_bytes())
+            .await?;
+        rec.update(|r| r.starttls = true);
+        let mut s = acceptor.accept(tcp).await?;
+        let Some(l) = read_line_raw(&mut s).await else {
+            return Ok(());
+        };
+        let tag = l.split(' ').next().unwrap_or("").to_string();
+        assert_eq!(l, format!("{tag} CAPABILITY"), "mock imap");
+        s.write_all(
+            format!("* CAPABILITY {caps}\r\n{tag} OK Pre-login capabilities listed.\r\n")
+                .as_bytes(),
         )
-        .as_bytes(),
-    )
-    .await?;
+        .await?;
+        s
+    };
     let Some(line) = read_line_raw(&mut s).await else {
         return Ok(());
     };
@@ -849,6 +962,18 @@ async fn mock_imap(
             return Ok(());
         }
     }
+    if v == Verdict::Reject && mech.eq_ignore_ascii_case("OAUTHBEARER") {
+        // RFC 7628 §3.2.3: the error result, answered with %x01.
+        s.write_all(format!("+ {}\r\n", oauthbearer_error(&login)).as_bytes())
+            .await?;
+        let answer = read_line_raw(&mut s).await.unwrap_or_default();
+        rec.update(|r| r.error_answer = Some(answer.clone()));
+        if answer != "AQ==" {
+            s.write_all(format!("{tag} BAD Authentication aborted by client.\r\n").as_bytes())
+                .await?;
+            return Ok(());
+        }
+    }
     let caps = rec.login_caps.as_deref().unwrap_or("IMAP4rev1 IDLE MOVE");
     let reply = match v {
         Verdict::Ok if rec.caps_untagged => format!("{tag} OK Logged in"),
@@ -894,29 +1019,47 @@ async fn mock_smtp(
     acceptor: tokio_rustls::TlsAcceptor,
     rec: Rec,
 ) -> std::io::Result<()> {
-    tcp.write_all(b"220 backend.test ESMTP mock\r\n").await?;
-    let Some(l) = read_line_raw(&mut tcp).await else {
-        return Ok(());
+    if rec.mode.proxy_header {
+        let hdr = read_proxy_header(&mut tcp, IO_TIMEOUT).await;
+        rec.update(|s| s.proxy_header = hdr);
+    }
+    let mut s = if rec.mode.implicit_tls {
+        // Port 465 (RFC 8314 §3.3): the greeting over TLS.
+        let mut s = acceptor.accept(tcp).await?;
+        s.write_all(b"220 backend.test ESMTP mock\r\n").await?;
+        s
+    } else {
+        tcp.write_all(b"220 backend.test ESMTP mock\r\n").await?;
+        let Some(l) = read_line_raw(&mut tcp).await else {
+            return Ok(());
+        };
+        assert!(l.starts_with("EHLO "), "mock smtp: {l}");
+        tcp.write_all(b"250-backend.test\r\n250-PIPELINING\r\n250 STARTTLS\r\n")
+            .await?;
+        let Some(l) = read_line_raw(&mut tcp).await else {
+            return Ok(());
+        };
+        assert_eq!(l, "STARTTLS", "mock smtp");
+        tcp.write_all(b"220 2.0.0 Ready to start TLS\r\n").await?;
+        rec.update(|r| r.starttls = true);
+        acceptor.accept(tcp).await?
     };
-    assert!(l.starts_with("EHLO "), "mock smtp: {l}");
-    tcp.write_all(b"250-backend.test\r\n250-PIPELINING\r\n250 STARTTLS\r\n")
-        .await?;
-    let Some(l) = read_line_raw(&mut tcp).await else {
-        return Ok(());
-    };
-    assert_eq!(l, "STARTTLS", "mock smtp");
-    tcp.write_all(b"220 2.0.0 Ready to start TLS\r\n").await?;
-    let mut s = acceptor.accept(tcp).await?;
     let extensions: String = match &rec.smtp_ehlo {
         Some(l) => l.iter().map(|x| format!("250-{x}\r\n")).collect(),
         None => SMTP_EHLO.iter().map(|x| format!("250-{x}\r\n")).collect(),
     };
+    let xclient = if rec.mode.xclient {
+        "250-XCLIENT NAME ADDR PROTO HELO LOGIN\r\n"
+    } else {
+        ""
+    };
     let ehlo = format!(
-        "250-backend.test\r\n{extensions}250-XCLIENT NAME ADDR PROTO HELO LOGIN\r\n250 AUTH PLAIN LOGIN XOAUTH2\r\n"
+        "250-backend.test\r\n{extensions}{xclient}250 AUTH PLAIN LOGIN XOAUTH2 OAUTHBEARER\r\n"
     );
     // After XCLIENT the session is the client's: XCLIENT only if its
     // address is authorized too.
-    let ehlo_client = format!("250-backend.test\r\n{extensions}250 AUTH PLAIN LOGIN XOAUTH2\r\n");
+    let ehlo_client =
+        format!("250-backend.test\r\n{extensions}250 AUTH PLAIN LOGIN XOAUTH2 OAUTHBEARER\r\n");
     let mut after_xclient = false;
     while let Some(l) = read_line_raw(&mut s).await {
         if l.len() + 2 > SMTP_LINE_LIMIT {
@@ -986,6 +1129,16 @@ async fn mock_smtp(
                         return Ok(());
                     }
                 }
+                if v == Verdict::Reject && mech.eq_ignore_ascii_case("OAUTHBEARER") {
+                    s.write_all(format!("334 {}\r\n", oauthbearer_error(&login)).as_bytes())
+                        .await?;
+                    let answer = read_line_raw(&mut s).await.unwrap_or_default();
+                    rec.update(|r| r.error_answer = Some(answer.clone()));
+                    if answer != "AQ==" {
+                        s.write_all(b"501 5.7.0 Authentication aborted\r\n").await?;
+                        return Ok(());
+                    }
+                }
                 let reply: &[u8] = match v {
                     Verdict::Ok => b"235 2.7.0 Authentication successful\r\n",
                     Verdict::Reject => b"535 5.7.8 Error: authentication failed\r\n",
@@ -1012,19 +1165,28 @@ async fn mock_sieve(
     acceptor: tokio_rustls::TlsAcceptor,
     rec: Rec,
 ) -> std::io::Result<()> {
-    let hdr = read_proxy_header(&mut tcp, Duration::from_secs(1)).await;
-    rec.update(|s| s.proxy_header = hdr);
-    tcp.write_all(
-        b"\"IMPLEMENTATION\" \"Pigeonhole mock\"\r\n\"SASL\" \"PLAIN XOAUTH2 OAUTHBEARER\"\r\n\"STARTTLS\"\r\n\"VERSION\" \"1.0\"\r\nOK \"mock ready\"\r\n",
-    )
-    .await?;
-    let Some(l) = read_line_raw(&mut tcp).await else {
-        return Ok(());
-    };
-    assert_eq!(l, "STARTTLS", "mock sieve");
-    tcp.write_all(b"OK \"Begin TLS negotiation now.\"\r\n")
+    if rec.mode.proxy_header {
+        let hdr = read_proxy_header(&mut tcp, IO_TIMEOUT).await;
+        rec.update(|s| s.proxy_header = hdr);
+    }
+    let mut s = if rec.mode.implicit_tls {
+        // Stalwart can serve ManageSieve over implicit TLS: the capability
+        // greeting comes over TLS.
+        acceptor.accept(tcp).await?
+    } else {
+        tcp.write_all(
+            b"\"IMPLEMENTATION\" \"Pigeonhole mock\"\r\n\"SASL\" \"PLAIN XOAUTH2 OAUTHBEARER\"\r\n\"STARTTLS\"\r\n\"VERSION\" \"1.0\"\r\nOK \"mock ready\"\r\n",
+        )
         .await?;
-    let mut s = acceptor.accept(tcp).await?;
+        let Some(l) = read_line_raw(&mut tcp).await else {
+            return Ok(());
+        };
+        assert_eq!(l, "STARTTLS", "mock sieve");
+        tcp.write_all(b"OK \"Begin TLS negotiation now.\"\r\n")
+            .await?;
+        rec.update(|r| r.starttls = true);
+        acceptor.accept(tcp).await?
+    };
     let extra = rec
         .login_caps
         .as_ref()
@@ -1076,6 +1238,23 @@ async fn mock_sieve(
         return Ok(());
     }
     let v = verdict_after(&login).await;
+    if v == Verdict::Reject && mech.eq_ignore_ascii_case("OAUTHBEARER") {
+        // The error result as a server string (RFC 5804 §2.1): a literal for
+        // `badreq…`, quoted otherwise. Answered with "AQ==" (%x01).
+        let e = oauthbearer_error(&login);
+        let challenge = if login.starts_with("badreq") {
+            format!("{{{}}}\r\n{e}\r\n", e.len())
+        } else {
+            format!("\"{e}\"\r\n")
+        };
+        s.write_all(challenge.as_bytes()).await?;
+        let answer = read_line_raw(&mut s).await.unwrap_or_default();
+        rec.update(|r| r.error_answer = Some(answer.clone()));
+        if answer != "\"AQ==\"" {
+            s.write_all(b"NO \"Authentication aborted.\"\r\n").await?;
+            return Ok(());
+        }
+    }
     let reply: &[u8] = match v {
         Verdict::Ok => b"OK \"Logged in.\"\r\n",
         Verdict::Reject => b"NO \"Authentication failed.\"\r\n",
@@ -1271,6 +1450,48 @@ pub struct Opts {
     pub submission_extra: &'static str,
     /// `server.hostname`.
     pub hostname: &'static str,
+    /// The profile keys of the IMAP, submission and ManageSieve backends.
+    pub profiles: [Profile; 3],
+    /// `submission.implicit_tls_listen` on `SMTPS_IP` (`Proxy::smtps`).
+    pub submissions: bool,
+}
+
+/// The profile keys of one backend; `None`: left out of the config. The
+/// mock backend serves what they select.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Profile {
+    /// `client_ip`. Unset: the short forms, `proxy_protocol = true` for IMAP
+    /// and ManageSieve, `submission.xclient` (`Opts::smtp_xclient`).
+    pub client_ip: Option<&'static str>,
+    pub tls: Option<&'static str>,
+    pub auth_forward: Option<&'static str>,
+}
+
+impl Profile {
+    /// The mock backend's mode for this profile.
+    pub fn mode(&self, kind: Kind) -> MockMode {
+        let d = MockMode::default_for(kind);
+        MockMode {
+            implicit_tls: self.tls.map_or(d.implicit_tls, |t| t == "implicit"),
+            proxy_header: self.client_ip.map_or(d.proxy_header, |c| c == "proxy_v2"),
+            xclient: self.client_ip.map_or(d.xclient, |c| c == "xclient"),
+        }
+    }
+
+    /// The keys after `address`, `verify_name` and `ca_file` in the
+    /// backend's inline table.
+    fn keys(&self, short_form_pp: bool) -> String {
+        let mut k = match self.client_ip {
+            Some(c) => format!(", client_ip = \"{c}\""),
+            None => format!(", proxy_protocol = {short_form_pp}"),
+        };
+        for (key, v) in [("tls", self.tls), ("auth_forward", self.auth_forward)] {
+            if let Some(v) = v {
+                k.push_str(&format!(", {key} = \"{v}\""));
+            }
+        }
+        k
+    }
 }
 
 impl Default for Opts {
@@ -1293,6 +1514,8 @@ impl Default for Opts {
             max_auth_attempts: 1,
             submission_extra: "",
             hostname: HOSTNAME,
+            profiles: [Profile::default(); 3],
+            submissions: false,
         }
     }
 }
@@ -1344,10 +1567,10 @@ pub fn grok_regex() -> regex::Regex {
 }
 
 /// Strict parser for the full line as the binary writes it. Group 10
-/// is the `rule` field, appended after `pwfp`.
+/// is the `rule` field, appended after `pwfp`, group 11 `listener`.
 fn line_regex() -> regex::Regex {
     regex::Regex::new(
-        r#"^\S+Z +(INFO|WARN) authlog: authresult result="([^"]*)" proto="([^"]*)" scope="([^"]*)" mech=(\S*) user=(\S*) peer=(\S+) reason="([^"]*)" pwfp="([^"]*)" rule="([^"]*)"$"#,
+        r#"^\S+Z +(INFO|WARN) authlog: authresult result="([^"]*)" proto="([^"]*)" scope="([^"]*)" mech=(\S*) user=(\S*) peer=(\S+) reason="([^"]*)" pwfp="([^"]*)" rule="([^"]*)" listener="(imap|submission|submissions|sieve)"$"#,
     )
     .unwrap()
 }
@@ -1359,6 +1582,8 @@ pub struct Proxy {
     pub imap: SocketAddr,
     pub smtp: SocketAddr,
     pub sieve: SocketAddr,
+    /// The implicit-TLS submission listener; unset without `Opts::submissions`.
+    pub smtps: SocketAddr,
     pub metrics: SocketAddr,
 }
 
@@ -1375,12 +1600,14 @@ impl Proxy {
     pub fn config_text(pki: &Pki, idp: &Idp, backends: [&MockBackend; 3], opts: &Opts) -> String {
         let [imap, smtp, sieve] = backends;
         let ca = pki.ca_file.display();
-        let backend = |b: &MockBackend, pp: bool| {
+        let backend = |b: &MockBackend, p: &Profile, pp: bool| {
             format!(
-                "{{ address = \"{}\", verify_name = \"{BACKEND_NAME}\", ca_file = \"{ca}\", proxy_protocol = {pp} }}",
-                b.addr
+                "{{ address = \"{}\", verify_name = \"{BACKEND_NAME}\", ca_file = \"{ca}\"{} }}",
+                b.addr,
+                p.keys(pp)
             )
         };
+        let [imap_p, smtp_p, sieve_p] = &opts.profiles;
         format!(
             r#"config_version = 2
 
@@ -1397,7 +1624,7 @@ backend = {imap_be}
 
 [submission]
 listen = "{SMTP_IP}:0"
-backend = {smtp_be}
+{submissions}backend = {smtp_be}
 xclient = {xclient}
 {submission_extra}
 
@@ -1440,11 +1667,16 @@ connect_secs = 3
                     k.display()
                 ))
                 .collect::<String>(),
-            imap_be = backend(imap, true),
-            smtp_be = backend(smtp, false),
-            xclient = opts.smtp_xclient,
+            imap_be = backend(imap, imap_p, true),
+            smtp_be = backend(smtp, smtp_p, false),
+            xclient = opts.smtp_xclient && smtp_p.client_ip.is_none(),
+            submissions = if opts.submissions {
+                format!("implicit_tls_listen = \"{SMTPS_IP}:0\"\n")
+            } else {
+                String::new()
+            },
             submission_extra = opts.submission_extra,
-            sieve_be = backend(sieve, true),
+            sieve_be = backend(sieve, sieve_p, true),
             jwks = idp.jwks_url(),
             issuer_extra = opts.issuer_extra,
             per_ip = opts.max_preauth_per_ip,
@@ -1522,6 +1754,7 @@ connect_secs = 3
             imap: SocketAddr::from(([0, 0, 0, 0], 0)),
             smtp: SocketAddr::from(([0, 0, 0, 0], 0)),
             sieve: SocketAddr::from(([0, 0, 0, 0], 0)),
+            smtps: SocketAddr::from(([0, 0, 0, 0], 0)),
             metrics: SocketAddr::from(([0, 0, 0, 0], 0)),
         };
         let until = Instant::now() + IO_TIMEOUT;
@@ -1538,10 +1771,12 @@ connect_secs = 3
                 // Without metrics nothing listens on METRICS_IP (it is also
                 // the client's address, so no other socket can be mistaken).
                 let m = by_ip(METRICS_IP).or((!metrics).then_some(proxy.metrics));
-                if let (Some(i), Some(s), Some(v), Some(m)) =
-                    (by_ip(IMAP_IP), by_ip(SMTP_IP), by_ip(SIEVE_IP), m)
+                let t = by_ip(SMTPS_IP).or((!opts.submissions).then_some(proxy.smtps));
+                if let (Some(i), Some(s), Some(v), Some(m), Some(t)) =
+                    (by_ip(IMAP_IP), by_ip(SMTP_IP), by_ip(SIEVE_IP), m, t)
                 {
                     (proxy.imap, proxy.smtp, proxy.sieve, proxy.metrics) = (i, s, v, m);
+                    proxy.smtps = t;
                     return proxy;
                 }
             }
@@ -1643,6 +1878,20 @@ connect_secs = 3
             .map(|l| {
                 re.captures(l)
                     .unwrap_or_else(|| panic!("unexpected authresult line format: {l}"))[10]
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The `listener` field of every `authresult` line so far, in order.
+    pub fn authresult_listeners(&self) -> Vec<String> {
+        let re = line_regex();
+        self.logs()
+            .iter()
+            .filter(|l| l.contains("authresult"))
+            .map(|l| {
+                re.captures(l)
+                    .unwrap_or_else(|| panic!("unexpected authresult line format: {l}"))[11]
                     .to_string()
             })
             .collect()
@@ -1762,9 +2011,12 @@ impl Harness {
     /// Start with a PKI made beforehand (its CA or directory named in `opts`).
     pub async fn start_on(pki: Pki, opts: Opts) -> Harness {
         let idp = Idp::start().await;
-        let imap_be = MockBackend::start(Kind::Imap, pki.backend.clone()).await;
-        let smtp_be = MockBackend::start(Kind::Smtp, pki.backend.clone()).await;
-        let sieve_be = MockBackend::start(Kind::Sieve, pki.backend.clone()).await;
+        let mock = |kind: Kind, i: usize| {
+            MockBackend::start_mode(kind, pki.backend.clone(), opts.profiles[i].mode(kind))
+        };
+        let imap_be = mock(Kind::Imap, 0).await;
+        let smtp_be = mock(Kind::Smtp, 1).await;
+        let sieve_be = mock(Kind::Sieve, 2).await;
         if opts.sieve_down {
             sieve_be.shutdown().await;
         }

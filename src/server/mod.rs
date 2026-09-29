@@ -31,13 +31,25 @@ pub struct BackendConn {
     pub address: String,
     pub name: ServerName<'static>,
     pub tls: TlsConnector,
-    pub proxy_protocol: bool,
+    /// How the backend learns the client's address.
+    pub client_ip: config::ClientIp,
+    /// STARTTLS or implicit TLS.
+    pub tls_mode: config::BackendTls,
+    /// The SASL mechanism a validated token is forwarded with.
+    pub auth_forward: config::AuthForward,
     /// TCP keepalive of every connection to this backend.
     pub keepalive: crate::wire::Keepalive,
 }
 
 impl BackendConn {
-    fn new(b: &config::Backend, keepalive: crate::wire::Keepalive) -> Result<BackendConn> {
+    /// `xclient` is `submission.xclient`, `default_tls` the protocol's
+    /// default of `tls` (both already applied by `config::parse`).
+    fn new(
+        b: &config::Backend,
+        xclient: bool,
+        default_tls: config::BackendTls,
+        keepalive: crate::wire::Keepalive,
+    ) -> Result<BackendConn> {
         let name = b
             .verify_name
             .clone()
@@ -48,9 +60,25 @@ impl BackendConn {
             address: b.address.clone(),
             name,
             tls: tls::backend_connector(b.ca_file.as_deref())?,
-            proxy_protocol: b.proxy_protocol,
+            client_ip: b.effective_client_ip(xclient),
+            tls_mode: b.tls.unwrap_or(default_tls),
+            auth_forward: b.auth_forward,
             keepalive,
         })
+    }
+
+    /// The name the backend is reached and verified by: `verify_name`, or
+    /// the host of `address`. OAUTHBEARER sends it as `host`.
+    pub fn host(&self) -> String {
+        self.name.to_str().into_owned()
+    }
+
+    /// The port of `address` (validated as `host:port`); 0 if it has none.
+    pub fn port(&self) -> u16 {
+        self.address
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse().ok())
+            .unwrap_or(0)
     }
 }
 
@@ -152,7 +180,12 @@ impl Generation {
         let keepalive = keepalive(&cfg.session);
         let imap = Imap {
             acceptor: tls::acceptor(&certs, Some(b"imap")),
-            backend: BackendConn::new(&cfg.imap.backend, keepalive)?,
+            backend: BackendConn::new(
+                &cfg.imap.backend,
+                false,
+                config::BackendTls::Implicit,
+                keepalive,
+            )?,
         };
         // The capability caches stay with a backend that stays.
         let submission = cfg
@@ -165,8 +198,12 @@ impl Generation {
                     .map(|(ctx, _)| ctx.protocol.ehlo.clone());
                 Ok(Submission {
                     acceptor: tls::acceptor(&certs, None),
-                    backend: BackendConn::new(&s.backend, keepalive)?,
-                    xclient: s.xclient,
+                    backend: BackendConn::new(
+                        &s.backend,
+                        s.xclient,
+                        config::BackendTls::Starttls,
+                        keepalive,
+                    )?,
                     ehlo_only: s.ehlo_extensions.clone(),
                     ehlo: kept.unwrap_or_default(),
                     caps_ttl: std::time::Duration::from_secs(s.capability_cache_secs),
@@ -183,7 +220,12 @@ impl Generation {
                     .map(|(ctx, _)| ctx.protocol.caps.clone());
                 Ok(Sieve {
                     acceptor: tls::acceptor(&certs, Some(b"managesieve")),
-                    backend: BackendConn::new(&s.backend, keepalive)?,
+                    backend: BackendConn::new(
+                        &s.backend,
+                        false,
+                        config::BackendTls::Starttls,
+                        keepalive,
+                    )?,
                     caps: kept.unwrap_or_default(),
                     caps_ttl: std::time::Duration::from_secs(s.capability_cache_secs),
                 })
@@ -534,6 +576,19 @@ pub async fn run(path: String, cfg: config::Config) -> Result<()> {
             crate::proto::smtp::handle,
             life.clone(),
         );
+        if let Some(addr) = &sub.implicit_tls_listen {
+            let implicit = TcpListener::bind(addr).await?;
+            tracing::info!(target: crate::obs::target::MAIN, listen=%addr, backend=%sub.backend.address, "submission implicit-TLS listener up");
+            listener::spawn_listener(
+                implicit,
+                metrics::Proto::Smtp,
+                "submission session ended",
+                current.subscribe(),
+                |g| g.submission.clone(),
+                crate::proto::smtp::handle_implicit,
+                life.clone(),
+            );
+        }
     }
 
     if let Some(sv) = &cfg.sieve {

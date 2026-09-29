@@ -281,6 +281,77 @@ pub fn build_xoauth2(user: &str, token: &str) -> Zeroizing<String> {
     Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(raw.as_bytes()))
 }
 
+/// Build an OAUTHBEARER response (RFC 7628 §3.1) to forward to the backend:
+/// the GS2 header with `user` as authzid (RFC 5801 §4, `,` and `=` escaped),
+/// the backend's `host` and `port` (the server the proxy connects to; port 0
+/// is left out), the token. Zeroized on drop like `build_xoauth2`.
+pub fn build_oauthbearer(user: &str, host: &str, port: u16, token: &str) -> Zeroizing<String> {
+    let authzid = user.replace('=', "=3D").replace(',', "=2C");
+    let port = if port == 0 {
+        String::new()
+    } else {
+        format!("port={port}\x01")
+    };
+    let raw = Zeroizing::new(
+        [
+            "n,a=",
+            &authzid,
+            ",\x01host=",
+            host,
+            "\x01",
+            &port,
+            "auth=Bearer ",
+            token,
+            "\x01\x01",
+        ]
+        .concat(),
+    );
+    Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(raw.as_bytes()))
+}
+
+/// The dummy response that completes a failed OAUTHBEARER exchange after
+/// the server's error result (RFC 7628 §3.2.3): `%x01`, base64.
+pub const OAUTHBEARER_DUMMY: &str = "AQ==";
+
+/// What a backend's error result (RFC 7628 §3.2.2) to a forwarded
+/// OAUTHBEARER token says: the base64 of its challenge, a JSON object whose
+/// `status` is an OAuth error code (RFC 6750 §3.1).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ErrorResult {
+    /// `invalid_request`: the backend could not use the request and judged
+    /// no token. An outage, not a verdict.
+    BadRequest,
+    /// Any other status (`invalid_token`, `insufficient_scope`, …): a
+    /// verdict on the token. The status as `authlog::sanitize` leaves it.
+    Status(String),
+    /// Not base64 of a JSON object with a string `status`.
+    Malformed,
+}
+
+/// Largest error result read from a backend challenge (base64); a status,
+/// a scope and a URL fit in far less.
+const MAX_ERROR_RESULT: usize = 4096;
+
+/// Classify a backend's error result (`b64`, the challenge text without
+/// the protocol's prefix).
+pub fn parse_error_result(b64: &str) -> ErrorResult {
+    let b64 = b64.trim();
+    if b64.len() > MAX_ERROR_RESULT {
+        return ErrorResult::Malformed;
+    }
+    let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+        return ErrorResult::Malformed;
+    };
+    let Ok(serde_json::Value::Object(o)) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+        return ErrorResult::Malformed;
+    };
+    match o.get("status").and_then(|v| v.as_str()) {
+        Some("invalid_request") => ErrorResult::BadRequest,
+        Some(status) => ErrorResult::Status(crate::obs::authlog::sanitize(status)),
+        None => ErrorResult::Malformed,
+    }
+}
+
 /// What a client authenticated with. The proxy either forwards an OAuth bearer
 /// token (validated locally first) or a password (validated by the backend).
 /// `Debug` is hand-written to REDACT the secret — a password/token must never
@@ -364,6 +435,62 @@ pub fn build_plain(user: &str, pass: &str) -> Zeroizing<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The forwarded OAUTHBEARER response parses back with the client-side
+    /// parser: the authzid survives `,` and `=`, and the token is intact.
+    #[test]
+    fn oauthbearer_forward_round_trips() {
+        let b64 = build_oauthbearer("a,b=c@example.org", "mail.example.org", 993, "TKN");
+        let raw = String::from_utf8(
+            base64::engine::general_purpose::STANDARD
+                .decode(b64.as_str())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            raw,
+            "n,a=a=2Cb=3Dc@example.org,\x01host=mail.example.org\x01port=993\x01auth=Bearer TKN\x01\x01"
+        );
+        let c = parse_sasl("OAUTHBEARER", &b64).unwrap();
+        assert_eq!(c.user, "a,b=c@example.org");
+        assert_eq!(c.token.as_str(), "TKN");
+        assert_eq!(c.host.as_deref(), Some("mail.example.org"));
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(build_oauthbearer("u@example.org", "192.0.2.1", 0, "T").as_str())
+            .unwrap();
+        assert_eq!(
+            raw,
+            b"n,a=u@example.org,\x01host=192.0.2.1\x01auth=Bearer T\x01\x01"
+        );
+    }
+
+    #[test]
+    fn backend_error_results() {
+        let b = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+        assert_eq!(
+            parse_error_result(&b(r#"{"status":"invalid_token","scope":"mail"}"#)),
+            ErrorResult::Status("invalid_token".into())
+        );
+        assert_eq!(
+            parse_error_result(&b(r#"{"status":"invalid_request"}"#)),
+            ErrorResult::BadRequest
+        );
+        assert_eq!(
+            parse_error_result(&format!(" {} ", b(r#"{"status":"x\ny"}"#))),
+            ErrorResult::Status("x?y".into())
+        );
+        for bad in [
+            b(r#"{"scope":"mail"}"#),
+            b(r#"{"status":401}"#),
+            b(r#"["invalid_token"]"#),
+            b("not json"),
+            "***".into(),
+            String::new(),
+            b(&format!(r#"{{"status":"{}"}}"#, "x".repeat(4000))),
+        ] {
+            assert_eq!(parse_error_result(&bad), ErrorResult::Malformed, "{bad}");
+        }
+    }
 
     #[test]
     fn parse_xoauth2_ir() {

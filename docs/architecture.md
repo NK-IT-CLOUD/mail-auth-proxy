@@ -2,13 +2,15 @@
 
 This document covers the parts every protocol shares. The per-protocol dialogs are in [protocols.md](protocols.md), every configuration key in [configuration.md](configuration.md), and logs, metrics and signals in [operations.md](operations.md). It is written from the source in `src/` and checked with the black-box tests in `tests/`; where it and the code disagree, the code wins.
 
-The proxy terminates client TLS for three protocols and runs each protocol's dialog only until the client presents a credential. It then decides whether that credential may be used, logs in to the backend (Dovecot or Postfix) with the client's own credential, and relays bytes without interpreting them. It never holds a master credential. OAuth bearer tokens are validated locally against JWKS keys, never by introspection at the IdP.
+The proxy terminates client TLS for three protocols and runs each protocol's dialog only until the client presents a credential. It then decides whether that credential may be used, logs in to the backend (a standards-conforming IMAP, submission and ManageSieve server such as Dovecot and Postfix) with the client's own credential, and relays bytes without interpreting them. It never holds a master credential. OAuth bearer tokens are validated locally against JWKS keys, never by introspection at the IdP.
 
 | Protocol | Client side | Backend side |
 |---|---|---|
-| IMAP | implicit TLS on `imap.listen` | implicit TLS to `imap.backend`, optional PROXY protocol v2 |
-| SMTP submission | plaintext + STARTTLS on `submission.listen` | plaintext + STARTTLS to `submission.backend`, optional XCLIENT |
-| ManageSieve | plaintext + STARTTLS on `sieve.listen` | plaintext + STARTTLS to `sieve.backend`, optional PROXY protocol v2 |
+| IMAP | implicit TLS on `imap.listen` | `imap.backend`: implicit TLS (default) or STARTTLS |
+| SMTP submission | plaintext + STARTTLS on `submission.listen`; optional implicit TLS on `submission.implicit_tls_listen` | `submission.backend`: STARTTLS (default) or implicit TLS |
+| ManageSieve | plaintext + STARTTLS on `sieve.listen` | `sieve.backend`: STARTTLS (default) or implicit TLS |
+
+Each backend has a profile ([configuration.md](configuration.md#keys)): `tls` as in the table, `client_ip` (a PROXY protocol v2 header, XCLIENT on submission, or nothing) and `auth_forward` (a token goes as XOAUTH2 or OAUTHBEARER). The profile belongs to the backend, not to the protocol, and every key of it is reloadable.
 
 ## Request flow
 
@@ -21,8 +23,9 @@ client ──TLS──▶ mail-auth-proxy ────────────�
                  4. read AUTHENTICATE / AUTH / LOGIN (up to limits.max_auth_attempts)
                  5a. OAuth: validate the JWT locally ──────── JWKS (cached, refreshed) ◀── IdP
                  5b. password: legacy gate (rule, domain, account check, throttle)
-                 6. connect to the backend, pass the client address (PROXY v2 / XCLIENT),
-                    log in with the same token (as XOAUTH2) or the same password (as PLAIN)
+                 6. connect to the backend (implicit TLS or STARTTLS), pass the client address
+                    (PROXY v2 / XCLIENT / none), log in with the same token (as XOAUTH2 or
+                    OAUTHBEARER) or the same password (as PLAIN)
                  7. relay the backend's verdict; on success relay bytes until either side closes
 ```
 
@@ -51,7 +54,7 @@ The JWKS refresh and the rate limit's sweep run on the generation in use. An old
 
 ## Client TLS
 
-- rustls with the aws-lc-rs provider. TLS 1.2 and TLS 1.3 use rustls' default cipher suites. IMAP and ManageSieve negotiate ALPN with their IANA identifiers `imap` and `managesieve`: a client that offers ALPN without that identifier is refused in the handshake (`no_application_protocol`); one that offers none is accepted. SMTP has no identifier and ignores ALPN. There is no client-certificate authentication.
+- rustls with the aws-lc-rs provider. TLS 1.2 and TLS 1.3 use rustls' default cipher suites. IMAP and ManageSieve negotiate ALPN with their IANA identifiers `imap` and `managesieve`: a client that offers ALPN without that identifier is refused in the handshake (`no_application_protocol`); one that offers none is accepted. SMTP has no identifier and selects none: on both submission listeners (STARTTLS and implicit TLS) a client that offers an ID of the IANA ALPN registry (another protocol: `http/1.1`, `h2`, `imap`, …; GREASE values excepted) is refused before the ServerHello with `no_application_protocol`, one that offers none or only unregistered values is accepted. There is no client-certificate authentication.
 - The certificate is chosen by SNI (RFC 6066 §3) from `tls.cert` (the default) and `tls.certificates`: exact DNS name first, then a wildcard for one leftmost label (RFC 9525 §6.3), ASCII case-insensitive; no SNI gets the default. The accepted names are the subjectAltName DNS names of the configured certificates. The proxy reads the ClientHello first (rustls `Acceptor`); a name that no certificate carries ends the handshake with the fatal alert `unrecognized_name` before a certificate is sent (RFC 9325 §3.7). Details in [configuration.md](configuration.md#tls-server-names).
 - The SNI after the handshake is therefore always a name of the proxy. It is used by the legacy rules ([legacy gate](#legacy-gate)) and the OAUTHBEARER `host` check. A client that sends no SNI matches only rules without `sni`. Clients that connect by IP address never send SNI.
 
@@ -150,8 +153,8 @@ A source IP in `scope.internal_networks` counts as `scope=internal`, whatever th
 
 | Mechanism | Client → proxy | Proxy → backend |
 |---|---|---|
-| `XOAUTH2` | `user=<u>^Aauth=Bearer <jwt>^A^A`. The scheme `Bearer` is case-insensitive and `user=` must not be empty. | `XOAUTH2` rebuilt as `user=<validated identity claim>^Aauth=Bearer <same jwt>^A^A` |
-| `OAUTHBEARER` | GS2 header `n,a=<authzid>,` or `y,…` (the authzid is optional: `n,,`; `=2C` and `=3D` in it stand for `,` and `=`; `p=` channel binding is refused), then `^A`-separated fields with `auth=Bearer <jwt>`. A `host=` must match the TLS server name when the client sent SNI (RFC 7628 §3.2; ASCII case-insensitive, a trailing dot ignored), otherwise the token counts as rejected (`bad_token`). `port=` is ignored. | converted to `XOAUTH2` as above |
+| `XOAUTH2` | `user=<u>^Aauth=Bearer <jwt>^A^A`. The scheme `Bearer` is case-insensitive and `user=` must not be empty. | with `auth_forward = "xoauth2"` (default): `XOAUTH2` rebuilt as `user=<validated identity claim>^Aauth=Bearer <same jwt>^A^A`; with `auth_forward = "oauthbearer"`: `OAUTHBEARER` rebuilt as `n,a=<validated identity claim>,^Ahost=<backend name>^Aport=<backend port>^Aauth=Bearer <same jwt>^A^A` (RFC 7628 §3.1) |
+| `OAUTHBEARER` | GS2 header `n,a=<authzid>,` or `y,…` (the authzid is optional: `n,,`; `=2C` and `=3D` in it stand for `,` and `=`; `p=` channel binding is refused), then `^A`-separated fields with `auth=Bearer <jwt>`. A `host=` must match the TLS server name when the client sent SNI (RFC 7628 §3.2; ASCII case-insensitive, a trailing dot ignored), otherwise the token counts as rejected (`bad_token`). `port=` is ignored. | as for `XOAUTH2`: the backend's `auth_forward` mechanism, rebuilt |
 | `PLAIN` | `authzid\0authcid\0passwd`. User and password must be non-empty, and the password must not contain a NUL (RFC 4616 §2). The login is the authcid; a non-empty authzid must equal it, otherwise the exchange fails (acting as another user is not supported). | `PLAIN` rebuilt as `\0<login>\0<passwd>` (empty authzid) |
 | `LOGIN` | Two base64 prompts (`Username:`, `Password:`). An initial response on the AUTH line is the username; then only the password is asked for. Neither field may contain a NUL. IMAP and SMTP only. | sent as `PLAIN` |
 
@@ -166,7 +169,7 @@ Passwords, bearer tokens and the SASL responses that carry them are held in buff
 - every client line before authentication (an IMAP `LOGIN` line or an `AUTHENTICATE`/`AUTH` line can carry the credential), including the buffers it outgrew while being read;
 - the SASL response lines, their base64-decoded bytes (also when decoding fails half-way), the unquoted ManageSieve response and literal;
 - the parsed password or token;
-- the `XOAUTH2` or `PLAIN` response rebuilt for the backend, in raw and base64 form, and the command line that carries it.
+- the `XOAUTH2`, `OAUTHBEARER` or `PLAIN` response rebuilt for the backend, in raw and base64 form, and the command line that carries it.
 
 The credential is dropped right after the backend login, before the session is relayed. Types that hold one print `<redacted>` in `Debug`, and error texts name neither the credential nor a byte of its base64 encoding; the log keeps only the keyed password fingerprint (`pwfp`).
 
@@ -212,15 +215,19 @@ JWKS handling:
 
 - Each backend has its own trust anchors: the CAs in its `ca_file`, or the system store (`rustls-native-certs`, which also honours `SSL_CERT_FILE`/`SSL_CERT_DIR`). Certificate verification cannot be turned off.
 - The name verified is the backend's `verify_name`, or the host part of its `address`.
+- `tls = "implicit"` starts the handshake on the new connection; `tls = "starttls"` reads the plaintext greeting, sends the protocol's STARTTLS and starts the handshake after the backend's go-ahead. Nothing the backend sent before TLS is used afterwards: IMAP and ManageSieve capabilities, and the SMTP EHLO extensions, are read again over TLS (RFC 9051 §6.2.1, RFC 5804 §2.2, RFC 3207 §4.2). The line reader takes one byte at a time, so no byte after the go-ahead is read as plaintext.
 - TCP connect and TLS handshake each have a `timeouts.connect_secs` timeout (default 10 s).
 
-## PROXY protocol v2 and XCLIENT
+## Client address: PROXY protocol v2, XCLIENT, none
 
-- With `proxy_protocol = true` on the IMAP or Sieve backend, the proxy writes a binary PROXY v2 header (command `PROXY`, `TCP4` or `TCP6`) as the first bytes of that backend connection, before TLS.
-  - The source is the client address and the destination is the local address the client connected to. IPv4-mapped addresses are *not* canonicalised here.
-  - The ManageSieve capability probe ([protocols: ManageSieve after TLS](protocols.md#managesieve-after-tls)) is the proxy's own connection and sends a PROXY v2 `LOCAL` header (no addresses).
-  - The backend listener must require the header (Dovecot `haproxy = yes`); switch both settings together.
-- SMTP never sends PROXY protocol. With `submission.xclient = true` it sends `XCLIENT [HELO=<client EHLO name>] [PROTO=ESMTP|SMTP] [PORT=<client port>] NAME=[UNAVAILABLE] ADDR=<ipv4>` (or `ADDR=IPV6:<ipv6>`) after the backend's post-TLS EHLO, HELO, PROTO and PORT only where the backend lists them in its `XCLIENT` line, but only if the backend advertises `XCLIENT`; otherwise the step is skipped silently. With `submission.xclient = false`, a backend that advertises `XCLIENT` is an outage and no credential is sent. The same applies when the `EHLO` after the proxy's `XCLIENT` still lists it, because the client's own address would then be authorized for it.
+A backend's `client_ip` says how it learns the client address.
+
+- `proxy_v2` (any backend; short form `proxy_protocol = true`): the proxy writes a binary PROXY v2 header (command `PROXY`, `TCP4` or `TCP6`) as the first bytes of that backend connection, before the greeting and TLS.
+  - The source is the client address and the destination is the local address the client connected to. An IPv4-mapped pair (from a dual-stack listener) is sent as `TCP4`.
+  - The proxy's own connections, the ManageSieve capability probe ([protocols: ManageSieve after TLS](protocols.md#managesieve-after-tls)) and the SMTP EHLO probe, send a PROXY v2 `LOCAL` header (no addresses).
+  - The backend listener must require the header (Dovecot `haproxy = yes`, Postfix `smtpd_upstream_proxy_protocol = haproxy`); switch both settings together.
+- `none`: nothing. The backend sees the proxy's address for every client, so its own per-address rate limits, bans (fail2ban on the backend host, a server's built-in blocking of failing addresses) and logs treat all clients as one: one abusive client can get every user blocked there. The proxy's own rate limit still sees the real addresses. Validation warns about it.
+- `xclient` (submission only; short form `submission.xclient = true`): the proxy sends `XCLIENT [HELO=<client EHLO name>] [PROTO=ESMTP|SMTP] [PORT=<client port>] NAME=[UNAVAILABLE] ADDR=<ipv4>` (or `ADDR=IPV6:<ipv6>`) after the backend's post-TLS EHLO, HELO, PROTO and PORT only where the backend lists them in its `XCLIENT` line, but only if the backend advertises `XCLIENT`; otherwise the step is skipped silently. With any other `client_ip`, a backend that advertises `XCLIENT` to the proxy is an outage and no credential is sent. The same applies when the `EHLO` after the proxy's `XCLIENT` still lists it, because the client's own address would then be authorized for it.
 
 ## After authentication
 

@@ -725,7 +725,7 @@ users = ["*@example.test", "*@gone.test"]
         .collect();
     let line = |user: &str, reason: &str, rule: &str| {
         format!(
-            r#"WARN authlog: authresult result="fail" proto="imap" scope="external" mech=PLAIN user={user} peer=127.0.0.1 reason="{reason}" pwfp="<fp>" rule="{rule}""#
+            r#"WARN authlog: authresult result="fail" proto="imap" scope="external" mech=PLAIN user={user} peer=127.0.0.1 reason="{reason}" pwfp="<fp>" rule="{rule}" listener="imap""#
         )
     };
     assert_eq!(

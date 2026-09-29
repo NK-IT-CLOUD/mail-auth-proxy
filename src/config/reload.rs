@@ -16,8 +16,8 @@ pub struct Plan {
 /// Compare the configuration in use `old` with `new`; both validated.
 ///
 /// Restart-only: the listener addresses (`imap.listen`, `submission.listen`,
-/// `sieve.listen`), whether `[submission]` and `[sieve]` exist (a listener
-/// more or less), and the metrics endpoint (`metrics.enabled`,
+/// `submission.implicit_tls_listen`, `sieve.listen`), whether `[submission]`
+/// and `[sieve]` exist (a listener more or less), and the metrics endpoint (`metrics.enabled`,
 /// `metrics.listen`). Everything else is taken over by a reload.
 pub fn plan(old: &Config, new: &Config) -> Plan {
     let mut restart_required = Vec::new();
@@ -43,6 +43,13 @@ pub fn plan(old: &Config, new: &Config) -> Plan {
             (Some(a), Some(b)) if a != b => restart_required.push(key),
             (Some(_), None) | (None, Some(_)) => restart_required.push(section),
             _ => {}
+        }
+    }
+    // Within a submission section that stays: the implicit-TLS listener
+    // added, removed or moved.
+    if let (Some(a), Some(b)) = (&old.submission, &new.submission) {
+        if a.implicit_tls_listen != b.implicit_tls_listen {
+            restart_required.push("submission.implicit_tls_listen");
         }
     }
     let (om, nm) = (&old.metrics, &new.metrics);
@@ -152,5 +159,54 @@ mod tests {
         assert!(plan_for(&off, &off.replace("9102", "9103"))
             .restart_required
             .is_empty());
+    }
+
+    /// The backend profile keys are reloadable; the implicit-TLS submission
+    /// listener binds a socket: adding, moving or removing it needs a restart.
+    #[test]
+    fn backend_profile_reloads_implicit_listener_restarts() {
+        let old = format!("{V2}{SUB}{SIEVE}");
+        let new = format!(
+            "{}{}{}",
+            V2.replace(
+                "client_ip = \"proxy_v2\"",
+                "client_ip = \"none\", tls = \"starttls\", auth_forward = \"oauthbearer\""
+            ),
+            SUB.replace("}", ", client_ip = \"proxy_v2\", tls = \"implicit\" }"),
+            SIEVE.replace(
+                "}",
+                ", tls = \"implicit\", auth_forward = \"oauthbearer\" }"
+            )
+        );
+        let p = plan_for(&old, &new);
+        assert!(p.restart_required.is_empty(), "{p:?}");
+        assert_eq!(p.changed, ["imap", "sieve", "submission"]);
+
+        let with = |l: &str| {
+            SUB.replace(
+                "backend",
+                &format!("implicit_tls_listen = \"{l}\"\nbackend"),
+            )
+        };
+        let (base, new) = (format!("{V2}{SUB}"), format!("{V2}{}", with("0.0.0.0:465")));
+        for (a, b) in [(&base, &new), (&new, &base)] {
+            assert_eq!(
+                plan_for(a, b).restart_required,
+                ["submission.implicit_tls_listen"]
+            );
+        }
+        assert_eq!(
+            plan_for(
+                &format!("{V2}{}", with("0.0.0.0:465")),
+                &format!("{V2}{}", with("127.0.0.1:465"))
+            )
+            .restart_required,
+            ["submission.implicit_tls_listen"]
+        );
+        // The section as a whole: reported once, as the section.
+        assert_eq!(
+            plan_for(V2, &format!("{V2}{}", with("0.0.0.0:465"))).restart_required,
+            ["submission"]
+        );
     }
 }

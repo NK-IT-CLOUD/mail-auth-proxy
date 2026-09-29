@@ -2,6 +2,8 @@
 
 use super::Sieve;
 use crate::auth::{BackendCredential, BackendError, BackendLogin};
+use crate::config::BackendTls;
+use crate::obs::authlog::sanitize;
 use crate::server::BackendConn;
 use crate::wire::line::read_line;
 use crate::wire::{connect, Tuning};
@@ -15,7 +17,7 @@ use tokio::time::Instant;
 use tokio_rustls::client::TlsStream;
 use zeroize::Zeroizing;
 
-/// The backend's post-STARTTLS capabilities (SIEVE extensions, limits, …),
+/// The backend's capabilities over TLS (SIEVE extensions, limits, …),
 /// relayed to clients before they authenticate.
 ///
 /// Caching them means an unauthenticated client never causes a backend
@@ -56,8 +58,9 @@ impl CapsCache {
     }
 }
 
-/// Open a backend ManageSieve session up to (and including) the post-TLS
-/// capability list.
+/// Open a backend ManageSieve session up to (and including) the capability
+/// list over TLS: after STARTTLS the server sends it again (RFC 5804 §2.2),
+/// with implicit TLS it is the greeting.
 /// `origin` is `(client, local)` for a client's session, `None` for the
 /// capability probe, which is the proxy's own connection.
 pub(super) async fn backend_session(
@@ -65,13 +68,16 @@ pub(super) async fn backend_session(
     origin: Option<(SocketAddr, SocketAddr)>,
     tuning: &Tuning,
 ) -> Result<(TlsStream<TcpStream>, Vec<String>)> {
+    const WHAT: &str = "sieve backend";
     // The PROXY header goes first, before the backend's greeting.
-    let mut tcp_be = connect::connect(backend, origin, tuning.connect, "sieve backend").await?;
-    // Greeting capabilities, then STARTTLS and its OK.
-    read_caps_until_ok(&mut tcp_be, tuning.idle).await?;
-    tcp_be.write_all(b"STARTTLS\r\n").await?;
-    read_caps_until_ok(&mut tcp_be, tuning.idle).await?;
-    let mut be = connect::tls(backend, tcp_be, tuning.connect, "sieve backend").await?;
+    let mut tcp_be = connect::connect(backend, origin, tuning.connect, WHAT).await?;
+    if backend.tls_mode == BackendTls::Starttls {
+        // Greeting capabilities, then STARTTLS and its OK.
+        read_caps_until_ok(&mut tcp_be, tuning.idle).await?;
+        tcp_be.write_all(b"STARTTLS\r\n").await?;
+        read_caps_until_ok(&mut tcp_be, tuning.idle).await?;
+    }
+    let mut be = connect::tls(backend, tcp_be, tuning.connect, WHAT).await?;
     let caps = read_caps_until_ok(&mut be, tuning.idle).await?;
     Ok((be, caps))
 }
@@ -131,19 +137,13 @@ impl BackendLogin for SieveLogin<'_> {
     type Conn = (TlsStream<TcpStream>, String);
 
     async fn login(&self, credential: BackendCredential<'_>) -> Result<Self::Conn, BackendError> {
-        let (mech, response) = match credential {
-            BackendCredential::Token { identity, token } => {
-                ("XOAUTH2", crate::auth::sasl::build_xoauth2(identity, token))
-            }
-            BackendCredential::Password { user, pass } => {
-                ("PLAIN", crate::auth::sasl::build_plain(user, pass))
-            }
-        };
+        let fwd = credential.forward(self.backend);
+        let (mech, response) = (fwd.mech, fwd.response.as_str());
         // A quoted string holds at most 1024 octets (RFC 5804 §4); a longer
         // response (any sizable token) goes as a literal `{n+}`. `concat`
         // sizes the line once; it is zeroized on drop like the response.
         let auth_line = if response.len() <= 1024 {
-            Zeroizing::new(["AUTHENTICATE \"", mech, "\" \"", &response, "\"\r\n"].concat())
+            Zeroizing::new(["AUTHENTICATE \"", mech, "\" \"", response, "\"\r\n"].concat())
         } else {
             let len = response.len().to_string();
             Zeroizing::new(
@@ -153,7 +153,7 @@ impl BackendLogin for SieveLogin<'_> {
                     "\" {",
                     &len,
                     "+}\r\n",
-                    &response,
+                    response,
                     "\r\n",
                 ]
                 .concat(),
@@ -166,14 +166,64 @@ impl BackendLogin for SieveLogin<'_> {
         }
         be.write_all(auth_line.as_bytes()).await?;
         // The backend's reply; it is forwarded verbatim on OK.
-        let be_reply = read_line(&mut be, self.tuning.idle).await?;
+        let mut be_reply = read_line(&mut be, self.tuning.idle).await?;
+        let mut error_result = None;
+        if let (true, Some(answer)) = (is_string(&be_reply), fwd.error_answer()) {
+            // The error challenge of a token, a string (RFC 5804 §2.1): the
+            // client answers with the mechanism's dummy response (empty for
+            // XOAUTH2, `%x01` for OAUTHBEARER), then the server fails the
+            // exchange (RFC 7628 §3.2.3).
+            let challenge = read_challenge(&mut be, &be_reply, self.tuning.idle).await?;
+            error_result = fwd.error_result(&challenge);
+            be.write_all(format!("\"{answer}\"\r\n").as_bytes()).await?;
+            be_reply = read_line(&mut be, self.tuning.idle).await?;
+        }
         match classify_auth_reply(&be_reply) {
             AuthReply::Ok => Ok((be, be_reply)),
-            AuthReply::Rejected => Err(BackendError::Rejected(be_reply)),
+            AuthReply::Rejected => {
+                Err(crate::auth::rejected_after(be_reply, error_result.as_ref()))
+            }
             AuthReply::Unavailable => {
                 Err(anyhow!("backend temporarily unavailable: {be_reply}").into())
             }
         }
+    }
+}
+
+/// A line that starts a ManageSieve string: quoted or a literal (RFC 5804
+/// §4), the form of a server challenge.
+fn is_string(line: &str) -> bool {
+    line.starts_with('"') || line.starts_with('{')
+}
+
+/// Longest server challenge read from a literal; an error result is small.
+const MAX_CHALLENGE: usize = 4096;
+
+/// The text of a server challenge whose first line is `line`: a quoted
+/// string on that line, or a literal `{n}` whose `n` octets and CRLF follow.
+pub(crate) async fn read_challenge<S: tokio::io::AsyncRead + Unpin>(
+    s: &mut S,
+    line: &str,
+    idle: Duration,
+) -> Result<String> {
+    if let Some(n) = line.strip_prefix('{').and_then(|l| l.strip_suffix('}')) {
+        let n: usize = n
+            .parse()
+            .ok()
+            .filter(|n| *n <= MAX_CHALLENGE)
+            .ok_or_else(|| anyhow!("backend challenge: bad literal {}", sanitize(line)))?;
+        let mut buf = vec![0u8; n];
+        tokio::time::timeout(idle, tokio::io::AsyncReadExt::read_exact(s, &mut buf))
+            .await
+            .map_err(|_| anyhow!("backend challenge literal timed out"))??;
+        if !read_line(s, idle).await?.is_empty() {
+            return Err(anyhow!("backend challenge: text after the literal"));
+        }
+        return String::from_utf8(buf).map_err(|_| anyhow!("backend challenge: not UTF-8"));
+    }
+    match super::preauth::unquote_string(line) {
+        Some((text, rest)) if rest.trim().is_empty() => Ok(text),
+        _ => Err(anyhow!("backend challenge: malformed string")),
     }
 }
 

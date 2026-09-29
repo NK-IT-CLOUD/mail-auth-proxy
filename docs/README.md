@@ -5,6 +5,7 @@
 | [../INSTALL.md](../INSTALL.md) | operators | packages, verifying downloads, first configuration, permissions, certificates, start, upgrade, removal |
 | [configuration.md](configuration.md) | operators | command line, validation, every configuration key with default and effect |
 | [backend-dovecot-postfix.md](backend-dovecot-postfix.md) | operators | Dovecot 2.4 (oauth2 passdb, PROXY v2 listeners, ManageSieve, doveadm API) and Postfix submission (XCLIENT, Dovecot SASL) behind the proxy |
+| [backend-stalwart.md](backend-stalwart.md) | operators | Stalwart behind the proxy: untested, from the Stalwart documentation, with the open points for a live test |
 | [idp-keycloak.md](idp-keycloak.md) | operators | Keycloak realm, mail audience, mail clients, the matching `[[oauth.issuers]]` entry |
 | [operations.md](operations.md) | operators | logs and the `authresult` line, metrics, signals, log-based blocking, troubleshooting |
 | [architecture.md](architecture.md) | operators, developers | request flow, client and backend TLS, legacy gate, SASL, token validation, PROXY/XCLIENT, limits, timeouts |

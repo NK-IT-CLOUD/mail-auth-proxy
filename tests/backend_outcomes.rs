@@ -383,8 +383,8 @@ async fn smtp_auth_line_refused_is_outage() {
     }
 }
 
-/// A backend that advertises XCLIENT to a proxy with `submission.xclient =
-/// false` is misconfigured: after the relay starts, the client could send its
+/// A backend that advertises XCLIENT to a proxy whose submission backend
+/// has another `client_ip` is misconfigured: after the relay starts, the client could send its
 /// own `XCLIENT LOGIN=<other> ADDR=…` on the proxy's authorization. Every
 /// login is an outage, on both paths, and no credential reaches the backend.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -394,7 +394,7 @@ async fn smtp_xclient_offered_but_disabled_is_outage() {
         ..Opts::default()
     })
     .await;
-    let cause = "submission.xclient = false";
+    let cause = "submission.backend.client_ip is not";
     let token = h.idp.token(EMAIL);
     let c = h.ready(Kind::Smtp, Src::External, Sni::Public).await;
     expect_outage(

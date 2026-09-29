@@ -75,8 +75,10 @@ accepts a password only where a rule allows it.
   reasons apart. Passwords are never logged, only a per-process keyed fingerprint.
 
 **Protocols**
-- IMAPS on 993, SMTP submission on 587 (STARTTLS), ManageSieve on 4190 (STARTTLS).
-- Client address to the backend via PROXY protocol v2 (Dovecot) and XCLIENT (Postfix).
+- IMAPS on 993, SMTP submission on 587 (STARTTLS) and optionally 465 (implicit TLS, RFC
+  8314), ManageSieve on 4190 (STARTTLS).
+- A profile per backend: STARTTLS or implicit TLS, the client address via PROXY protocol
+  v2 or XCLIENT, the token forwarded as XOAUTH2 or OAUTHBEARER (RFC 7628).
 - Backend TLS is always verified; there is no switch to turn it off.
 
 **Operations**
@@ -153,8 +155,8 @@ key = "/etc/mail-auth-proxy/tls/privkey.pem"
 
 [imap]
 listen = "0.0.0.0:993"
-# proxy_protocol = true needs a Dovecot listener with haproxy = yes; without it every login fails
-backend = { address = "192.0.2.10:10993", verify_name = "imap.example.org", proxy_protocol = true }
+# client_ip = "proxy_v2" needs a Dovecot listener with haproxy = yes; without it every login fails
+backend = { address = "192.0.2.10:10993", verify_name = "imap.example.org", client_ip = "proxy_v2" }
 
 [[oauth.issuers]]
 issuer = "https://sso.example.org/realms/mail"
@@ -254,6 +256,17 @@ rate-limit counters, is in
 
 The full index is [docs/README.md](docs/README.md).
 
+## Supported backends
+
+The proxy logs in to any IMAP, submission and ManageSieve server that validates the
+forwarded token itself and speaks the standard dialogs; the backend profile
+(`tls`, `client_ip`, `auth_forward`) adapts the connection to it.
+
+| Backend | Status | Setup |
+|---|---|---|
+| Dovecot 2.4 (IMAP, ManageSieve) and Postfix with Dovecot SASL (submission) | supported: runs in production | [docs/backend-dovecot-postfix.md](docs/backend-dovecot-postfix.md), [example](examples/config.dovecot-postfix.toml) |
+| Stalwart | untested example, written from the Stalwart documentation | [docs/backend-stalwart.md](docs/backend-stalwart.md), [example](examples/config.stalwart.toml) |
+
 ## Known limitations
 
 - At most `limits.max_auth_attempts` authentication attempts per connection (default 3).
@@ -270,7 +283,8 @@ The full index is [docs/README.md](docs/README.md).
 - Legacy rules trust the source address: the proxy must see real client addresses (no SNAT
   or load balancer in front). A rule with `sni` needs SNI, which clients connecting by IP
   address do not send.
-- Backends other than Dovecot and Postfix have not been tested yet.
+- Backends other than Dovecot and Postfix have not been tested yet (Stalwart: an untested
+  example).
 
 The complete list is in
 [docs/protocols.md](docs/protocols.md#surprising-and-client-incompatible-behaviour).

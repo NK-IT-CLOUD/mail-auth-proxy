@@ -26,18 +26,25 @@ key = "/path/to/privkey.pem"                  # readable by group mail-auth-prox
 # ── Protocols ────────────────────────────────────────────────────────────────
 # Every backend connection is TLS-verified: against `verify_name` (default: the
 # host part of `address`) with the system trust store, or only the CAs in
-# `ca_file`.
+# `ca_file`. Each backend has a profile:
+#   tls          = "implicit" | "starttls"      default: implicit for IMAP, starttls otherwise
+#   client_ip    = "proxy_v2" | "xclient" | "none"   how the backend learns the client
+#                  address (xclient: submission only; none: the backend sees only the proxy)
+#   auth_forward = "xoauth2" | "oauthbearer"    how a validated token is forwarded
+# Examples for Dovecot + Postfix and for Stalwart: examples/config.dovecot-postfix.toml
+# and examples/config.stalwart.toml in the source repository.
 
 [imap]
 listen = "0.0.0.0:993"                     # implicit TLS
-backend = { address = "192.0.2.10:10993", verify_name = "imap.example.org", proxy_protocol = true }
-# proxy_protocol: send a PROXY v2 header with the client address. The Dovecot
-# listener must have `haproxy = yes` (use a dedicated port for it).
+backend = { address = "192.0.2.10:10993", verify_name = "imap.example.org", client_ip = "proxy_v2" }
+# client_ip = "proxy_v2": send a PROXY v2 header with the client address. The
+# Dovecot listener must have `haproxy = yes` (use a dedicated port for it).
 
 [submission]                               # optional: omit to disable
 listen = "0.0.0.0:587"                     # STARTTLS
-backend = { address = "192.0.2.10:587", verify_name = "smtp.example.org" }
-xclient = true                             # Postfix: smtpd_authorized_xclient_hosts
+# implicit_tls_listen = "0.0.0.0:465"      # optional second listener, implicit TLS (RFC 8314)
+backend = { address = "192.0.2.10:587", verify_name = "smtp.example.org", client_ip = "xclient" }
+# client_ip = "xclient": Postfix smtpd_authorized_xclient_hosts must list the proxy
 # The EHLO reply after STARTTLS lists the backend's extensions that the proxy handles
 # (PIPELINING, SIZE, 8BITMIME, SMTPUTF8, DSN, ENHANCEDSTATUSCODES, CHUNKING);
 # ehlo_extensions narrows them by keyword.
@@ -46,7 +53,7 @@ capability_cache_secs = 600                # reuse of the backend's EHLO extensi
 
 [sieve]                                    # optional: omit to disable
 listen = "0.0.0.0:4190"                    # STARTTLS
-backend = { address = "192.0.2.10:14190", verify_name = "imap.example.org", proxy_protocol = true }
+backend = { address = "192.0.2.10:14190", verify_name = "imap.example.org", client_ip = "proxy_v2" }
 capability_cache_secs = 600
 
 # ── OAuth2 ───────────────────────────────────────────────────────────────────

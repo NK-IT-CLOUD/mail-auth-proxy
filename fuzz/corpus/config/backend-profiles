@@ -1,0 +1,74 @@
+# Backend profile: Stalwart. UNTESTED EXAMPLE, written from the Stalwart
+# documentation (stalw.art/docs: NetworkListener, Proxy Protocol, OpenID
+# Connect directory); it has not run against a Stalwart server yet. Setup and
+# open points: docs/backend-stalwart.md.
+#
+# Stalwart validates the forwarded token itself: an OIDC directory
+# (`issuerUrl` = the issuer below, `requireAudience` = an audience the proxy
+# accepts too, `claimUsername` = the proxy's identity_claim). It takes the
+# token as OAUTHBEARER (XOAUTH2 is listed as well) and the client address as a
+# PROXY protocol header from the networks in a listener's
+# `overrideProxyTrustedNetworks` (or the server-wide `proxyTrustedNetworks`).
+# Stalwart has no XCLIENT. Listeners for the proxy, reachable only from it:
+#
+#   {"name": "imaptls-proxy", "protocol": "imap", "bind": {"[::]:10993": true},
+#    "tlsImplicit": true, "overrideProxyTrustedNetworks": {"192.0.2.20/32": true}}
+#   {"name": "submissions-proxy", "protocol": "smtp", "bind": {"[::]:10465": true},
+#    "tlsImplicit": true, "overrideProxyTrustedNetworks": {"192.0.2.20/32": true}}
+#   {"name": "sieve-proxy", "protocol": "manageSieve", "bind": {"[::]:14190": true},
+#    "tlsImplicit": true, "overrideProxyTrustedNetworks": {"192.0.2.20/32": true}}
+#
+# (192.0.2.20: the proxy's address as Stalwart sees it.)
+#
+# Check before use: Stalwart lists RFC 8437 (IMAP UNAUTHENTICATE) among its
+# supported extensions. The proxy refuses to log in to a backend that offers
+# UNAUTHENTICATE (the client could leave its login and try passwords past the
+# proxy), so IMAP logins end as an outage while Stalwart advertises it.
+
+config_version = 2
+
+[server]
+hostname = "mail.example.org"
+
+[tls]
+cert = "/etc/mail-auth-proxy/tls/fullchain.pem"
+key = "/etc/mail-auth-proxy/tls/privkey.pem"
+
+[imap]
+listen = "0.0.0.0:993"
+
+[imap.backend]
+address = "192.0.2.30:10993"
+verify_name = "mail.example.org"
+tls = "implicit"
+client_ip = "proxy_v2"
+auth_forward = "oauthbearer"
+
+[submission]
+listen = "0.0.0.0:587"
+implicit_tls_listen = "0.0.0.0:465"
+
+[submission.backend]
+address = "192.0.2.30:10465"
+verify_name = "mail.example.org"
+tls = "implicit"
+client_ip = "proxy_v2"
+auth_forward = "oauthbearer"
+
+[sieve]
+listen = "0.0.0.0:4190"
+
+[sieve.backend]
+address = "192.0.2.30:14190"
+verify_name = "mail.example.org"
+tls = "implicit"
+client_ip = "proxy_v2"
+auth_forward = "oauthbearer"
+
+[oauth]
+[[oauth.issuers]]
+issuer = "https://sso.example.org/realms/mail"
+jwks_url = "https://sso.example.org/realms/mail/protocol/openid-connect/certs"
+audiences = ["stalwart"]                   # Stalwart's requireAudience default
+token_type = "keycloak"
+identity_claim = "email"                   # Stalwart: claimUsername = "email"

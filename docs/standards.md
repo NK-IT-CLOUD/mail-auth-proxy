@@ -25,9 +25,9 @@ Requirement levels (MUST, SHOULD, MAY) are those of the cited text; an empty Lev
 | SNI supported | MUST | RFC 9325 §3.7 | Yes | The certificate is chosen by SNI (`tls.cert`, `tls.certificates`); without SNI the default `tls.cert`. After the handshake the name is used by the legacy (password) rules and the OAUTHBEARER `host` check. |
 | Certificate chosen by name: exact DNS name, a wildcard only as the whole leftmost label and for one label, no CN | | RFC 9525 §6.3, §2 (formerly RFC 6125 §6.4.3) | Yes | The accepted names are the subjectAltName DNS names of the configured certificates. An exact name wins over a wildcard; ASCII case-insensitive, a trailing dot ignored. |
 | Reject an unrecognised server name | SHOULD | RFC 9325 §3.7, RFC 6066 §3 | Yes | Fatal `unrecognized_name` alert, before a certificate is sent. |
-| ALPN supported; reject a non-matching ALPN | MUST / advised | RFC 9325 §3.8, RFC 7301 §3.2 | Yes | IMAP `imap`, ManageSieve `managesieve` (IANA). A client that offers ALPN without it gets the `no_application_protocol` alert; one that offers none is accepted. SMTP has no ALPN identifier and ignores ALPN. |
+| ALPN supported; reject a non-matching ALPN | MUST / advised | RFC 9325 §3.8, RFC 7301 §3.2 | Yes | IMAP `imap`, ManageSieve `managesieve` (IANA). A client that offers ALPN without it gets the `no_application_protocol` alert; one that offers none is accepted. SMTP (587 and 465) has no ALPN identifier and selects none; a client that offers a registered ID of another protocol (the IANA registry without the RFC 8701 GREASE values) gets `no_application_protocol` before the ServerHello, one with no ALPN or only unregistered values is accepted. |
 | Implicit TLS for IMAP (port 993) | SHOULD | RFC 8314 §3.2 | Yes | |
-| Implicit TLS for submission (port 465) | SHOULD | RFC 8314 §3.3, RFC 9325 §3.2 | No | Only STARTTLS on 587. See D-SMTP-1. |
+| Implicit TLS for submission (port 465) | SHOULD | RFC 8314 §3.3, RFC 9325 §3.2 | Yes | `submission.implicit_tls_listen`, next to STARTTLS on 587 (`submission.listen`, required). |
 | Plaintext is never accepted for authentication | MUST | RFC 9325 §3.2 | Yes | Fixed policy, not configurable |
 | TLS close_notify before closing | SHOULD | RFC 8314 §3.4 | Yes | On every TLS session the proxy ends: after a refusal, an outage, a timeout, LOGOUT or QUIT, and when the relay ends. Within 2 s, then the connection closes regardless. |
 | Log TLS parameters with authentication records | SHOULD | RFC 8314 §4 | No | |
@@ -63,7 +63,7 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 | STARTTLS on cleartext ports | MUST | RFC 9051 §6.1.1 | N/A | No cleartext IMAP port |
 | Pipelined commands after AUTHENTICATE reach the backend | | RFC 9051 §5.5 | Yes | |
 
-## 3. SMTP submission (STARTTLS)
+## 3. SMTP submission (STARTTLS and implicit TLS)
 
 | Requirement | Level | Reference | Status | Notes |
 |---|---|---|---|---|
@@ -93,7 +93,7 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 | Only advertise extensions that work | MUST | RFC 5321 §4.2.4 | Partial | The post-TLS list is the backend's own, as far as the proxy handles each extension (PIPELINING, SIZE, 8BITMIME, SMTPUTF8, DSN, ENHANCEDSTATUSCODES, CHUNKING), from a probe the proxy caches. See D-SMTP-3. |
 | PIPELINING, ENHANCEDSTATUSCODES, DSN, 8BITMIME offered | SHOULD | RFC 6409 §7 | Yes | Where the backend offers them |
 | After a failed BDAT the chunk is read and discarded before the reply | MUST | RFC 3030 §2 | Deviation | Before AUTH, BDAT gets `530` and `421`, then the close: the proxy does not read mail data before AUTH, and its chunk is never taken for commands |
-| Implicit TLS on 465 | SHOULD | RFC 8314 §3.3 | No | D-SMTP-1 |
+| Implicit TLS on 465: TLS handshake first, then the greeting | SHOULD | RFC 8314 §3.3 | Yes | Optional listener `submission.implicit_tls_listen`; the dialog after the greeting is the one after STARTTLS, and `STARTTLS` there gets `503` |
 
 ## 4. ManageSieve
 
@@ -121,8 +121,8 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 
 | Mechanism | Specification | Accepted from clients | Sent to backend |
 |---|---|---|---|
-| XOAUTH2 | Google "OAuth 2.0 mechanism" | IMAP, SMTP, Sieve | always used for OAuth logins |
-| OAUTHBEARER | RFC 7628 | IMAP, SMTP, Sieve | converted to XOAUTH2 |
+| XOAUTH2 | Google "OAuth 2.0 mechanism" | IMAP, SMTP, Sieve | for OAuth logins, by default (`auth_forward`) |
+| OAUTHBEARER | RFC 7628 | IMAP, SMTP, Sieve | for OAuth logins with `auth_forward = "oauthbearer"` |
 | PLAIN | RFC 4616 | IMAP, SMTP, Sieve, where a legacy rule allows | used for password logins |
 | LOGIN | draft-murchison-sasl-login | IMAP (also the LOGIN command), SMTP | sent as PLAIN |
 
@@ -172,13 +172,18 @@ Bearer tokens are validated locally as signed JWTs (JWS compact serialisation) a
 | Requirement | Level | Reference | Status | Notes |
 |---|---|---|---|---|
 | PROXY v2 binary header: signature, version 2, PROXY or LOCAL command, TCP4/TCP6 | MUST | haproxy PROXY protocol §2.2 | Yes | Sent in one write before the TLS handshake. IPv4-mapped IPv6 addresses (dual-stack listener) are sent as TCP4. |
-| LOCAL header for the proxy's own connections, length 0 | | §2.2 | Yes | Used for the ManageSieve capability probe |
-| XCLIENT only when advertised; xtext values; `IPV6:` prefix; `[UNAVAILABLE]`; at most 512 octets | | Postfix XCLIENT_README | Yes | NAME and ADDR always; HELO (the client's post-TLS EHLO or HELO name), PROTO and PORT where the backend lists them. A HELO name that is empty, longer than 255 characters or would push the command past 512 octets is sent as `[UNAVAILABLE]`. A backend that advertises XCLIENT while `submission.xclient = false`, or still advertises it after the proxy's XCLIENT, is an outage: the client could send its own XCLIENT after login. |
+| LOCAL header for the proxy's own connections, length 0 | | §2.2 | Yes | Used for the ManageSieve capability probe and the SMTP EHLO probe |
+| XCLIENT only when advertised; xtext values; `IPV6:` prefix; `[UNAVAILABLE]`; at most 512 octets | | Postfix XCLIENT_README | Yes | NAME and ADDR always; HELO (the client's post-TLS EHLO or HELO name), PROTO and PORT where the backend lists them. A HELO name that is empty, longer than 255 characters or would push the command past 512 octets is sent as `[UNAVAILABLE]`. A backend that advertises XCLIENT while `submission.backend.client_ip` is not `xclient`, or still advertises it after the proxy's XCLIENT, is an outage: the client could send its own XCLIENT after login. |
 | EHLO again after XCLIENT's `220` | | XCLIENT_README | Yes | |
-| STARTTLS to the backend, EHLO again after TLS | MUST | RFC 3207 §4.2 | Yes | |
+| STARTTLS to the backend, EHLO again after TLS | MUST | RFC 3207 §4.2 | Yes | With the submission backend's `tls = "starttls"` (default) |
+| IMAP STARTTLS to the backend: capabilities discarded and asked again after TLS | MUST | RFC 9051 §6.2.1 | Yes | With the IMAP backend's `tls = "starttls"`; SASL-IR and UNAUTHENTICATE are read from the post-TLS list |
+| ManageSieve STARTTLS to the backend: capabilities read again after TLS | MUST | RFC 5804 §2.2 | Yes | With the ManageSieve backend's `tls = "starttls"` (default) |
+| Implicit TLS to the backend | | RFC 8314 §3 | Yes | `tls = "implicit"` per backend (default for IMAP): the handshake first, then the greeting |
 | SMTP client: no initial response if the AUTH line would exceed the command-line limit | MUST | RFC 4954 §4, RFC 5321 §4.5.3.1.4 | Yes | The response is always sent after `334`. A reply 500-509 (syntax class) to the response is a rejection for a password and an outage for a token. |
 | IMAP client: initial response only if the backend advertises SASL-IR | MUST | RFC 4959 §3 | Yes | Taken from the greeting's CAPABILITY code; without SASL-IR the response follows the backend's empty challenge |
-| XOAUTH2 error challenge answered with an empty response (IMAP and SMTP client) | | Google XOAUTH2 "Error response" | Yes | The following `NO` / `5xx` is a rejection |
+| XOAUTH2 error challenge answered with an empty response (IMAP, SMTP and ManageSieve client) | | Google XOAUTH2 "Error response" | Yes | The following `NO` / `5xx` is a rejection |
+| OAUTHBEARER client response: GS2 header with authzid, `host` and `port` of the server, `auth=Bearer` | MUST | RFC 7628 §3.1, RFC 5801 §4 | Yes | With `auth_forward = "oauthbearer"`: `n,a=<identity>,`, `host` the backend's `verify_name` (or the host of its `address`), `port` its port |
+| OAUTHBEARER error result answered with the dummy response `%x01` | MUST | RFC 7628 §3.2.3 | Yes | IMAP and SMTP `AQ==`, ManageSieve `"AQ=="`; then the final reply is the verdict. `status` `invalid_request` (RFC 6750 §3.1: the request, not the token) makes the login an outage |
 | EHLO domain is a resolvable FQDN or an address literal | MUST | RFC 5321 §2.3.5, §4.1.4 | Depends on configuration | The configured server name is used. Its syntax is checked and a single label gives a warning (D-SMTP-4); whether it resolves is not |
 | TCP keepalive switched on per connection by the application; interval configurable | MUST (of the TCP stack) | RFC 9293 §3.8.4 (MUST-24, MUST-27) | Yes | On for client and backend connections (`session.keepalive_*`, default 600 s / 60 s / 5). The stack's 2-hour default (MUST-28) is for connections the application leaves alone. |
 | One unanswered keepalive probe does not mean a dead connection | MUST | RFC 9293 §3.8.4 (MUST-29) | Yes | `session.keepalive_count` must be at least 2 |
@@ -198,6 +203,8 @@ Metric names follow the Prometheus naming guidelines: an application prefix (`ma
 | `mail_auth_proxy_preauth_aborts_total{proto,scope}` | counter |
 | `mail_auth_proxy_token_validate_total{result}` | counter |
 | `mail_auth_proxy_connections_total{proto}` | counter |
+| `mail_auth_proxy_listener_connections_total{listener}` | counter |
+| `mail_auth_proxy_listener_auth_attempts_total{listener,result}` | counter |
 | `mail_auth_proxy_backend_errors_total{proto}` | counter |
 | `mail_auth_proxy_connections_rejected_total{proto}` | counter |
 | `mail_auth_proxy_legacy_list_errors_total{list}` | counter |
@@ -268,10 +275,6 @@ The LOGIN mechanism is server-first, so RFC 4954 §4 and RFC 4959 §3 require th
 
 - Before login the proxy lists `IMAP4rev1` only. After login the backend's own capability list is relayed, which RFC 9051 §6.2.2 allows to differ; a backend with IMAP4rev2 lists it there, and `ENABLE IMAP4rev2` goes to the backend.
 - Advertising `IMAP4rev2` before login would promise what a backend without it (for example, Dovecot with default settings) does not honour.
-
-### D-SMTP-1: no implicit TLS for submission (465)
-
-Only STARTTLS on 587 is implemented.
 
 ### D-SMTP-3: EHLO list from a probe of the backend
 

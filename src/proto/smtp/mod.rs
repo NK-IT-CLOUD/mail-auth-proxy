@@ -1,6 +1,6 @@
-//! SMTP submission listener: plaintext dialog up to STARTTLS, post-TLS
-//! dialog up to AUTH, gate, credential check and backend login, then a byte
-//! relay.
+//! SMTP submission listeners: the plaintext dialog up to STARTTLS (587) or
+//! implicit TLS (465), then the dialog over TLS up to AUTH, gate, credential
+//! check and backend login, then a byte relay.
 
 pub(crate) mod backend;
 pub mod ehlo;
@@ -10,7 +10,7 @@ use crate::auth::discovery::{self, Answer};
 use crate::auth::sasl::Discovery;
 use crate::auth::{self, refused};
 use crate::limits::ConnPermit;
-use crate::obs::metrics::Proto;
+use crate::obs::metrics::{Listener, Proto};
 use crate::server::{BackendConn, Ctx};
 use crate::wire::deadline_at;
 use crate::wire::line::{read_client_line, verb_is};
@@ -21,14 +21,14 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio_rustls::server::TlsStream;
 
 /// The submission listener's own settings.
 pub struct Submission {
-    /// TLS after STARTTLS; SMTP has no ALPN identifier.
+    /// TLS after STARTTLS and on the implicit-TLS listener; SMTP has no
+    /// ALPN identifier.
     pub acceptor: crate::server::tls::Acceptor,
     pub backend: BackendConn,
-    /// Announce the client address with XCLIENT when the backend offers it.
-    pub xclient: bool,
     /// `submission.ehlo_extensions`: the keywords the EHLO reply may list
     /// at most; `None`: every one of `ehlo::RELAYED`.
     pub ehlo_only: Option<Vec<String>>,
@@ -48,15 +48,20 @@ pub async fn probe_at_startup(ctx: Arc<Ctx<Submission>>) {
     }
 }
 
+/// The STARTTLS listener (port 587): the plaintext dialog up to STARTTLS,
+/// then the TLS dialog.
 pub async fn handle(
     mut tcp: TcpStream,
     peer: SocketAddr,
     ctx: Arc<Ctx<Submission>>,
-    mut permit: ConnPermit,
+    permit: ConnPermit,
 ) -> Result<()> {
     let _conn = crate::obs::metrics::ConnGuard::open(crate::obs::metrics::Proto::Smtp);
+    crate::obs::metrics::record_listener_connection(Listener::Submission);
     let name = ctx.hostname();
-    let (internal, scope) = ctx.scope(peer);
+    // The address the client dialed, for a PROXY header to the backend.
+    let local = tcp.local_addr().unwrap_or(peer);
+    let (internal, _) = ctx.scope(peer);
     // One pre-auth budget from the greeting to the credential, across the
     // plaintext dialog, the TLS handshake and the post-TLS dialog (see
     // `Tuning::preauth`).
@@ -120,7 +125,59 @@ pub async fn handle(
         return Ok(());
     }
 
-    let mut client_tls = match deadline_at(
+    let client_tls = accept_tls(tcp, &ctx, preauth_until, internal).await?;
+    serve(
+        client_tls,
+        Conn {
+            peer,
+            local,
+            listener: Listener::Submission,
+            preauth_until,
+        },
+        ctx,
+        permit,
+    )
+    .await
+}
+
+/// The implicit-TLS listener (port 465, RFC 8314 §3.3): the TLS handshake
+/// first, then the greeting and the same dialog as after STARTTLS.
+pub async fn handle_implicit(
+    tcp: TcpStream,
+    peer: SocketAddr,
+    ctx: Arc<Ctx<Submission>>,
+    permit: ConnPermit,
+) -> Result<()> {
+    let _conn = crate::obs::metrics::ConnGuard::open(Proto::Smtp);
+    crate::obs::metrics::record_listener_connection(Listener::Submissions);
+    let local = tcp.local_addr().unwrap_or(peer);
+    let (internal, _) = ctx.scope(peer);
+    let preauth_until = tokio::time::Instant::now() + ctx.tuning.preauth;
+    let client_tls = accept_tls(tcp, &ctx, preauth_until, internal).await?;
+    serve(
+        client_tls,
+        Conn {
+            peer,
+            local,
+            listener: Listener::Submissions,
+            preauth_until,
+        },
+        ctx,
+        permit,
+    )
+    .await
+}
+
+/// The TLS handshake with the client, within the pre-auth budget; a failure
+/// is a pre-auth abort.
+async fn accept_tls(
+    tcp: TcpStream,
+    ctx: &Ctx<Submission>,
+    preauth_until: tokio::time::Instant,
+    internal: bool,
+) -> Result<TlsStream<TcpStream>> {
+    let tuning = &ctx.tuning;
+    match deadline_at(
         preauth_until,
         tuning.preauth,
         "submission TLS handshake",
@@ -128,22 +185,61 @@ pub async fn handle(
     )
     .await
     {
-        Ok(c) => c,
+        Ok(c) => Ok(c),
         Err(e) => {
-            crate::obs::metrics::record_preauth_abort(crate::obs::metrics::Proto::Smtp, internal);
-            return Err(e);
+            crate::obs::metrics::record_preauth_abort(Proto::Smtp, internal);
+            Err(e)
         }
-    };
+    }
+}
 
+/// The client connection a TLS dialog runs for.
+struct Conn {
+    peer: SocketAddr,
+    /// The address the client dialed, for a PROXY header to the backend.
+    local: SocketAddr,
+    listener: Listener,
+    /// End of the pre-auth budget, counted from the accept.
+    preauth_until: tokio::time::Instant,
+}
+
+/// The dialog over TLS up to AUTH, gate, credential check and backend
+/// login, then the relay. On the implicit-TLS listener it starts with the
+/// greeting; after STARTTLS the client speaks first (RFC 3207 §4.2).
+async fn serve(
+    mut client_tls: TlsStream<TcpStream>,
+    conn: Conn,
+    ctx: Arc<Ctx<Submission>>,
+    mut permit: ConnPermit,
+) -> Result<()> {
+    let Conn {
+        peer,
+        local,
+        listener,
+        preauth_until,
+    } = conn;
+    let name = ctx.hostname();
+    let (internal, scope) = ctx.scope(peer);
+    let tuning = &ctx.tuning;
     // The TLS session ends with close_notify whichever way the dialog
     // ends (RFC 8314 §3.4); the relay closes its own.
     let result: Result<()> = async {
+        if listener == Listener::Submissions {
+            deadline_at(preauth_until, tuning.preauth, "submission greeting", async {
+                client_tls
+                    .write_all(format!("220 {name} ESMTP\r\n").as_bytes())
+                    .await?;
+                Ok(())
+            })
+            .await?;
+        }
         // SNI and source address decide which password mechanisms the legacy
         // rules offer; none means OAuth only.
         let sni = client_tls.get_ref().1.server_name().map(|s| s.to_string());
         let pw_mechs = ctx.password_mechs(Proto::Smtp, sni.as_deref(), peer);
         let session = auth::Session {
             proto: Proto::Smtp,
+            listener,
             peer,
             internal,
             scope,
@@ -299,8 +395,8 @@ pub async fn handle(
                 backend: &ctx.protocol.backend,
                 tuning,
                 name,
-                xclient: ctx.protocol.xclient,
                 peer,
+                local,
                 helo: helo.as_ref(),
             };
             const INVALID: &str = "535 5.7.8 Authentication credentials invalid";

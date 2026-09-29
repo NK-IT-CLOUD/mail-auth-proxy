@@ -1,7 +1,9 @@
-//! The SMTP backend: login dialog (STARTTLS, optional XCLIENT, AUTH) and
-//! reply reader.
+//! The SMTP backend: login dialog (STARTTLS or implicit TLS, optional
+//! XCLIENT, AUTH) and reply reader.
 
+use crate::auth::sasl::ErrorResult;
 use crate::auth::{BackendCredential, BackendError, BackendLogin};
+use crate::config::BackendTls;
 use crate::server::BackendConn;
 use crate::wire::line::{read_line, verb_is};
 use crate::wire::{connect, Tuning};
@@ -19,10 +21,10 @@ pub(super) struct SmtpLogin<'a> {
     pub tuning: &'a Tuning,
     /// Our name in EHLO.
     pub name: &'a str,
-    /// Announce the client address with XCLIENT when the backend offers it.
-    pub xclient: bool,
     /// The client's address.
     pub peer: SocketAddr,
+    /// The address the client dialed, for the PROXY header.
+    pub local: SocketAddr,
     /// The client's last greeting after TLS, for XCLIENT.
     pub helo: Option<&'a ClientHelo>,
 }
@@ -60,12 +62,15 @@ impl BackendLogin for SmtpLogin<'_> {
 
     async fn login(&self, credential: BackendCredential<'_>) -> Result<Self::Conn, BackendError> {
         let password = matches!(credential, BackendCredential::Password { .. });
-        let (be, code) = self.dialog(credential).await?;
+        let (be, code, error_result) = self.dialog(credential).await?;
         match auth_verdict(code, password) {
             AuthVerdict::Ok => Ok(be),
             // The backend refused the credential (bad password, unknown user,
             // sender-login mismatch).
-            AuthVerdict::Rejected => Err(BackendError::Rejected(code.to_string())),
+            AuthVerdict::Rejected => Err(crate::auth::rejected_after(
+                code.to_string(),
+                error_result.as_ref(),
+            )),
             AuthVerdict::Unavailable => {
                 Err(anyhow!("backend AUTH failed without a verdict: {code}").into())
             }
@@ -107,42 +112,48 @@ fn auth_verdict(code: u16, password: bool) -> AuthVerdict {
     }
 }
 
-/// Connect to the submission backend, read its greeting, `EHLO <name>`,
-/// STARTTLS and the TLS handshake, then `EHLO <name>` again. Returns the
-/// TLS stream and the lines of the post-TLS EHLO reply (without the code,
-/// the first being the backend's name).
+/// Connect to the submission backend and secure the connection as its
+/// `tls` says: STARTTLS reads the plaintext greeting, sends `EHLO <name>`
+/// and STARTTLS (RFC 3207) before the handshake; implicit TLS (RFC 8314
+/// §3.3) reads the greeting over TLS. Then `EHLO <name>` over TLS. Returns
+/// the TLS stream and the lines of that EHLO reply (without the code, the
+/// first being the backend's name). `origin` is `(client, local)` for a
+/// client's session, `None` for the proxy's own EHLO probe (see
+/// `connect::connect`).
 pub(super) async fn connect_ehlo(
     backend: &BackendConn,
+    origin: Option<(SocketAddr, SocketAddr)>,
     tuning: &Tuning,
     name: &str,
 ) -> Result<(TlsStream<TcpStream>, Vec<String>)> {
-    // No PROXY header: the configuration rejects one for the submission
-    // backend, which learns the client address via XCLIENT instead.
-    let mut tcp_be = connect::connect(backend, None, tuning.connect, "submission backend").await?;
-
-    let (code, _) = read_smtp_reply(&mut tcp_be, tuning.idle).await?;
-    if code != 220 {
-        return Err(anyhow!("backend greeting code {code}"));
-    }
-
-    tcp_be
-        .write_all(format!("EHLO {name}\r\n").as_bytes())
-        .await?;
-    let (code, lines) = read_smtp_reply(&mut tcp_be, tuning.idle).await?;
-    if code != 250 {
-        return Err(anyhow!("backend EHLO code {code}"));
-    }
-    if !lines.iter().any(|l| verb_is(l, "STARTTLS")) {
-        return Err(anyhow!("backend did not advertise STARTTLS"));
-    }
-
-    tcp_be.write_all(b"STARTTLS\r\n").await?;
-    let (code, _) = read_smtp_reply(&mut tcp_be, tuning.idle).await?;
-    if code != 220 {
-        return Err(anyhow!("backend STARTTLS code {code}"));
-    }
-
-    let mut be = connect::tls(backend, tcp_be, tuning.connect, "submission backend").await?;
+    const WHAT: &str = "submission backend";
+    let mut tcp_be = connect::connect(backend, origin, tuning.connect, WHAT).await?;
+    let mut be = match backend.tls_mode {
+        BackendTls::Starttls => {
+            expect_greeting(&mut tcp_be, tuning.idle).await?;
+            tcp_be
+                .write_all(format!("EHLO {name}\r\n").as_bytes())
+                .await?;
+            let (code, lines) = read_smtp_reply(&mut tcp_be, tuning.idle).await?;
+            if code != 250 {
+                return Err(anyhow!("backend EHLO code {code}"));
+            }
+            if !lines.iter().any(|l| verb_is(l, "STARTTLS")) {
+                return Err(anyhow!("backend did not advertise STARTTLS"));
+            }
+            tcp_be.write_all(b"STARTTLS\r\n").await?;
+            let (code, _) = read_smtp_reply(&mut tcp_be, tuning.idle).await?;
+            if code != 220 {
+                return Err(anyhow!("backend STARTTLS code {code}"));
+            }
+            connect::tls(backend, tcp_be, tuning.connect, WHAT).await?
+        }
+        BackendTls::Implicit => {
+            let mut be = connect::tls(backend, tcp_be, tuning.connect, WHAT).await?;
+            expect_greeting(&mut be, tuning.idle).await?;
+            be
+        }
+    };
 
     be.write_all(format!("EHLO {name}\r\n").as_bytes()).await?;
     let (code, ehlo_lines) = read_smtp_reply(&mut be, tuning.idle).await?;
@@ -152,15 +163,31 @@ pub(super) async fn connect_ehlo(
     Ok((be, ehlo_lines))
 }
 
+/// Read the backend's greeting; anything but `220` is an error.
+async fn expect_greeting<S: AsyncRead + Unpin>(s: &mut S, idle: Duration) -> Result<()> {
+    let (code, _) = read_smtp_reply(s, idle).await?;
+    if code != 220 {
+        return Err(anyhow!("backend greeting code {code}"));
+    }
+    Ok(())
+}
+
 impl SmtpLogin<'_> {
     /// `connect_ehlo`, optional XCLIENT, then AUTH with the client's own
     /// credential (never a master password). Returns the final AUTH reply
-    /// code.
+    /// code and the OAUTHBEARER error result, if there was one.
     async fn dialog(
         &self,
         credential: BackendCredential<'_>,
-    ) -> Result<(TlsStream<TcpStream>, u16)> {
-        let (mut be, ehlo_lines) = connect_ehlo(self.backend, self.tuning, self.name).await?;
+    ) -> Result<(TlsStream<TcpStream>, u16, Option<ErrorResult>)> {
+        let (mut be, ehlo_lines) = connect_ehlo(
+            self.backend,
+            Some((self.peer, self.local)),
+            self.tuning,
+            self.name,
+        )
+        .await?;
+        let xclient = self.backend.client_ip == crate::config::ClientIp::Xclient;
 
         // XCLIENT (optional): Postfix then logs and stamps the real client
         // address. Only when configured and advertised; a backend that does
@@ -172,14 +199,14 @@ impl SmtpLogin<'_> {
         // accepts XCLIENT from an authorized host until ADDR is sent). Fail
         // closed before any credential is sent: an outage.
         let offers_xclient = ehlo_lines.iter().any(|l| verb_is(l, "XCLIENT"));
-        if !self.xclient && offers_xclient {
+        if !xclient && offers_xclient {
             return Err(anyhow!(
-                "backend advertises XCLIENT to this proxy but submission.xclient = false: \
-                 an authenticated client could send its own XCLIENT; set submission.xclient = true \
+                "backend advertises XCLIENT to this proxy but submission.backend.client_ip is not \"xclient\": \
+                 an authenticated client could send its own XCLIENT; set client_ip = \"xclient\" \
                  or remove the proxy from Postfix smtpd_authorized_xclient_hosts"
             ));
         }
-        if self.xclient && offers_xclient {
+        if xclient && offers_xclient {
             let advertised = ehlo_lines
                 .iter()
                 .find(|l| verb_is(l, "XCLIENT"))
@@ -211,14 +238,8 @@ impl SmtpLogin<'_> {
             }
         }
 
-        let (mech, response) = match credential {
-            BackendCredential::Token { identity, token } => {
-                ("XOAUTH2", crate::auth::sasl::build_xoauth2(identity, token))
-            }
-            BackendCredential::Password { user, pass } => {
-                ("PLAIN", crate::auth::sasl::build_plain(user, pass))
-            }
-        };
+        let fwd = credential.forward(self.backend);
+        let mech = fwd.mech;
         // The response goes after the `334` challenge, never on the AUTH line:
         // RFC 4954 §4 forbids an initial response that pushes the command past
         // the server's line limit (512 octets in RFC 5321, 2048 in Postfix's
@@ -234,17 +255,20 @@ impl SmtpLogin<'_> {
                 "backend refused AUTH {mech} before the credential: {code}"
             ));
         }
-        be.write_all(Zeroizing::new([&response, "\r\n"].concat()).as_bytes())
+        be.write_all(Zeroizing::new([fwd.response.as_str(), "\r\n"].concat()).as_bytes())
             .await?;
-        let (mut code, _) = read_smtp_reply(&mut be, self.tuning.idle).await?;
-        if code == 334 && mech == "XOAUTH2" {
-            // XOAUTH2 error challenge (`334 <base64 JSON>`): the client
-            // answers with an empty response and the server then sends its
-            // final failure reply (Google "XOAUTH2 mechanism", RFC 7628 §3.2.3).
-            be.write_all(b"\r\n").await?;
+        let (mut code, lines) = read_smtp_reply(&mut be, self.tuning.idle).await?;
+        let mut error_result = None;
+        if let (334, Some(answer)) = (code, fwd.error_answer()) {
+            // The error challenge of a token (`334 <base64 JSON>`): the client
+            // answers with the mechanism's dummy response (empty for XOAUTH2,
+            // `%x01` for OAUTHBEARER) and the server then sends its final
+            // failure reply (Google "XOAUTH2 mechanism", RFC 7628 §3.2.3).
+            error_result = fwd.error_result(lines.first().map_or("", String::as_str));
+            be.write_all(format!("{answer}\r\n").as_bytes()).await?;
             code = read_smtp_reply(&mut be, self.tuning.idle).await?.0;
         }
-        Ok((be, code))
+        Ok((be, code, error_result))
     }
 }
 

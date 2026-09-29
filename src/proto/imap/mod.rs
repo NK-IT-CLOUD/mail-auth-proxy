@@ -32,6 +32,7 @@ pub async fn handle(
     mut permit: limits::ConnPermit,
 ) -> Result<()> {
     let _conn = metrics::ConnGuard::open(metrics::Proto::Imap);
+    metrics::record_listener_connection(metrics::Listener::Imap);
     // The address the client dialed, for the PROXY header; `peer` as the
     // fallback keeps both ends in one address family.
     let local = tcp.local_addr().unwrap_or(peer);
@@ -60,6 +61,7 @@ pub async fn handle(
         let pw_mechs = ctx.password_mechs(metrics::Proto::Imap, sni.as_deref(), peer);
         let session = auth::Session {
             proto: metrics::Proto::Imap,
+            listener: metrics::Listener::Imap,
             peer,
             internal,
             scope,

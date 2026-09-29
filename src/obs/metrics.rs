@@ -38,6 +38,38 @@ impl Proto {
     }
 }
 
+/// The listener a client connected to: the `listener` label and the
+/// `authresult` field. Submission has two, STARTTLS (587) and implicit TLS
+/// (465, the IANA service name `submissions`, RFC 8314 §7.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Listener {
+    Imap,
+    Submission,
+    Submissions,
+    Sieve,
+}
+
+impl Listener {
+    pub fn label(self) -> &'static str {
+        LISTENER_LABELS[self as usize]
+    }
+}
+
+const N_LISTENER: usize = 4;
+const LISTENER_LABELS: [&str; N_LISTENER] = ["imap", "submission", "submissions", "sieve"];
+
+// listener_connections[listener], listener_auth[listener][result]: the
+// connections and auth outcomes of the other families, split by listener.
+static LISTENER_CONNECTIONS: [AtomicU64; N_LISTENER] = [const { AtomicU64::new(0) }; N_LISTENER];
+static LISTENER_AUTH: [[AtomicU64; 2]; N_LISTENER] =
+    [const { [const { AtomicU64::new(0) }; 2] }; N_LISTENER];
+
+/// Record a connection accepted on `listener` (besides `ConnGuard`).
+#[inline]
+pub fn record_listener_connection(listener: Listener) {
+    LISTENER_CONNECTIONS[listener as usize].fetch_add(1, Ordering::Relaxed);
+}
+
 const N_PROTO: usize = 3;
 const PROTO_LABELS: [&str; N_PROTO] = ["imap", "smtp", "sieve"];
 
@@ -105,9 +137,10 @@ static CONNECTIONS_REJECTED: [AtomicU64; N_PROTO] = [const { AtomicU64::new(0) }
 /// Record one auth outcome for `proto` using `mechanism`, tagged by whether the
 /// client source was internal (`true`) or external (`false`).
 #[inline]
-pub fn record_auth(proto: Proto, internal: bool, mechanism: &str, ok: bool) {
+pub fn record_auth(proto: Proto, listener: Listener, internal: bool, mechanism: &str, ok: bool) {
     AUTH_ATTEMPTS[proto.idx()][scope_idx(internal)][mech_idx(mechanism)][usize::from(!ok)]
         .fetch_add(1, Ordering::Relaxed);
+    LISTENER_AUTH[listener as usize][usize::from(!ok)].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Record a refused credential of `proto` with its `authresult` reason.
@@ -615,6 +648,26 @@ fn render() -> String {
         o.push_str(&format!(
             "mail_auth_proxy_connections_total{{proto=\"{plabel}\"}} {v}\n"
         ));
+    }
+
+    o.push_str("# HELP mail_auth_proxy_listener_connections_total Client connections accepted, by listener (connections_total split by listener).\n");
+    o.push_str("# TYPE mail_auth_proxy_listener_connections_total counter\n");
+    for (l, llabel) in LISTENER_LABELS.iter().enumerate() {
+        let v = LISTENER_CONNECTIONS[l].load(Ordering::Relaxed);
+        o.push_str(&format!(
+            "mail_auth_proxy_listener_connections_total{{listener=\"{llabel}\"}} {v}\n"
+        ));
+    }
+
+    o.push_str("# HELP mail_auth_proxy_listener_auth_attempts_total Auth attempts by listener and result (auth_attempts_total split by listener).\n");
+    o.push_str("# TYPE mail_auth_proxy_listener_auth_attempts_total counter\n");
+    for (l, llabel) in LISTENER_LABELS.iter().enumerate() {
+        for (r, rlabel) in ["ok", "fail"].iter().enumerate() {
+            let v = LISTENER_AUTH[l][r].load(Ordering::Relaxed);
+            o.push_str(&format!(
+                "mail_auth_proxy_listener_auth_attempts_total{{listener=\"{llabel}\",result=\"{rlabel}\"}} {v}\n"
+            ));
+        }
     }
 
     o.push_str("# HELP mail_auth_proxy_backend_errors_total Backend unreachable or failing during auth (outage, not a rejected login).\n");
@@ -1198,8 +1251,14 @@ mod tests {
 
     #[test]
     fn render_is_valid_exposition_and_reflects_counts() {
-        record_auth(Proto::Imap, true, "XOAUTH2", true);
-        record_auth(Proto::Smtp, false, "OAUTHBEARER", false);
+        record_auth(Proto::Imap, Listener::Imap, true, "XOAUTH2", true);
+        record_auth(
+            Proto::Smtp,
+            Listener::Submissions,
+            false,
+            "OAUTHBEARER",
+            false,
+        );
         record_token_validate(true);
         record_upstream_forward(Proto::Sieve);
         let g = ConnGuard::open(Proto::Imap);

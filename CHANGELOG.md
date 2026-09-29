@@ -6,6 +6,40 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- A profile per backend (`imap.backend`, `submission.backend`, `sieve.backend`), every key
+  reloadable:
+  - `tls = "starttls" | "implicit"`: how the proxy secures its connection to the backend.
+    IMAP can now use STARTTLS (RFC 9051 §6.2.1: the capabilities are asked anew over
+    TLS), submission and ManageSieve implicit TLS (RFC 8314). The EHLO and capability
+    probes take the same way. Defaults as before: IMAP implicit, the others STARTTLS.
+  - `auth_forward = "xoauth2" | "oauthbearer"`: the mechanism a validated token is
+    forwarded with, whichever the client used. OAUTHBEARER (RFC 7628 §3.1) carries the
+    verified identity as GS2 authzid and the backend's name and port. A failure's error
+    result is answered with `%x01` (§3.2.3); a `status` of `invalid_request` is an outage,
+    not a failed login. Default `xoauth2`, as before.
+  - `client_ip = "proxy_v2" | "xclient" | "none"`: how the backend learns the client
+    address. The submission backend can now take a PROXY v2 header (with a `LOCAL` header
+    on the EHLO probe); `xclient` is refused on the other backends. A backend with `none`,
+    set or by default, gives a configuration warning: it sees every client as the proxy.
+- `submission.implicit_tls_listen`: a second submission listener with implicit TLS (port
+  465, RFC 8314 §3.3), next to STARTTLS on `submission.listen`, with the same dialog,
+  gate and backend. Adding, moving or removing it needs a restart.
+- The `authresult` line gets a last field `listener` (`imap`, `submission`,
+  `submissions`, `sieve`), and `mail_auth_proxy_listener_connections_total{listener}` and
+  `mail_auth_proxy_listener_auth_attempts_total{listener,result}` split connections and
+  auth attempts by listener. Existing fields, families and labels are unchanged.
+- Example configurations `examples/config.dovecot-postfix.toml` and
+  `examples/config.stalwart.toml` (the latter untested, from the Stalwart documentation).
+- ALPACA hardening for SMTP (RFC 9325 §3.8, RFC 7301 §3.2): on both submission
+  listeners a client that offers an ALPN ID of another protocol from the IANA registry
+  (`http/1.1`, `h2`, `imap`, …; GREASE values excepted) is refused before the ServerHello
+  with the fatal alert `no_application_protocol` (120); the session-end line says
+  `TLS ALPN "<id>" names another protocol`. Without ALPN, or with unregistered values,
+  nothing changes and no protocol is selected.
+- Fuzz target `backend_auth`: the backend's OAUTHBEARER error result, the ManageSieve
+  challenge string, the OAUTHBEARER build/parse roundtrip.
+
 ### Changed
 - The refusal timing of the legacy gate learns the rejection latencies per backend
   instead of per protocol. A refusal by the account check or the throttle waits like a
@@ -13,8 +47,18 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   domain) waits for the slowest backend of the protocol. With one backend per protocol
   the timing is the same as before; the change keeps refusals and wrong passwords alike
   once a protocol has several backends.
-- The `submission auth ok` and `sieve auth ok` log lines name the issuer of the token
-  (`issuer=`, empty for a password).
+- The `submission auth ok` and `sieve auth ok` log lines, and the IMAP lines `oauth
+  validated; proxying to backend` and `password auth; forwarding to backend`, name the
+  issuer of the token (`issuer=`, empty for a password).
+- `backend.proxy_protocol` and `submission.xclient` are short forms of `client_ip`;
+  `--print-config` shows `client_ip`. `submission.backend.proxy_protocol = true` is now
+  accepted (it was an error); combining a short form with `client_ip`, or both short
+  forms, is an error.
+- The ManageSieve backend login answers an error challenge to a forwarded token (a
+  string instead of a verdict line) and reads the verdict after it; before, the challenge
+  line was taken as a rejection and the backend connection dropped.
+- The log line of a submission backend that advertises XCLIENT to a proxy not set to use
+  it names `submission.backend.client_ip` instead of `submission.xclient`.
 
 ### Fixed
 - The usage text (`-h`, `--help`, an unknown option) lists `-h` and `--help`.

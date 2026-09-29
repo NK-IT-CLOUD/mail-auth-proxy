@@ -18,17 +18,18 @@ Example values used throughout:
 ## What the backend must do
 
 The proxy validates every token before it contacts the backend, then logs in with the
-same token (always as `XOAUTH2`, also when the client used `OAUTHBEARER`) or the same
-password (always as `PLAIN`). The backend therefore needs:
+same token (as the backend's `auth_forward` mechanism, `XOAUTH2` by default, also when
+the client used `OAUTHBEARER`) or the same password (always as `PLAIN`). The backend
+therefore needs:
 
 1. TLS on every listener the proxy uses, with a certificate for the name the proxy
    verifies (`verify_name`, or the host part of `address`). The proxy verifies it against
    the system trust store or the backend's `ca_file`; verification cannot be turned off.
 2. An `oauth2` passdb that validates the token **itself**. The proxy's check is a filter
    in front of the backend, not a replacement for it.
-3. Optionally, the real client address: PROXY protocol v2 for IMAP and ManageSieve,
-   XCLIENT for Postfix submission. Without it, the backend logs and rate-limits by the
-   proxy's address.
+3. The real client address (`client_ip`): PROXY protocol v2 for IMAP and ManageSieve,
+   XCLIENT for Postfix submission. Without it (`client_ip = "none"`, a configuration
+   warning), the backend logs and rate-limits by the proxy's address.
 4. Only if the legacy gate is used: a passdb for passwords, and optionally the doveadm
    HTTP API for the account check.
 
@@ -44,6 +45,10 @@ ssl_server_key_file = /etc/ssl/mail/privkey.pem
 ```
 
 `plain login` are needed only for the legacy gate and for Postfix SASL with passwords.
+`xoauth2` is what the proxy sends by default; with `auth_forward = "oauthbearer"` on a
+backend it sends `oauthbearer` instead (RFC 7628, with the backend's name and port as
+`host` and `port`). The working installation uses `xoauth2`; the `oauthbearer` path
+against Dovecot is **not verified**.
 Keep Dovecot's `auth_failure_delay` at its default (2 s) or set it explicitly; the proxy
 pads its own refusals to it (`legacy.failure_delay_ms`).
 
@@ -78,14 +83,19 @@ Matching proxy configuration:
 ```toml
 [imap]
 listen = "0.0.0.0:993"
-backend = { address = "192.0.2.10:10993", verify_name = "imap.example.org", proxy_protocol = true }
+backend = { address = "192.0.2.10:10993", verify_name = "imap.example.org", client_ip = "proxy_v2" }
 
 [sieve]
 listen = "0.0.0.0:4190"
-backend = { address = "192.0.2.10:14190", verify_name = "imap.example.org", proxy_protocol = true }
+backend = { address = "192.0.2.10:14190", verify_name = "imap.example.org", client_ip = "proxy_v2" }
 ```
 
-`proxy_protocol` on the proxy and `haproxy = yes` on the listener must be switched
+The IMAP backend uses implicit TLS and the ManageSieve backend STARTTLS, the defaults.
+With `tls = "starttls"` the IMAP backend is reached on a listener without implicit TLS,
+upgraded with `STARTTLS`; that path is **not verified** against Dovecot.
+
+`client_ip = "proxy_v2"` (short form `proxy_protocol = true`) on the proxy and
+`haproxy = yes` on the listener must be switched
 together: a header sent to a listener that does not expect it, or a listener that expects
 one and does not get it, makes every login fail with a retry-later reply
 (`mail_auth_proxy_backend_errors_total` rises). The ManageSieve capability probe the proxy runs
@@ -117,7 +127,8 @@ passdb oauth2 {
 
 - `issuers` lists every issuer the proxy accepts (space-separated).
 - `username_attribute` must name the same claim as the proxy's `identity_claim`
-  (default `email`); the proxy sends that claim's value as the XOAUTH2 `user=`.
+  (default `email`); the proxy sends that claim's value as the XOAUTH2 `user=` (with
+  `auth_forward = "oauthbearer"`: as the GS2 authzid `a=`).
 - Dovecot looks up keys as `<azp>/<alg>/<kid>` below the prefix, one PEM public key per
   file (`azp` of a token without that claim: `default`; `/` and `%` in a path component
   escaped as `%2f` and `%25`). Dovecot rejects a client ID that has no directory there,
@@ -209,15 +220,20 @@ Matching proxy configuration:
 ```toml
 [submission]
 listen = "0.0.0.0:587"
-backend = { address = "192.0.2.10:587", verify_name = "imap.example.org" }
-xclient = true
+implicit_tls_listen = "0.0.0.0:465"        # optional: implicit TLS for clients (RFC 8314)
+backend = { address = "192.0.2.10:587", verify_name = "imap.example.org", client_ip = "xclient" }
 ```
 
-### STARTTLS
+`implicit_tls_listen` is the proxy's own second listener; both listeners use the same
+backend and need nothing on the Postfix side.
 
-The backend must offer `STARTTLS` in its first EHLO reply (`smtpd_tls_security_level =
-encrypt` or `may`); the proxy always upgrades the backend connection. Implicit TLS
-(port 465) is not supported as a backend.
+### STARTTLS or implicit TLS
+
+With the default `tls = "starttls"` the backend must offer `STARTTLS` in its first EHLO
+reply (`smtpd_tls_security_level = encrypt` or `may`). A Postfix `smtps` service with
+`-o smtpd_tls_wrappermode=yes` (port 465) is reached with `tls = "implicit"` on the
+backend instead. The working installation uses STARTTLS on 587; the implicit-TLS path
+against Postfix is **not verified**.
 
 ### XCLIENT
 
@@ -230,14 +246,19 @@ the client's name, as without the proxy. If the proxy is not
 listed, Postfix does not advertise `XCLIENT`, the proxy skips the step silently and
 Postfix sees the proxy's address.
 
-The proxy refuses the reverse case. A backend that advertises `XCLIENT` while
-`xclient = false` would let the logged-in client send its own `XCLIENT LOGIN=…`, so the
+The proxy refuses the reverse case. A backend that advertises `XCLIENT` while its
+`client_ip` is not `xclient` would let the logged-in client send its own `XCLIENT LOGIN=…`, so the
 proxy answers every login there with a temporary failure and logs the misconfiguration.
 It does the same when a client's own address is in `smtpd_authorized_xclient_hosts`
 (Postfix still advertises `XCLIENT` after the proxy's).
 
-Postfix has no PROXY protocol on this path; the proxy's configuration check rejects
-`proxy_protocol` on the submission backend.
+Instead of XCLIENT, the submission backend can take a PROXY v2 header
+(`client_ip = "proxy_v2"` on the proxy, `-o smtpd_upstream_proxy_protocol=haproxy` on a
+service only the proxy reaches; version 2 needs Postfix 3.5 or later). The header carries
+only addresses, not the client's EHLO name, and the proxy's own EHLO probe sends a `LOCAL`
+header. This path is **not verified** against Postfix; XCLIENT is what the working
+installation uses. Do not list the proxy in `smtpd_authorized_xclient_hosts` then: a
+backend that offers XCLIENT to a proxy without `client_ip = "xclient"` gets no logins.
 
 ### Sender checks and EHLO
 
@@ -255,7 +276,7 @@ seen: remove them for the proxy's address too, or leave them out with
 
 ### `line_length_limit`
 
-The proxy sends `AUTH XOAUTH2` without an initial response and the token on its own line,
+The proxy sends `AUTH XOAUTH2` (or `AUTH OAUTHBEARER`) without an initial response and the token on its own line,
 which Postfix limits by `smtpd_sasl_response_limit` (12288 octets), not by
 `line_length_limit` (default 2048). The working installation raises `line_length_limit`
 to 16384 on the submission service; whether the default is enough behind the proxy is

@@ -1,6 +1,6 @@
 # Parses the `authresult` line of mail-auth-proxy (docs/operations.md, "The authresult line").
-# `pwfp` and `rule` are the last fields of the line; the pattern treats them as
-# optional.
+# `pwfp` and `rule` follow `reason`; the pattern treats them as optional. The
+# fields after them (`listener`) are not extracted.
 onsuccess: next_stage
 name: mail-auth-proxy/logs
 description: "Parse mail-auth-proxy authentication results"

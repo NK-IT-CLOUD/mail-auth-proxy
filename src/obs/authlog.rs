@@ -5,8 +5,9 @@
 //! on a stable `authlog` target with a fixed `authresult` message so a log
 //! parser can anchor reliably. Fields: result, proto, scope
 //! (internal/external), mech, user, peer (source IP), reason, pwfp, rule (the
-//! legacy rule that decided, empty otherwise). New fields are only ever
-//! appended at the end.
+//! legacy rule that decided, empty otherwise), listener (`imap`,
+//! `submission`, `submissions`, `sieve`). New fields are only ever appended
+//! at the end.
 //!
 //! - The attempted password is never logged. Only a truncated HMAC-SHA256
 //!   fingerprint (`pwfp`, keyed per process) is, to correlate password
@@ -15,7 +16,7 @@
 //!   everything but a safe set of characters with `?`, so a crafted value
 //!   cannot forge a field or a log line.
 
-use super::metrics::Proto;
+use super::metrics::{Listener, Proto};
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
@@ -160,6 +161,8 @@ pub struct AuthEvent<'a> {
     pub pwfp: &'a str,
     /// Name of the legacy rule that decided, or empty (OAuth, no rule).
     pub rule: &'a str,
+    /// The listener the client connected to.
+    pub listener: Listener,
 }
 
 impl AuthEvent<'_> {
@@ -178,12 +181,13 @@ impl AuthEvent<'_> {
         // Rule names are validated at startup; sanitised anyway, the field is
         // parsed.
         let rule = sanitize(self.rule);
+        let listener = self.listener.label();
         if self.reason == Reason::Ok {
             tracing::info!(target: "authlog",
-                result = "ok", proto, scope, mech = %mech, user = %user, peer = %peer, reason, pwfp, rule = rule.as_str(), "authresult");
+                result = "ok", proto, scope, mech = %mech, user = %user, peer = %peer, reason, pwfp, rule = rule.as_str(), listener, "authresult");
         } else {
             tracing::warn!(target: "authlog",
-                result = "fail", proto, scope, mech = %mech, user = %user, peer = %peer, reason, pwfp, rule = rule.as_str(), "authresult");
+                result = "fail", proto, scope, mech = %mech, user = %user, peer = %peer, reason, pwfp, rule = rule.as_str(), listener, "authresult");
         }
     }
 }
@@ -275,6 +279,7 @@ mod tests {
                 reason: Reason::BackendReject,
                 pwfp: "",
                 rule: "",
+                listener: Listener::Imap,
             }
             .record();
         });

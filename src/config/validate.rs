@@ -2,7 +2,8 @@
 //! the short forms into what the rest of the program reads.
 
 use super::{
-    AccountCheck, AuthRateLimit, Config, Legacy, Rule, Session, TokenType, PASSWORD_GATE_RULE,
+    AccountCheck, AuthRateLimit, Backend, BackendTls, ClientIp, Config, Legacy, Rule, Session,
+    TokenType, PASSWORD_GATE_RULE,
 };
 use std::net::{IpAddr, SocketAddr};
 
@@ -64,10 +65,10 @@ impl Config {
         let mut backends = vec![("imap.backend", &self.imap.backend)];
         if let Some(s) = &self.submission {
             listens.push(("submission.listen", &s.listen));
-            backends.push(("submission.backend", &s.backend));
-            if s.backend.proxy_protocol {
-                err("submission.backend.proxy_protocol is not supported (Postfix gets the client address via xclient)".into());
+            if let Some(l) = &s.implicit_tls_listen {
+                listens.push(("submission.implicit_tls_listen", l));
             }
+            backends.push(("submission.backend", &s.backend));
             use crate::proto::smtp::ehlo::{ehlo_keyword, RELAYED};
             let mut keywords: Vec<&str> = Vec::new();
             for x in s.ehlo_extensions.iter().flatten() {
@@ -126,6 +127,9 @@ impl Config {
         }
         for (name, b) in &backends {
             check_path(&format!("{name}.ca_file"), b.ca_file.as_deref(), &mut err);
+            let submission = *name == "submission.backend";
+            let xclient = submission && self.submission.as_ref().is_some_and(|s| s.xclient);
+            check_client_ip(name, b, submission, xclient, &mut err, warnings);
             let address_ok = b
                 .address
                 .rsplit_once(':')
@@ -378,6 +382,61 @@ impl Config {
             }
         }
         self.metrics.enabled = Some(self.metrics.is_enabled());
+        // The backend profile with its defaults spelled out; the short forms
+        // become `client_ip`.
+        let b = &mut self.imap.backend;
+        b.client_ip = Some(b.effective_client_ip(false));
+        b.proxy_protocol = false;
+        b.tls.get_or_insert(BackendTls::Implicit);
+        if let Some(s) = &mut self.submission {
+            s.backend.client_ip = Some(s.backend.effective_client_ip(s.xclient));
+            (s.backend.proxy_protocol, s.xclient) = (false, false);
+            s.backend.tls.get_or_insert(BackendTls::Starttls);
+        }
+        if let Some(s) = &mut self.sieve {
+            s.backend.client_ip = Some(s.backend.effective_client_ip(false));
+            s.backend.proxy_protocol = false;
+            s.backend.tls.get_or_insert(BackendTls::Starttls);
+        }
+    }
+}
+
+/// `client_ip` of the backend `name` against its short forms
+/// (`proxy_protocol`, `submission.xclient`) and its protocol.
+fn check_client_ip(
+    name: &str,
+    b: &Backend,
+    submission: bool,
+    xclient: bool,
+    err: &mut impl FnMut(String),
+    warnings: &mut Vec<String>,
+) {
+    if b.client_ip.is_some() && (b.proxy_protocol || xclient) {
+        err(format!(
+            "{name}.client_ip cannot be combined with its short form ({})",
+            if xclient {
+                "submission.xclient"
+            } else {
+                "proxy_protocol"
+            }
+        ));
+        return;
+    }
+    if b.proxy_protocol && xclient {
+        err(format!(
+            "{name}: proxy_protocol and submission.xclient cannot both be set; choose one with client_ip"
+        ));
+        return;
+    }
+    match b.effective_client_ip(xclient) {
+        ClientIp::Xclient if !submission => err(format!(
+            "{name}.client_ip = \"xclient\" is an SMTP extension: submission.backend only"
+        )),
+        ClientIp::None => warnings.push(format!(
+            "{name}: client_ip = \"none\": the backend sees the proxy's address for every client, so its per-address limits, bans and logs treat all clients as one (set client_ip = \"proxy_v2\"{})",
+            if submission { " or \"xclient\"" } else { "" }
+        )),
+        _ => {}
     }
 }
 
@@ -770,7 +829,7 @@ impl AuthRateLimit {
 #[cfg(test)]
 mod tests {
     use crate::config::tests::{parse, V2};
-    use crate::config::PASSWORD_GATE_RULE;
+    use crate::config::{BackendTls, ClientIp, PASSWORD_GATE_RULE};
 
     /// Errors of `V2` plus `extra`, joined.
     fn errors_with(extra: &str) -> String {
@@ -830,7 +889,7 @@ mod tests {
     #[test]
     fn rejected_details() {
         let with = |extra: &str| parse(&format!("{V2}{extra}"));
-        assert!(with("[submission]\nlisten = \"0.0.0.0:587\"\nbackend = { address = \"192.0.2.10:587\", proxy_protocol = true }\n").is_err());
+        assert!(with("[submission]\nlisten = \"0.0.0.0:587\"\nbackend = { address = \"192.0.2.10:587\", proxy_protocol = true }\nxclient = true\n").is_err());
         assert!(with("[submission]\nlisten = \"0.0.0.0:587\"\nbackend = { address = \"192.0.2.10:587\" }\nehlo_extensions = [\"AUTH PLAIN\"]\n").is_err());
         assert!(parse(&V2.replace(
             "token_type = \"keycloak\"",
@@ -1171,12 +1230,18 @@ mod tests {
         assert!(crate::config::parse(&with("[[tls.certificates]]\ncert = \"/t.pem\"\n")).is_err());
     }
 
-    /// The shipped example is valid and gives no warning.
+    /// The shipped examples are valid and give no warning.
     #[test]
     fn example_config_is_clean() {
-        let l = crate::config::parse(include_str!("../../examples/config.example.toml")).unwrap();
-        assert!(l.errors.is_empty(), "{:?}", l.errors);
-        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        for text in [
+            include_str!("../../examples/config.example.toml"),
+            include_str!("../../examples/config.dovecot-postfix.toml"),
+            include_str!("../../examples/config.stalwart.toml"),
+        ] {
+            let l = crate::config::parse(text).unwrap();
+            assert!(l.errors.is_empty(), "{:?}", l.errors);
+            assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        }
     }
 
     /// The short form warns like the rule it becomes (`public = true`
@@ -1376,7 +1441,7 @@ mod tests {
     /// configuration.
     #[test]
     fn ehlo_extensions_warnings() {
-        let sub = "[submission]\nlisten = \"0.0.0.0:587\"\nbackend = { address = \"192.0.2.10:587\", verify_name = \"mail.example.org\" }\n";
+        let sub = "[submission]\nlisten = \"0.0.0.0:587\"\nbackend = { address = \"192.0.2.10:587\", verify_name = \"mail.example.org\", client_ip = \"xclient\" }\n";
         let warnings = |extra: &str| {
             let l = crate::config::parse(&format!("{V2}{sub}{extra}")).unwrap();
             assert!(l.errors.is_empty(), "{:?}", l.errors);
@@ -1639,5 +1704,121 @@ mod tests {
             .warnings
             .iter()
             .all(|w| w.contains("RFC 9051 section 5.4")));
+    }
+
+    /// The backend profile: defaults are the behaviour of the short forms
+    /// (IMAP implicit TLS, submission and ManageSieve STARTTLS, XOAUTH2),
+    /// the short forms become `client_ip`, and the printed form parses back
+    /// to the same configuration.
+    #[test]
+    fn backend_profile_defaults_and_short_forms() {
+        let text = format!(
+            "{}[submission]\nlisten = \"0.0.0.0:587\"\nbackend = {{ address = \"192.0.2.10:587\" }}\nxclient = true\n[sieve]\nlisten = \"0.0.0.0:4190\"\nbackend = {{ address = \"192.0.2.10:4190\", proxy_protocol = true }}\n",
+            V2.replace(", client_ip = \"proxy_v2\"", "")
+        );
+        let l = crate::config::parse(&text).unwrap();
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        let c = &l.config;
+        let (imap, sub, sieve) = (
+            &c.imap.backend,
+            &c.submission.as_ref().unwrap().backend,
+            &c.sieve.as_ref().unwrap().backend,
+        );
+        assert_eq!(imap.client_ip, Some(ClientIp::None));
+        assert_eq!(sub.client_ip, Some(ClientIp::Xclient));
+        assert_eq!(sieve.client_ip, Some(ClientIp::ProxyV2));
+        assert_eq!(imap.tls, Some(BackendTls::Implicit));
+        assert_eq!(sub.tls, Some(BackendTls::Starttls));
+        assert_eq!(sieve.tls, Some(BackendTls::Starttls));
+        for b in [imap, sub, sieve] {
+            assert_eq!(b.auth_forward, crate::config::AuthForward::Xoauth2);
+            assert!(!b.proxy_protocol);
+        }
+        assert!(!c.submission.as_ref().unwrap().xclient);
+        // Only the IMAP backend is left without the client address.
+        let none: Vec<_> = l
+            .warnings
+            .iter()
+            .filter(|w| w.contains("client_ip = \"none\""))
+            .collect();
+        assert_eq!(none.len(), 1, "{none:?}");
+        assert!(none[0].starts_with("imap.backend:"), "{none:?}");
+        assert!(none[0].contains("per-address limits"), "{none:?}");
+        let printed = toml::to_string(c).unwrap();
+        assert!(!printed.contains("proxy_protocol") && !printed.contains("xclient = "));
+        let back =
+            parse(&printed.replace("client_ip = \"none\"", "client_ip = \"proxy_v2\"")).unwrap();
+        assert_eq!(
+            toml::to_string(&back.config).unwrap(),
+            printed.replace("client_ip = \"none\"", "client_ip = \"proxy_v2\"")
+        );
+    }
+
+    /// Explicit profile keys parse; `xclient` is for submission only; a key
+    /// and its short form cannot be combined.
+    #[test]
+    fn backend_profile_is_validated() {
+        let sub = |backend: &str, extra: &str| {
+            format!("[submission]\nlisten = \"0.0.0.0:587\"\nbackend = {{ address = \"192.0.2.10:587\"{backend} }}\n{extra}")
+        };
+        let l = parse(&format!(
+            "{}{}",
+            V2.replace(
+                "client_ip = \"proxy_v2\"",
+                "client_ip = \"proxy_v2\", tls = \"starttls\", auth_forward = \"oauthbearer\""
+            ),
+            sub(
+                ", client_ip = \"proxy_v2\", tls = \"implicit\"",
+                "implicit_tls_listen = \"0.0.0.0:465\"\n"
+            )
+        ))
+        .unwrap();
+        let c = &l.config;
+        assert_eq!(c.imap.backend.tls, Some(BackendTls::Starttls));
+        assert_eq!(
+            c.imap.backend.auth_forward,
+            crate::config::AuthForward::Oauthbearer
+        );
+        let s = c.submission.as_ref().unwrap();
+        assert_eq!(s.backend.client_ip, Some(ClientIp::ProxyV2));
+        assert_eq!(s.backend.tls, Some(BackendTls::Implicit));
+        assert_eq!(s.implicit_tls_listen.as_deref(), Some("0.0.0.0:465"));
+
+        for (extra, needle) in [
+            (
+                V2.replace("\"proxy_v2\"", "\"xclient\""),
+                "imap.backend.client_ip = \"xclient\" is an SMTP extension",
+            ),
+            (
+                format!("{V2}{}", sub(", client_ip = \"none\"", "xclient = true\n")),
+                "submission.backend.client_ip cannot be combined with its short form (submission.xclient)",
+            ),
+            (
+                V2.replace("\"proxy_v2\"", "\"none\", proxy_protocol = true"),
+                "imap.backend.client_ip cannot be combined with its short form (proxy_protocol)",
+            ),
+            (
+                format!("{V2}{}", sub(", proxy_protocol = true", "xclient = true\n")),
+                "proxy_protocol and submission.xclient cannot both be set",
+            ),
+            (
+                format!("{V2}{}", sub("", "implicit_tls_listen = \"465\"\n")),
+                "submission.implicit_tls_listen = \"465\" must be ip:port",
+            ),
+            (
+                format!("{V2}{}", sub("", "implicit_tls_listen = \"0.0.0.0:587\"\n")),
+                "submission.implicit_tls_listen = \"0.0.0.0:587\" is used twice",
+            ),
+        ] {
+            let e = errors_of(&extra);
+            assert!(e.contains(needle), "{needle}: {e}");
+        }
+        for bad in [
+            V2.replace("\"proxy_v2\"", "\"proxy\""),
+            V2.replace("client_ip = \"proxy_v2\"", "tls = \"none\""),
+            V2.replace("client_ip = \"proxy_v2\"", "auth_forward = \"plain\""),
+        ] {
+            assert!(crate::config::parse(&bad).is_err(), "{bad}");
+        }
     }
 }

@@ -87,3 +87,10 @@ path = "fuzz_targets/tls_not_after.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "backend_auth"
+path = "fuzz_targets/backend_auth.rs"
+test = false
+doc = false
+bench = false

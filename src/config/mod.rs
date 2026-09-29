@@ -105,7 +105,7 @@ cert = "/c.pem"
 key = "/k.pem"
 [imap]
 listen = "0.0.0.0:993"
-backend = { address = "192.0.2.10:993", verify_name = "mail.example.org" }
+backend = { address = "192.0.2.10:993", verify_name = "mail.example.org", client_ip = "proxy_v2" }
 [oauth]
 [[oauth.issuers]]
 issuer = "https://idp.example/realms/mail"

@@ -54,7 +54,7 @@ async fn send_proxy_header(
     origin: Option<(SocketAddr, SocketAddr)>,
     timeout: Duration,
 ) -> Result<()> {
-    if !backend.proxy_protocol {
+    if backend.client_ip != crate::config::ClientIp::ProxyV2 {
         return Ok(());
     }
     let hdr = match origin {
@@ -111,7 +111,9 @@ mod tests {
             address,
             name: rustls::pki_types::ServerName::try_from("backend.test").unwrap(),
             tls: tokio_rustls::TlsConnector::from(Arc::new(cfg)),
-            proxy_protocol: false,
+            client_ip: crate::config::ClientIp::None,
+            tls_mode: crate::config::BackendTls::Implicit,
+            auth_forward: crate::config::AuthForward::Xoauth2,
             keepalive: crate::wire::Tuning::default().keepalive,
         };
         let tcp = connect(&backend, None, Duration::from_secs(5), "sieve backend")
@@ -141,7 +143,9 @@ mod tests {
             address: listener.local_addr().unwrap().to_string(),
             name: rustls::pki_types::ServerName::try_from("backend.test").unwrap(),
             tls: tokio_rustls::TlsConnector::from(Arc::new(cfg)),
-            proxy_protocol: true,
+            client_ip: crate::config::ClientIp::ProxyV2,
+            tls_mode: crate::config::BackendTls::Implicit,
+            auth_forward: crate::config::AuthForward::Xoauth2,
             keepalive: crate::wire::Tuning::default().keepalive,
         };
         let client: SocketAddr = "192.0.2.7:40000".parse().unwrap();

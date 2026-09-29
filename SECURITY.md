@@ -26,8 +26,12 @@ relays bytes. It never holds a master password or any other credential of its ow
 2. **Proxy ↔ backend: trusted, authenticated by TLS.** The backend is verified against its
    configured name and trust anchors. It is trusted to validate the forwarded token or
    password itself and to answer truthfully; its replies are still parsed defensively.
-   The PROXY v2 header and XCLIENT make the backend trust the client address the proxy
-   reports, so the backend must accept them only from the proxy's address.
+   The PROXY v2 header and XCLIENT (`client_ip`) make the backend trust the client address
+   the proxy reports, so the backend must accept them only from the proxy's address. A
+   STARTTLS backend (`tls = "starttls"`) is verified the same way; its plaintext greeting
+   and capabilities are discarded once TLS is up. An OAUTHBEARER error result from the
+   backend (`auth_forward = "oauthbearer"`) is parsed with a size limit and decides only
+   between a rejection and an outage.
 3. **Proxy ↔ identity provider: trusted for keys.** The JWKS is fetched over HTTPS,
    verified against the system trust store, and defines which tokens are valid for its
    issuer. Whoever can change a JWKS (or the trust store) can mint tokens for that issuer.
@@ -48,7 +52,7 @@ relays bytes. It never holds a master password or any other credential of its ow
 | STARTTLS command injection | nothing is read ahead of the TLS switch, so plaintext pipelined after `STARTTLS` cannot reach the encrypted session |
 | Log injection | client text escaped or reduced to a fixed character set in every log field |
 | A rogue or intercepted backend | backend TLS always verified; no option to disable it |
-| An authenticated SMTP client sending its own `XCLIENT` to impersonate another user | the proxy never relays into a session in which the backend still offers `XCLIENT`. A backend that advertises it while `submission.xclient = false`, or still advertises it after the proxy's own `XCLIENT` with `submission.xclient = true` (the client's address is itself authorized), is treated as misconfigured, and the login fails as an outage |
+| An authenticated SMTP client sending its own `XCLIENT` to impersonate another user | the proxy never relays into a session in which the backend still offers `XCLIENT`. A backend that advertises it while the submission backend's `client_ip` is not `xclient`, or still advertises it after the proxy's own `XCLIENT` (the client's address is itself authorized), is treated as misconfigured, and the login fails as an outage |
 | A logged-in client returning to the unauthenticated state (`UNAUTHENTICATE`, RFC 8437) to try passwords directly at the backend | the proxy never relays into such a session: a backend that offers `UNAUTHENTICATE` gets no login (an outage), and the capability is not passed to clients |
 | Bans of legitimate users during an outage | outages are answered with retry-later and never logged as failed logins |
 | One issuer asserting identities that belong to another | `oauth.issuers[].identity_domains`: an issuer logs in only to addresses in its domains. Without it, all issuers share one identity namespace, so an account name valid at issuer A can be asserted by issuer B; with more than one issuer the configuration warns about each issuer without it ([D-JWT-3](docs/standards.md#d-jwt-3-identity-namespace-across-issuers)) |
@@ -148,6 +152,10 @@ relays bytes. It never holds a master password or any other credential of its ow
   folds logins to lower case, so differently-cased logins share one counter.
 - **Backend validation.** The backend (e.g. Dovecot `oauth2` passdb) must validate tokens
   itself. The proxy's check is a filter in front of it and does not replace it.
+- **Client address at the backend.** With `client_ip = "none"` the backend sees every
+  client as the proxy's address: its own per-address limits and bans then act on all
+  users at once, and its logs cannot tell clients apart. Prefer `proxy_v2` or `xclient`
+  and restrict the backend listener to the proxy; the proxy warns about `none`.
 - **No `UNAUTHENTICATE` at the backend.** The IMAP and ManageSieve backends must not offer
   `UNAUTHENTICATE` (RFC 8437, RFC 5804 §2.14.1). After login the proxy relays bytes
   blindly, so a client could leave its login and try passwords for any account past the

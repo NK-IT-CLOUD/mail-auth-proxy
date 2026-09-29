@@ -11,7 +11,8 @@ use zeroize::Zeroizing;
 pub use crate::auth::discovery::{classify, Answer, ErrorChallenge};
 pub use crate::auth::legacy::MechSet;
 pub use crate::auth::sasl::{
-    authzid_allowed, build_plain, build_xoauth2, parse_plain, parse_sasl, ClientAuthKind, SaslCreds,
+    authzid_allowed, build_oauthbearer, build_plain, build_xoauth2, parse_error_result,
+    parse_plain, parse_sasl, ClientAuthKind, ErrorResult, SaslCreds, OAUTHBEARER_DUMMY,
 };
 pub use crate::auth::token::{TokenError, Validator};
 pub use crate::proto::imap::preauth::ClientAuth;
@@ -153,4 +154,13 @@ pub async fn sieve_read_sasl_string<S: AsyncRead + Unpin>(
     stream: &mut S,
 ) -> Result<Zeroizing<String>> {
     crate::proto::sieve::preauth::read_sasl_string(stream, IDLE).await
+}
+
+/// A ManageSieve server challenge whose first line is `line`, as the
+/// backend login reads it; a literal's octets are read from `stream`.
+pub async fn sieve_read_challenge<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    line: &str,
+) -> Result<String> {
+    crate::proto::sieve::backend::read_challenge(stream, line, IDLE).await
 }

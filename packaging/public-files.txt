@@ -18,6 +18,7 @@ docs/architecture.md
 docs/assets/how-it-works-dark.svg
 docs/assets/how-it-works-light.svg
 docs/backend-dovecot-postfix.md
+docs/backend-stalwart.md
 docs/configuration.md
 docs/idp-keycloak.md
 docs/operations.md
