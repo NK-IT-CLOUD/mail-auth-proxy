@@ -2,7 +2,8 @@
 
 The file is TOML, format version 2. A commented example is
 [examples/config.example.toml](../examples/config.example.toml); the package installs it as
-`/etc/mail-auth-proxy/config.toml` with all password settings commented out.
+`/usr/share/mail-auth-proxy/config.example.toml` and, where no config exists yet, copies it
+to `/etc/mail-auth-proxy/config.toml`, with all password settings commented out.
 
 ## Command line
 

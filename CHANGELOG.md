@@ -104,6 +104,20 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - OAUTHBEARER: a `host` in the client response must match the TLS server name (SNI),
   ASCII case-insensitive (RFC 7628 §3.2); a mismatch is refused like any rejected token
   (`bad_token`). Without SNI, and for `port`, nothing is compared.
+- `systemctl reload` failed on minimal systems without procps (/bin/kill); the packages
+  now depend on it (procps for the deb, util-linux-core for the rpm).
+- An upgrade with a locally changed `/etc/mail-auth-proxy/config.toml` stopped at dpkg's
+  conffile question whenever the shipped example had changed, and unattended-upgrades
+  skipped it. The config is no longer a conffile: the package ships the example as
+  `/usr/share/mail-auth-proxy/config.example.toml`, creates `config.toml` from it on
+  install where none exists and never changes an existing one. Upgrading from a release
+  that shipped it as conffile keeps the file unchanged, without a question (rpm: no
+  `.rpmnew`; a changed config is still kept as `.rpmsave` on removal).
+
+### Security
+- The packaged unit sets `LimitCORE=0`: the service writes no core dumps, which could
+  hold tokens, passwords and the TLS key. Before, only the soft limit was 0 and the
+  hard limit unlimited.
 
 ## [0.2.0] - 2026-09-29
 

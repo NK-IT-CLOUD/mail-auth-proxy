@@ -69,6 +69,13 @@ echo "$listing" | grep -q -x /usr/share/doc/mail-auth-proxy/THIRD-PARTY-NOTICES.
     || fail "package lacks THIRD-PARTY-NOTICES.html"
 [ "$(echo "$listing" | grep -c '^/usr/share/doc/mail-auth-proxy/crowdsec/scenarios/.*\.yaml$')" -eq 5 ] || fail "not 5 scenarios"
 echo "$listing" | grep -q '/\.tests/' && fail "hubtest cases in the package"
+# The example is package data; config.toml is created by postinstall (rpm owns it
+# as %ghost, without content).
+echo "$listing" | grep -q -x /usr/share/mail-auth-proxy/config.example.toml || fail "package lacks the example config"
+if [ $fmt = deb ]; then
+    ! echo "$listing" | grep -q -x $conf || fail "the deb ships $conf"
+    ! dpkg-query -W -f='${Conffiles}' mail-auth-proxy | grep -q . || fail "the deb has conffiles"
+fi
 
 echo "== upgrade to $new with a changed config"
 echo "# local change" >> $conf
@@ -80,7 +87,7 @@ mail-auth-proxy --version | grep -q "(commit $commit)" || fail "--version after 
 echo "== remove"
 if [ $fmt = deb ]; then
     apt-get remove -y -qq mail-auth-proxy
-    [ -e $conf ] || fail "remove deleted the conffile"
+    [ -e $conf ] || fail "remove deleted the config"
     apt-get purge -y -qq mail-auth-proxy
     [ ! -e /etc/mail-auth-proxy ] || fail "purge left /etc/mail-auth-proxy"
 else

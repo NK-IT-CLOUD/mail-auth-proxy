@@ -44,7 +44,7 @@ A single crate with a library (`src/lib.rs`) and a thin binary (`src/main.rs`).
 | `src/wire/` | line reader, deadlines, backend connect, PROXY protocol v2, byte relay |
 | `src/obs/` | the `authresult` log line and Prometheus metrics |
 | `tests/` | black-box tests: the real binary against mock Dovecot/Postfix/Pigeonhole backends, a local JWKS and a mock doveadm API (`tests/common/`) |
-| `examples/config.example.toml` | example configuration, shipped as the package's config file |
+| `examples/config.example.toml` | example configuration; the package ships it in `/usr/share/mail-auth-proxy/` and creates `config.toml` from it on install |
 | `packaging/` | systemd unit, sysusers.d, nfpm manifest, maintainer scripts, hermetic build, package smoke test and systemd start test |
 | `packaging/public-files.txt`, `public-tree.sh`, `leak-gate*.sh` | release tooling: the list of public paths, the script that builds the public tree from it, and the leak gate (with its self-test) that checks a tree or commit range before publication |
 | `contrib/crowdsec/` | CrowdSec parser and scenarios with `cscli hubtest` cases |

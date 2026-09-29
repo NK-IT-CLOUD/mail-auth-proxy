@@ -185,7 +185,8 @@ jobs:
 
   # Static musl build in the digest-pinned image, deb + rpm with nfpm, then
   # install, upgrade and remove in throwaway containers (assertions in
-  # packaging/smoke-test.sh).
+  # packaging/smoke-test.sh), then start the unit under systemd
+  # (packaging/systemd-test.sh).
   package-smoke:
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     if: vars.CI_RUNNER == '' || github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -219,5 +220,15 @@ jobs:
           done
           ls -l dist/*/
 
+      # The releases that shipped config.toml as conffile, for the upgrade tests.
+      - name: Releases to upgrade from
+        run: packaging/ci-fetch-releases.sh dist/releases
+
       - name: Install tests
-        run: packaging/ci-install-tests.sh "dist/0.0.0-ci.0" "dist/0.0.0-ci.${{ github.run_number }}"
+        run: packaging/ci-install-tests.sh "dist/0.0.0-ci.0" "dist/0.0.0-ci.${{ github.run_number }}" dist/releases
+
+      # The real unit under systemd as PID 1; the script's guard ends a hung
+      # container well before this limit.
+      - name: Start under systemd
+        timeout-minutes: 20
+        run: packaging/ci-systemd-test.sh "dist/0.0.0-ci.${{ github.run_number }}" dist/releases

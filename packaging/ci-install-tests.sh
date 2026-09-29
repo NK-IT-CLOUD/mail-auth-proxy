@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Install, upgrade and remove the packages in throwaway containers; the assertions
-# are in packaging/smoke-test.sh. CONTAINER_ENGINE is buildah (rootless,
-# self-hosted runners) or docker (GitHub-hosted runners).
-#   ci-install-tests.sh OLD_DIR NEW_DIR   (each with one .deb and one .rpm)
+# are in packaging/smoke-test.sh. Then the upgrade from a release that shipped the
+# config as conffile (packaging/migration-test.sh). CONTAINER_ENGINE is buildah
+# (rootless, self-hosted runners) or docker (GitHub-hosted runners).
+#   ci-install-tests.sh OLD_DIR NEW_DIR RELEASES_DIR   (each with one .deb and one .rpm;
+#                                                     RELEASES_DIR/VERSION/ per release)
 set -euo pipefail
-old=$1 new=$2
+old=$1 new=$2 release=$3
 engine=${CONTAINER_ENGINE:-docker}
 commit=$(git rev-parse --short=12 HEAD)
 ctr=
@@ -54,4 +56,18 @@ smoke docker.io/library/ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d
     'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq systemd > /dev/null' deb systemd-sysusers
 smoke docker.io/rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f \
     'dnf install -y -q systemd > /dev/null' rpm systemd-sysusers
+
+migrate() { # image, package format, release directory
+    ctr=$(c_from "$1")
+    c_copy "$ctr" packaging/migration-test.sh /pkg/migration-test.sh
+    c_copy "$ctr" "$(ls "$3"/*."$2")" "/pkg/old.$2"
+    c_copy "$ctr" "$(ls "$new"/*."$2")" "/pkg/new.$2"
+    c_run "$ctr" "sh /pkg/migration-test.sh /pkg/old.$2 /pkg/new.$2"
+    c_rm "$ctr"
+    ctr=
+}
+for r in "$release"/*/; do
+    migrate docker.io/library/debian:12@sha256:f37a335e82bca302e955fa39f9dfe28f1be618f016f8a2b56318e5a5111afc26 deb "$r"
+    migrate docker.io/rockylinux/rockylinux:9@sha256:8101994123cf3d0a8fee517bee7f39e555c7d92bd2d9eb3303cc988a0eeed00f rpm "$r"
+done
 echo "install tests: ok ($engine)"

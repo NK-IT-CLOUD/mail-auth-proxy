@@ -55,7 +55,8 @@ sudo dnf install ./mail-auth-proxy-X.Y.Z-1.x86_64.rpm
 | Path | What |
 |---|---|
 | `/usr/bin/mail-auth-proxy` | the binary |
-| `/etc/mail-auth-proxy/config.toml` | example configuration (a conffile: upgrades keep your changes), `root:mail-auth-proxy` `0640` |
+| `/etc/mail-auth-proxy/config.toml` | your configuration: created from the example on install where none exists, never changed by an upgrade, `root:mail-auth-proxy` `0640` |
+| `/usr/share/mail-auth-proxy/config.example.toml` | the example configuration of the installed version |
 | `/etc/mail-auth-proxy/` | directory `root:mail-auth-proxy` `0750` |
 | `/usr/lib/systemd/system/mail-auth-proxy.service` | the unit |
 | `/usr/lib/sysusers.d/mail-auth-proxy.conf` | the system user and group `mail-auth-proxy` (created on install, no login; an existing group of that name is reused) |
@@ -194,9 +195,11 @@ With APT: `sudo apt update && sudo apt upgrade`. With RPM: verify the new RPM an
 
 On upgrade the package restarts a **running** service only if the configuration passes
 `--check-config` with the service's credentials; otherwise the old process keeps running
-and a warning is printed. A stopped service stays stopped. Your `config.toml` is kept: on
-Debian, dpkg asks if the shipped example changed; with RPM, a changed example is written
-next to your file as `config.toml.rpmnew`.
+and a warning is printed. A stopped service stays stopped. Your `config.toml` is not a
+conffile: an upgrade never changes it and asks nothing, so unattended upgrades work. Compare
+it with `/usr/share/mail-auth-proxy/config.example.toml` for new settings. (Releases up to
+0.2.0 shipped `config.toml` as conffile; upgrading from them keeps your file as it is, and
+`dpkg` lists it as an obsolete conffile.)
 
 On `SIGTERM` (stop, restart) the proxy stops accepting and gives open sessions 10 s to
 finish; clients reconnect after that.
@@ -209,9 +212,9 @@ sudo apt purge mail-auth-proxy      # also removes the configuration
 sudo dnf remove mail-auth-proxy     # RPM
 ```
 
-Removal stops and disables the service. On purge the directory `/etc/mail-auth-proxy`
-is removed only if it is empty. `dnf remove` keeps a `config.toml` you changed as
-`config.toml.rpmsave`.
+Removal stops and disables the service. Purge removes `config.toml`; the directory
+`/etc/mail-auth-proxy` is removed only if nothing else is left in it. `dnf remove` keeps a
+`config.toml` you changed as `config.toml.rpmsave`.
 
 The user and group `mail-auth-proxy` stay, because files you created may belong to them.
 When nothing uses them any more, delete them with `sudo userdel mail-auth-proxy` (and

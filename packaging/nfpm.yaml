@@ -27,8 +27,17 @@ description: |
 # preinstall needs systemd-sysusers or groupadd/useradd (shadow-utils / passwd). nfpm 2.47
 # can express Requires(post) only (rpm.requires.post), not Requires(pre), so this
 # is not declared; both tools are part of every supported base system.
-depends:
-  - ca-certificates
+# The unit's ExecReload runs /bin/kill: procps on Debian and Ubuntu, util-linux-core
+# on RHEL 9 and its rebuilds.
+overrides:
+  deb:
+    depends:
+      - ca-certificates
+      - procps
+  rpm:
+    depends:
+      - ca-certificates
+      - util-linux-core
 contents:
   - src: ./dist/mail-auth-proxy
     dst: /usr/bin/mail-auth-proxy
@@ -40,9 +49,17 @@ contents:
       mode: 0750
       owner: root
       group: mail-auth-proxy
+  # Not a conffile: postinstall copies the example to config.toml where none exists,
+  # so an upgrade never asks about a changed example (dpkg) or writes .rpmnew.
   - src: ./examples/config.example.toml
-    dst: /etc/mail-auth-proxy/config.toml
-    type: config|noreplace
+    dst: /usr/share/mail-auth-proxy/config.example.toml
+    file_info:
+      mode: 0644
+  # rpm: the package keeps owning config.toml without shipping it, so upgrading from
+  # a release that shipped it as %config does not remove the admin's file.
+  - dst: /etc/mail-auth-proxy/config.toml
+    type: ghost
+    packager: rpm
     file_info:
       mode: 0640
       owner: root

@@ -9,4 +9,11 @@ case "$1" in
         fi
         ;;
 esac
+# rpm removes config.toml (%ghost) with the package: keep a changed one as
+# config.toml.rpmsave, as rpm does for a changed %config file.
+conf=/etc/mail-auth-proxy/config.toml
+if [ "$1" = 0 ] && [ -f "$conf" ] \
+    && [ "$(sha256sum < "$conf")" != "$(sha256sum < /usr/share/mail-auth-proxy/config.example.toml)" ]; then
+    cp -p "$conf" "$conf.rpmsave"
+fi
 exit 0

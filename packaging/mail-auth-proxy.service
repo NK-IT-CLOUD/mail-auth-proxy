@@ -49,6 +49,8 @@ Restart=on-failure
 RestartSec=2
 # Each session holds two sockets; max_connections (default 2048) must fit.
 LimitNOFILE=16384
+# No core dumps (soft and hard limit): they could hold tokens and the TLS key.
+LimitCORE=0
 
 [Install]
 WantedBy=multi-user.target
