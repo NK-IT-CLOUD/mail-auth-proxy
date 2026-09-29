@@ -74,8 +74,10 @@ fuzz_target!(|data: &[u8]| {
     // LOGIN arguments directly, and the quoting roundtrip.
     let text = String::from_utf8_lossy(input);
     let _ = imap_parse_two_astrings(&text);
+    // No IMAP string holds a NUL, and the parser refuses one.
     let (u, p) = text.split_once('\0').unwrap_or((&text, ""));
-    let (qu, qp) = (quote(u), quote(p));
+    let p: String = p.chars().filter(|&c| c != '\0').collect();
+    let (qu, qp) = (quote(u), quote(&p));
     let (pu, pp) = imap_parse_two_astrings(&format!("{qu} {qp}")).expect("quoted astrings");
-    assert_eq!((pu.as_str(), pp.as_str()), (u, p));
+    assert_eq!((pu.as_str(), pp.as_str()), (u, p.as_str()));
 });

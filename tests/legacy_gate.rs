@@ -133,6 +133,9 @@ async fn attempt(
         (Kind::Imap, Mech::Plain) => format!("a AUTHENTICATE PLAIN {}", plain(user, pass)),
         (Kind::Imap, Mech::Login) => format!("a LOGIN {user} {pass}"),
         (Kind::Smtp, Mech::Plain) => format!("AUTH PLAIN {}", plain(user, pass)),
+        // Where LOGIN is not offered, the reply to the user comes at once,
+        // without a password prompt.
+        (Kind::Smtp, Mech::Login) if !offered.1 => format!("AUTH LOGIN {}", b64(user)),
         (Kind::Smtp, Mech::Login) => {
             c.send(&format!("AUTH LOGIN {}", b64(user))).await;
             assert_eq!(c.line().await, "334 UGFzc3dvcmQ6");
@@ -271,8 +274,11 @@ mechanisms = ["PLAIN"]
                             "{id}"
                         );
                         let ok = exp_answer == Answer::Ok;
-                        assert_eq!(ok, pwfp.is_empty(), "{id}: pwfp {pwfp:?}");
-                        assert!(ok || is_fp(&pwfp), "{id}");
+                        // SASL LOGIN refused before the password: nothing to
+                        // fingerprint.
+                        let withheld = kind == Kind::Smtp && mech == Mech::Login && !offered_here;
+                        assert_eq!(ok || withheld, pwfp.is_empty(), "{id}: pwfp {pwfp:?}");
+                        assert!(ok || withheld || is_fp(&pwfp), "{id}");
                         let seen = h.backend(kind).sessions();
                         if ok {
                             assert_eq!(seen.len(), sessions + 1, "{id}");

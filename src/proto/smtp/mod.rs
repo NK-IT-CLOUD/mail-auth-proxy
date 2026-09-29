@@ -6,6 +6,7 @@ pub(crate) mod backend;
 pub(crate) mod preauth;
 
 use crate::auth::discovery::{self, Answer};
+use crate::auth::sasl::Discovery;
 use crate::auth::{self, refused};
 use crate::limits::ConnPermit;
 use crate::obs::metrics::Proto;
@@ -121,6 +122,15 @@ pub async fn handle(
     // rules offer; none means OAuth only.
     let sni = client_tls.get_ref().1.server_name().map(|s| s.to_string());
     let pw_mechs = ctx.password_mechs(Proto::Smtp, sni.as_deref(), peer);
+    let session = auth::Session {
+        proto: Proto::Smtp,
+        peer,
+        internal,
+        scope,
+        sni: sni.as_deref(),
+        pw_mechs,
+        preauth_until,
+    };
 
     // The EHLO reply after TLS: no STARTTLS, password mechanisms only as far
     // as the legacy gate offers them.
@@ -170,9 +180,24 @@ pub async fn handle(
                         .write_all(b"530 5.7.0 Authentication required\r\n")
                         .await?;
                 } else if verb_is(&line, "AUTH") {
-                    return Ok(Some(
-                        read_smtp_auth(&line, &mut client_tls, tuning.idle).await?,
-                    ));
+                    // One AUTH per connection (anti-guessing): a refused one
+                    // is answered, then the connection is closed with 421.
+                    let challenge = ctx.error_challenge.base64();
+                    return match read_smtp_auth(
+                        &line,
+                        &mut client_tls,
+                        pw_mechs,
+                        challenge,
+                        tuning.idle,
+                    )
+                    .await
+                    {
+                        Ok(v) => Ok(Some(v)),
+                        Err(e) => {
+                            let _ = client_tls.write_all(closing(name).as_bytes()).await;
+                            Err(e)
+                        }
+                    };
                 } else if verb_is(&line, "NOOP") || verb_is(&line, "RSET") {
                     client_tls.write_all(b"250 OK\r\n").await?;
                 } else if verb_is(&line, "QUIT") {
@@ -190,6 +215,17 @@ pub async fn handle(
     {
         Ok(v) => v,
         Err(e) => {
+            // Answered already; recorded like a blocked password.
+            if let Some(w) = e.downcast_ref::<auth::Withheld>() {
+                let _ = client_tls.flush().await;
+                return Err(auth::withheld(&ctx, &session, w));
+            }
+            // Answered with the error result already.
+            if let Some(d) = e.downcast_ref::<Discovery>() {
+                auth::discovery(&session, d);
+                let _ = client_tls.flush().await;
+                return Err(refused(format!("{e:#}")));
+            }
             // No credential was presented (EOF, total timeout, command flood,
             // unparsable AUTH): a `protocol` record and a pre-auth abort.
             crate::obs::authlog::AuthEvent {
@@ -208,21 +244,13 @@ pub async fn handle(
             return Err(e);
         }
     };
-    let (mech, kind) = match authed {
+    let (mech, kind, host) = match authed {
         Some(v) => v,
         None => return Ok(()),
     };
 
     // Gate, token validation and backend login (connect, STARTTLS, AUTH with
     // the client's own credential).
-    let session = auth::Session {
-        proto: Proto::Smtp,
-        peer,
-        internal,
-        scope,
-        sni: sni.as_deref(),
-        pw_mechs,
-    };
     let login = SmtpLogin {
         backend: &ctx.protocol.backend,
         tuning,
@@ -231,7 +259,7 @@ pub async fn handle(
         peer,
     };
     const INVALID: &str = "535 5.7.8 Authentication credentials invalid";
-    let outcome = auth::authorize(&ctx, &session, &mech, &kind, &login).await;
+    let outcome = auth::authorize(&ctx, &session, &mech, &kind, host.as_deref(), &login).await;
     // The credential is not needed after the login: dropping it zeroizes it
     // before the splice, which can last for hours.
     drop(kind);
@@ -256,21 +284,13 @@ pub async fn handle(
         ),
         // RFC 7628 section 3.2.2: the error result as a `334` challenge,
         // then the failure once the client has answered it (section 3.2.3).
-        // An abort (`*`) or undecodable answer is a 501 (RFC 4954 section
-        // 4); anything else, and a client that does not answer, gets 535.
         auth::Outcome::BadToken(e) => {
             let prompt = format!("334 {}", ctx.error_challenge.base64());
             let answer =
                 discovery::complete_line(&mut client_tls, &prompt, &mech, preauth_until, tuning)
                     .await;
-            let reply = match answer {
-                Ok(Answer::Cancelled | Answer::Undecodable) => {
-                    "501 5.5.2 Invalid or cancelled authentication response"
-                }
-                _ => INVALID,
-            };
             (
-                reply,
+                preauth::error_result_reply(&answer),
                 refused(format!("token rejected: {e}{}", Answer::note(&answer))),
             )
         }
@@ -292,8 +312,15 @@ pub async fn handle(
         ),
     };
     let _ = client_tls
-        .write_all(format!("{reply}\r\n").as_bytes())
+        .write_all(format!("{reply}\r\n{}", closing(name)).as_bytes())
         .await;
     let _ = client_tls.flush().await;
     Err(error)
+}
+
+/// The reply before the proxy closes a connection after a refused AUTH. The
+/// proxy takes one AUTH per connection, and RFC 5321 §3.8 lets a server
+/// close only after QUIT, a timeout, or a 421.
+fn closing(name: &str) -> String {
+    format!("421 4.7.0 {name} closing connection\r\n")
 }

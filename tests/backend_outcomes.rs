@@ -86,7 +86,7 @@ async fn expect_reject(h: &Harness, kind: Kind, password: bool) {
         rejected_token(kind)
     };
     assert_eq!(reply, expected, "{kind:?}");
-    c.expect_closed().await;
+    c.expect_end(kind).await;
 
     let ars = h.proxy.wait_authresults(before + 1).await;
     assert_eq!(ars.len(), before + 1);
@@ -138,7 +138,7 @@ async fn expect_outage(h: &Harness, kind: Kind, mut c: Client, cmd: &str, cause:
     let errors = h.proxy.metric(&backend_errors(kind)).await;
     c.send(cmd).await;
     assert_eq!(c.line().await, retry_later(kind), "{kind:?}");
-    c.expect_closed().await;
+    c.expect_end(kind).await;
     // The session-ended line is written after any authresult would have been.
     let line = h.wait_session_ended(kind, ended + 1).await;
     // The journal keeps the whole chain: the outage and its cause.
@@ -232,15 +232,18 @@ async fn sieve_reject_vs_outage() {
     outcomes(Kind::Sieve).await;
 }
 
-/// ManageSieve with a cold capability cache and the backend down: the client
-/// gets BYE right after STARTTLS. Neither a backend error nor a pre-auth
-/// abort is counted, and no authresult is written.
+/// ManageSieve with a cold capability cache and the backend down: the
+/// greeting has no SIEVE line and the client gets BYE right after STARTTLS.
+/// The failed probe is one backend error (the second, post-TLS, is not
+/// attempted within the retry spacing); no pre-auth abort is counted, and
+/// no authresult is written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sieve_capability_probe_failure() {
     let h = Harness::start().await;
     h.sieve_be.shutdown().await;
     let mut c = Client::connect(h.proxy.sieve, Src::External).await;
-    c.sieve_response().await;
+    let greeting = c.sieve_response().await;
+    assert!(!greeting.iter().any(|l| l.starts_with("\"SIEVE\"")));
     c.send("STARTTLS").await;
     assert_eq!(c.line().await, "OK \"Begin TLS negotiation now\"");
     c.tls(&h.pki, Sni::Public).await;
@@ -251,7 +254,7 @@ async fn sieve_capability_probe_failure() {
     let m = h.proxy.metrics().await;
     assert_eq!(
         m["mail_auth_proxy_backend_errors_total{proto=\"sieve\"}"],
-        0
+        1
     );
     assert_eq!(
         m["mail_auth_proxy_preauth_aborts_total{proto=\"sieve\",scope=\"external\"}"],
@@ -328,7 +331,7 @@ async fn backend_syntax_error_on_password_is_rejection() {
             )
             .await;
         assert_eq!(reply, rejected_password(kind), "{kind:?}");
-        c.expect_closed().await;
+        c.expect_end(kind).await;
         let ar = &h.proxy.wait_authresults(n + 1).await[n];
         assert_eq!(
             (ar.reason.as_str(), ar.user.as_str()),

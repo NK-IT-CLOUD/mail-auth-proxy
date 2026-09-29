@@ -43,6 +43,62 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A full legacy throttle table drops the oldest 1024 accounts at once instead of one per
   new failing account, so the table scan under the lock is no longer paid on every new
   account; a failure of an account already tracked evicts nothing.
+- ManageSieve: a backend `BYE` in answer to `AUTHENTICATE` (shutdown, connection limit)
+  is an outage, not a `backend_reject`; it no longer counts in the rate limit or for
+  CrowdSec (RFC 5804 §1.3).
+- A backend that offers `UNAUTHENTICATE` (RFC 8437, RFC 5804 §2.14.1) gets no login: an
+  outage with a journal line that names it, since a client could otherwise leave its
+  login and try passwords past the password gate. ManageSieve no longer relays the
+  capability.
+- Token validation (including a JWKS refresh for an unknown `kid`), the legacy account
+  check and the backend login now run inside the pre-auth budget (`preauth_secs`); a
+  slow IdP or a hanging backend no longer holds pre-auth slots beyond it. Running out is
+  an outage (retry later), not a failed login.
+- A password mechanism the endpoint does not offer, chosen without an initial response,
+  is refused at once (IMAP `NO`, SMTP `504 5.5.4`, ManageSieve `NO`) instead of prompting
+  for a password that would never be used. It is logged as `blocked_endpoint` without
+  `pwfp` (and with the login only if the client sent it as SASL LOGIN initial response).
+- ManageSieve `AUTHENTICATE` without initial response reads the client's answer as a
+  string (quoted, literal or bare) and takes `"*"` as a cancel (RFC 5804 §2.1); a
+  quoted response was passed to the base64 decoder with its quotes, so such logins
+  failed. Client literals must be `{n+}` with nothing after the header or after the
+  octets (RFC 5804 §4); `{n}`, `{n++}` and trailing text are refused.
+- ManageSieve: the greeting lists the backend's `SIEVE` capability from the first
+  connection after startup on (RFC 5804 §1.7); while the capability cache is cold the
+  greeting waits for the probe. Probes run one at a time (clients that arrive together
+  share one), a failed probe counts in `mail_auth_proxy_backend_errors_total{proto="sieve"}`
+  and the next one waits 5 s.
+- SASL parsing is strict where the RFCs are: a NUL in a PLAIN password (RFC 4616 §2), in
+  a SASL LOGIN field or in the IMAP `LOGIN` arguments is refused; the OAUTHBEARER GS2
+  header must be `n,` or `y,` with an optional `a=` authzid whose `=2C`/`=3D` are decoded
+  (RFC 7628 §3.1, RFC 5801 §4), `p=` channel binding is refused; a XOAUTH2 `user=` or
+  OAUTHBEARER authzid longer than 255 bytes or with control characters is refused. All
+  of these end as `protocol`, before the gate and the backend.
+- SMTP: after a refused `AUTH` (the proxy takes one per connection) the close is
+  announced with `421 4.7.0 <hostname> closing connection` after the refusal (RFC 5321
+  §3.8).
+- ManageSieve: `CAPABILITY` and `NOOP` work before STARTTLS too (RFC 5804 §2), and
+  `NOOP` with an argument answers with the `TAG` response code (§2.13).
+- ManageSieve backend login: a SASL response longer than 1024 octets (any sizable
+  token) is sent as a literal `{n+}` instead of an over-long quoted string (RFC 5804
+  §4).
+- IMAP backend login: the SASL initial response is only sent when the backend's
+  greeting advertises `SASL-IR`; otherwise the response follows the backend's empty
+  challenge (RFC 4959 §3).
+- IMAP: the pre-auth capabilities list `ID`, which the proxy answers (RFC 2971 §3).
+- IMAP and SMTP: an initial response `=` is the empty response (RFC 4959 §3, RFC 4954
+  §4), not undecodable base64. A SASL response that decodes but holds no valid
+  credential now gets `NO [AUTHENTICATIONFAILED]` / `535 5.7.8` instead of `BAD` /
+  `501`, which stay for responses that are not base64 and for a cancel (RFC 9051
+  §6.2.2, RFC 4954 §4).
+- An OAuth response with an empty `auth` value (`auth=`, or `Bearer` without a token) is
+  a discovery request (RFC 7628 §4.3): it gets the error result with `scope` and
+  `openid-configuration` like a rejected token instead of a syntax error. It carries no
+  credential, so its `authresult` line is `reason="protocol"` (with the mechanism and
+  the SASL user), and it counts neither as a failed attempt nor in the rate limit.
+- OAUTHBEARER: a `host` in the client response must match the TLS server name (SNI),
+  ASCII case-insensitive (RFC 7628 §3.2); a mismatch is refused like any rejected token
+  (`bad_token`). Without SNI, and for `port`, nothing is compared.
 
 ## [0.2.0] - 2026-09-29
 

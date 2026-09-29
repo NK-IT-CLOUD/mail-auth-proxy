@@ -59,8 +59,17 @@ async fn sieve_starttls_injection() {
 
     h.wait_session_ended(Kind::Sieve, 1).await;
     assert!(h.proxy.authresults().is_empty());
-    // Not even the capability probe: it only runs after a TLS handshake.
-    assert!(h.sieve_be.seen().is_empty(), "backend contacted");
+    // No session and no credential reached the backend. The only contact is
+    // the capability probe for the first greeting after startup (RFC 5804
+    // §1.7), the proxy's own connection.
+    assert!(h.sieve_be.sessions().is_empty(), "backend session");
+    assert!(
+        h.sieve_be
+            .seen()
+            .iter()
+            .all(|s| s.probe && s.login.is_none()),
+        "backend contacted"
+    );
     assert_eq!(
         h.proxy
             .metric("mail_auth_proxy_preauth_aborts_total{proto=\"sieve\",scope=\"internal\"}")

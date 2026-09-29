@@ -97,7 +97,7 @@ async fn error_result_names_the_idp_then_fails() {
             );
             c.send(&sasl_response(kind, dummy_response(mech))).await;
             assert_eq!(c.line().await, failed(kind), "{kind:?} {mech}");
-            c.expect_closed().await;
+            c.expect_end(kind).await;
             n += 1;
             expect_bad_token(&h, kind, mech, n).await;
             let line = h.wait_session_ended(kind, ended + 1).await;
@@ -206,7 +206,7 @@ async fn answers_other_than_the_dummy() {
                 error_result(kind, &challenge);
                 c.send(&answer).await;
                 assert_eq!(c.line().await, reply, "{kind:?} {mech} {answer:?}");
-                c.expect_closed().await;
+                c.expect_end(kind).await;
                 n += 1;
                 expect_bad_token(&h, kind, mech, n).await;
                 ended += 1;
@@ -317,7 +317,7 @@ async fn silent_client_is_cut_off_by_the_preauth_budget() {
             .await;
         error_result(kind, &challenge);
         assert_eq!(c.line().await, failed(kind), "{kind:?}");
-        c.expect_closed().await;
+        c.expect_end(kind).await;
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "{:?}",
@@ -350,7 +350,7 @@ async fn silent_client_is_cut_off_by_the_idle_timeout() {
             .await;
         error_result(kind, &challenge);
         assert_eq!(c.line().await, failed(kind), "{kind:?}");
-        c.expect_closed().await;
+        c.expect_end(kind).await;
         let line = h.wait_session_ended(kind, 1).await;
         assert!(line.contains("read timed out after 1s"), "{line}");
         expect_bad_token(&h, kind, "OAUTHBEARER", i + 1).await;
@@ -409,7 +409,7 @@ async fn stale_keys_get_retry_later_without_challenge() {
             Kind::Sieve => "NO (TRYLATER) \"Service temporarily unavailable\"",
         };
         assert_eq!(reply, want, "{kind:?}");
-        c.expect_closed().await;
+        c.expect_end(kind).await;
         h.wait_session_ended(kind, 1).await;
     }
     assert!(h.proxy.authresults().is_empty());

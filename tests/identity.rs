@@ -83,7 +83,7 @@ async fn oauth_authzid_naming_another_user_fails() {
         ] {
             let (mut c, reply) = h.auth(kind, Src::External, Sni::Public, mech, &ir).await;
             assert_eq!(reply, expected, "{kind:?} {mech}");
-            c.expect_closed().await;
+            c.expect_end(kind).await;
             n += 1;
             let ar = &h.proxy.wait_authresults(n).await[n - 1];
             assert_eq!(
@@ -152,10 +152,9 @@ async fn plain_authzid() {
     let (mut c, reply) = h
         .auth(Kind::Imap, Src::Internal, Sni::Internal, "PLAIN", &ir)
         .await;
-    assert_eq!(
-        reply,
-        "a BAD AUTHENTICATE failed: invalid or cancelled response"
-    );
+    // Valid base64 with an unusable credential: NO, not BAD (RFC 9051
+    // §6.2.2).
+    assert_eq!(reply, "a NO [AUTHENTICATIONFAILED] Authentication failed");
     c.expect_closed().await;
     assert_eq!(h.imap_be.sessions().len(), 1);
     let ar = &h.proxy.wait_authresults(2).await[1];

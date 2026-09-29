@@ -1,6 +1,6 @@
 //! The protocol line reader and the SASL response readers built on it.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context as _, Result};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use zeroize::{Zeroize as _, Zeroizing};
@@ -143,16 +143,40 @@ fn push_zeroizing(buf: &mut Vec<u8>, byte: u8) {
 }
 
 /// Read one SASL client response line. A lone `*` is the client cancelling
-/// the exchange (RFC 3501 §6.2.2, RFC 4954 §4) and ends it with an error.
+/// the exchange (RFC 3501 §6.2.2, RFC 4954 §4) and ends it with an error
+/// (`BadResponse`).
 pub async fn read_sasl_response<S: AsyncRead + Unpin>(
     s: &mut S,
     idle: Duration,
 ) -> Result<Zeroizing<String>> {
     let line = read_client_line(s, idle).await?;
     if line.trim() == "*" {
-        return Err(anyhow!("client cancelled authentication"));
+        return Err(anyhow::Error::new(crate::auth::sasl::BadResponse(
+            "client cancelled authentication",
+        )));
     }
     Ok(line)
+}
+
+/// The initial response on a command line (`arg`, the rest after the
+/// mechanism): `None` without one, empty for `=`, which stands for a
+/// zero-length response (RFC 4959 §3, RFC 4954 §4).
+pub fn initial_response(arg: Option<&str>) -> Option<Zeroizing<String>> {
+    arg.filter(|s| !s.is_empty()).map(|s| {
+        Zeroizing::new(if s == "=" {
+            String::new()
+        } else {
+            s.to_owned()
+        })
+    })
+}
+
+/// True if `e` means the client's SASL response was unusable as a message
+/// (not base64, a cancel, a read failure) rather than a wrong credential:
+/// IMAP answers BAD, SMTP 501 (RFC 9051 §6.2.2, RFC 4954 §4).
+pub fn is_bad_response(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<crate::auth::sasl::BadResponse>().is_some()
+        || e.downcast_ref::<LineError>().is_some()
 }
 
 /// One step of the SASL LOGIN dialog: send `prompt` (the protocol's
@@ -173,9 +197,13 @@ where
 }
 
 /// Decode one base64 field of the SASL LOGIN dialog (the username or the
-/// password).
+/// password). A NUL is refused, as in PLAIN (RFC 4616 §2): the backend gets
+/// the credential as PLAIN, where NUL separates the fields.
 pub fn decode_login_field(b64: &str) -> Result<Zeroizing<String>> {
-    let raw = crate::auth::sasl::decode_secret_b64(b64).map_err(|e| anyhow!("LOGIN {e}"))?;
+    let raw = crate::auth::sasl::decode_secret_b64(b64).context("LOGIN")?;
+    if raw.contains(&0) {
+        return Err(anyhow!("LOGIN: NUL in a field"));
+    }
     let text = std::str::from_utf8(&raw).map_err(|e| anyhow!("LOGIN utf8: {e}"))?;
     Ok(Zeroizing::new(text.to_owned()))
 }
@@ -227,6 +255,13 @@ mod tests {
         let pass = sasl_login_step(&mut server, "+", IDLE).await.unwrap();
         zeroized(&pass);
         assert_eq!(*pass, "pw");
+    }
+
+    /// A NUL in a LOGIN field is refused, as in PLAIN.
+    #[test]
+    fn login_field_with_nul_is_refused() {
+        assert_eq!(*decode_login_field("cHc=").unwrap(), "pw");
+        assert!(decode_login_field("cAB3").is_err()); // "p\0w"
     }
 
     /// A long line crosses several buffer growths and comes back intact; each

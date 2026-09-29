@@ -7,6 +7,9 @@ use zeroize::Zeroizing;
 pub struct SaslCreds {
     pub user: String,
     pub token: Zeroizing<String>,
+    /// OAUTHBEARER `host`: the server name the client connected to (RFC
+    /// 7628 §3.1), if it sent one.
+    pub host: Option<String>,
 }
 
 impl std::fmt::Debug for SaslCreds {
@@ -14,70 +17,244 @@ impl std::fmt::Debug for SaslCreds {
         f.debug_struct("SaslCreds")
             .field("user", &self.user)
             .field("token", &"<redacted>")
+            .field("host", &self.host)
             .finish()
     }
 }
 
+/// Whether the OAUTHBEARER `host` names `server`, the name the client asked
+/// for in TLS (SNI): ASCII case-insensitive, a trailing dot ignored.
+pub fn host_matches(host: &str, server: &str) -> bool {
+    let bare = |n: &str| n.strip_suffix('.').unwrap_or(n).to_string();
+    bare(host).eq_ignore_ascii_case(&bare(server))
+}
+
+/// A SASL client response that is not base64, or a cancel (`*`). IMAP
+/// answers it with BAD (RFC 9051 §6.2.2) and SMTP with 501 (RFC 4954 §4); a
+/// response that decodes but holds no valid credential is a failed
+/// authentication instead (IMAP NO, SMTP 535).
+#[derive(Debug)]
+pub struct BadResponse(pub &'static str);
+
+impl std::fmt::Display for BadResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for BadResponse {}
+
 /// Decode base64 that carries a credential into a buffer that is overwritten
-/// when dropped, also when decoding fails half-way. The error names no input
-/// byte: the input is the encoded credential.
+/// when dropped, also when decoding fails half-way. The error (a
+/// `BadResponse`) names no input byte: the input is the encoded credential.
 pub fn decode_secret_b64(b64: &str) -> Result<Zeroizing<Vec<u8>>> {
     let mut raw = Zeroizing::new(Vec::new());
     base64::engine::general_purpose::STANDARD
         .decode_vec(b64.trim(), &mut raw)
         .map_err(|e| {
-            anyhow!(
-                "base64 decode: {}",
-                match e {
-                    base64::DecodeError::InvalidByte(..) => "invalid character",
-                    base64::DecodeError::InvalidLength(_) => "invalid length",
-                    base64::DecodeError::InvalidLastSymbol { .. } => "invalid last symbol",
-                    base64::DecodeError::InvalidPadding => "invalid padding",
+            anyhow::Error::new(BadResponse(match e {
+                base64::DecodeError::InvalidByte(..) => "base64 decode: invalid character",
+                base64::DecodeError::InvalidLength(_) => "base64 decode: invalid length",
+                base64::DecodeError::InvalidLastSymbol { .. } => {
+                    "base64 decode: invalid last symbol"
                 }
-            )
+                base64::DecodeError::InvalidPadding => "base64 decode: invalid padding",
+            }))
         })?;
     Ok(raw)
 }
 
-/// Extract the `auth=Bearer <token>` value from ^A-separated fields. The
-/// scheme name is case-insensitive (RFC 7628 §3.1).
-fn extract_bearer(s: &str) -> Option<Zeroizing<String>> {
-    const PREFIX: &str = "auth=bearer ";
-    s.split('\x01')
-        .find_map(|f| {
-            f.get(..PREFIX.len())
-                .filter(|p| p.eq_ignore_ascii_case(PREFIX))
-                .map(|_| f[PREFIX.len()..].trim())
-        })
-        .filter(|t| !t.is_empty())
-        .map(|t| Zeroizing::new(t.to_owned()))
+/// A SASL mechanism the proxy takes from clients.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mechanism {
+    XOAuth2,
+    OAuthBearer,
+    Plain,
+    Login,
 }
 
+impl Mechanism {
+    /// The mechanism named `name`, ASCII case-insensitive (RFC 4422 §3.1).
+    pub fn parse(name: &str) -> Option<Mechanism> {
+        [
+            ("XOAUTH2", Mechanism::XOAuth2),
+            ("OAUTHBEARER", Mechanism::OAuthBearer),
+            ("PLAIN", Mechanism::Plain),
+            ("LOGIN", Mechanism::Login),
+        ]
+        .into_iter()
+        .find_map(|(n, m)| n.eq_ignore_ascii_case(name).then_some(m))
+    }
+}
+
+/// Longest SASL user a client may name (XOAUTH2 `user=`, OAUTHBEARER `a=`),
+/// the same bound as for a legacy login.
+pub const MAX_SASL_USER: usize = 255;
+
+/// A client-named SASL user as the proxy takes it: at most `MAX_SASL_USER`
+/// bytes, no control characters. It is compared with the token's identity
+/// and logged; a longer or controlled one is malformed.
+fn check_sasl_user(user: String) -> Result<String> {
+    if user.len() > MAX_SASL_USER {
+        return Err(anyhow!("SASL user longer than {MAX_SASL_USER} bytes"));
+    }
+    if user.chars().any(char::is_control) {
+        return Err(anyhow!("control character in the SASL user"));
+    }
+    Ok(user)
+}
+
+/// The authzid of the GS2 header that starts an OAUTHBEARER response (RFC
+/// 7628 §3.1, RFC 5801 §4): `gs2-cbind-flag "," [ "a=" saslname ] ","`,
+/// empty without one. The flag must be `n` or `y`: OAUTHBEARER has no
+/// channel binding, so `p=` is refused. In the saslname `=2C` and `=3D`
+/// stand for `,` and `=`; any other `=` and a raw `,` are malformed.
+fn gs2_authzid(field: &str) -> Result<String> {
+    let (flag, rest) = field
+        .split_once(',')
+        .ok_or_else(|| anyhow!("GS2 header without flag"))?;
+    match flag {
+        "n" | "y" => {}
+        f if f.starts_with("p=") => return Err(anyhow!("GS2 channel binding not supported")),
+        _ => return Err(anyhow!("GS2 header with an unknown flag")),
+    }
+    let authzid = rest
+        .strip_suffix(',')
+        .ok_or_else(|| anyhow!("GS2 header not terminated"))?;
+    if authzid.is_empty() {
+        return Ok(String::new());
+    }
+    let name = authzid
+        .strip_prefix("a=")
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| anyhow!("GS2 authzid malformed"))?;
+    let mut out = String::with_capacity(name.len());
+    let mut chars = name.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '=' => {
+                let code: String = chars.by_ref().take(2).collect();
+                match code.to_ascii_uppercase().as_str() {
+                    "2C" => out.push(','),
+                    "3D" => out.push('='),
+                    _ => return Err(anyhow!("GS2 authzid with a bad escape")),
+                }
+            }
+            ',' => return Err(anyhow!("GS2 authzid malformed")),
+            c => out.push(c),
+        }
+    }
+    Ok(out)
+}
+
+/// An OAuth response whose `auth` value is empty (`auth=`, or the Bearer
+/// scheme without a token): the client asks which IdP and scope to use
+/// (RFC 7628 §4.3). It carries no credential. `user` is the SASL user it
+/// named; `tag` is set by the IMAP dialog to the command's tag.
+#[derive(Debug)]
+pub struct Discovery {
+    pub mech: String,
+    pub user: String,
+    pub tag: String,
+}
+
+impl std::fmt::Display for Discovery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("empty auth value: a discovery request (RFC 7628 §4.3)")
+    }
+}
+
+impl std::error::Error for Discovery {}
+
+/// The `auth` field of an OAuth response.
+enum Auth {
+    Bearer(Zeroizing<String>),
+    /// Empty, or the Bearer scheme without a token (`Discovery`).
+    Empty,
+    /// No `auth` field, or another scheme.
+    Missing,
+}
+
+/// The first `auth=` of the ^A-separated fields. `auth` carries what the
+/// HTTP Authorization header would (RFC 7628 §3.1), whose scheme name is
+/// case-insensitive (RFC 9110 §11.1).
+fn extract_bearer(s: &str) -> Auth {
+    let Some(value) = s.split('\x01').find_map(|f| {
+        f.get(..5)
+            .filter(|k| k.eq_ignore_ascii_case("auth="))
+            .map(|_| f[5..].trim())
+    }) else {
+        return Auth::Missing;
+    };
+    if value.is_empty() {
+        return Auth::Empty;
+    }
+    let is_bearer = value
+        .get(..6)
+        .is_some_and(|s| s.eq_ignore_ascii_case("bearer"));
+    match value.get(6..) {
+        Some(rest) if is_bearer && rest.trim().is_empty() => Auth::Empty,
+        Some(rest) if is_bearer && rest.starts_with(' ') => {
+            Auth::Bearer(Zeroizing::new(rest.trim().to_owned()))
+        }
+        _ => Auth::Missing,
+    }
+}
+
+/// The user and token of an XOAUTH2 or OAUTHBEARER response. An empty
+/// `auth` value is the error `Discovery`.
 pub fn parse_sasl(mechanism: &str, b64_ir: &str) -> Result<SaslCreds> {
     let raw = decode_secret_b64(b64_ir)?;
     let s = std::str::from_utf8(&raw).map_err(|e| anyhow!("utf8: {e}"))?;
-    let token = extract_bearer(s).ok_or_else(|| anyhow!("no bearer token in SASL"))?;
-    let user = match mechanism.to_ascii_uppercase().as_str() {
-        "XOAUTH2" => s
-            .split('\x01')
-            .find_map(|f| f.strip_prefix("user=").map(|u| u.to_string()))
-            .ok_or_else(|| anyhow!("no user= in XOAUTH2"))?,
-        // gs2 header: n,a=<user>, — the authzid is optional (RFC 7628 §3.1,
-        // `n,,`). It is checked against the token's identity
-        // (`authzid_allowed`); the mailbox comes from the token.
-        "OAUTHBEARER" => {
-            let first = s.split('\x01').next().unwrap_or("");
-            first
-                .split(',')
-                .find_map(|p| p.strip_prefix("a=").map(|u| u.to_string()))
-                .unwrap_or_default()
-        }
-        m => return Err(anyhow!("unsupported mechanism {m}")),
+    let token = match extract_bearer(s) {
+        Auth::Bearer(token) => Some(token),
+        Auth::Empty => None,
+        Auth::Missing => return Err(anyhow!("no bearer token in SASL")),
     };
-    if user.is_empty() && mechanism.eq_ignore_ascii_case("XOAUTH2") {
-        return Err(anyhow!("empty user"));
+    let user = match Mechanism::parse(mechanism) {
+        Some(Mechanism::XOAuth2) => {
+            let user = s
+                .split('\x01')
+                .find_map(|f| f.strip_prefix("user=").map(|u| u.to_string()))
+                .ok_or_else(|| anyhow!("no user= in XOAUTH2"))?;
+            if user.is_empty() {
+                return Err(anyhow!("empty user"));
+            }
+            user
+        }
+        // The authzid is optional (RFC 7628 §3.1, `n,,`). It is checked
+        // against the token's identity (`authzid_allowed`); the mailbox comes
+        // from the token.
+        Some(Mechanism::OAuthBearer) => gs2_authzid(s.split('\x01').next().unwrap_or(""))?,
+        Some(Mechanism::Plain | Mechanism::Login) | None => {
+            return Err(anyhow!("not an OAuth mechanism"))
+        }
+    };
+    let user = check_sasl_user(user)?;
+    // OAUTHBEARER kvpairs follow the GS2 header; XOAUTH2 has no host.
+    let host = match Mechanism::parse(mechanism) {
+        Some(Mechanism::OAuthBearer) => s
+            .split('\x01')
+            .skip(1)
+            .find_map(|f| f.strip_prefix("host="))
+            .map(|h| {
+                if h.is_empty() || h.len() > 255 || !h.bytes().all(|b| b.is_ascii_graphic()) {
+                    Err(anyhow!("malformed host"))
+                } else {
+                    Ok(h.to_string())
+                }
+            })
+            .transpose()?,
+        _ => None,
+    };
+    match token {
+        Some(token) => Ok(SaslCreds { user, token, host }),
+        None => Err(anyhow::Error::new(Discovery {
+            mech: mechanism.to_string(),
+            user,
+            tag: String::new(),
+        })),
     }
-    Ok(SaslCreds { user, token })
 }
 
 /// Whether a client may name `authzid` (XOAUTH2 `user=`, OAUTHBEARER `a=`)
@@ -151,6 +328,11 @@ pub fn parse_plain(b64_ir: &str) -> Result<(String, Zeroizing<String>)> {
     let passwd = it
         .next()
         .ok_or_else(|| anyhow!("PLAIN: missing passwd (NUL-separated)"))?;
+    // RFC 4616 §2: NUL MUST NOT appear in authzid, authcid or passwd; the
+    // split leaves any further NUL in the password.
+    if passwd.contains(&0) {
+        return Err(anyhow!("PLAIN: NUL in the password"));
+    }
     if !authzid.is_empty() && authzid != authcid {
         return Err(anyhow!(
             "PLAIN: authorization identity differs from the login"
@@ -250,6 +432,144 @@ mod tests {
         assert!(parse_plain(&two).is_err());
         let empty_pw = base64::engine::general_purpose::STANDARD.encode("\0user\0");
         assert!(parse_plain(&empty_pw).is_err());
+    }
+
+    /// RFC 4616 §2: NUL must not appear in the password (the split leaves
+    /// any further NUL there).
+    #[test]
+    fn plain_nul_in_password_rejected() {
+        let ir = base64::engine::general_purpose::STANDARD.encode("\0user\0pa\0ss");
+        assert!(parse_plain(&ir).is_err());
+        let ir = base64::engine::general_purpose::STANDARD.encode("\0user\0pass\0");
+        assert!(parse_plain(&ir).is_err());
+    }
+
+    /// The GS2 header of OAUTHBEARER (RFC 7628 §3.1, RFC 5801 §4).
+    #[test]
+    fn oauthbearer_gs2_header() {
+        let parse = |gs2: &str| {
+            let raw = format!("{gs2}\x01auth=Bearer T\x01\x01");
+            let ir = base64::engine::general_purpose::STANDARD.encode(raw);
+            parse_sasl("OAUTHBEARER", &ir).map(|c| c.user)
+        };
+        assert_eq!(parse("n,,").unwrap(), "");
+        assert_eq!(parse("y,,").unwrap(), "");
+        assert_eq!(parse("n,a=bob@y.tld,").unwrap(), "bob@y.tld");
+        assert_eq!(parse("n,a=a=2Cb=3Dc=2c,").unwrap(), "a,b=c,");
+        for bad in [
+            "p=tls-unique,,",
+            "p=tls-unique,a=bob@y.tld,",
+            "x,,",
+            ",,",
+            "n,",
+            "n,a=bob@y.tld",
+            "n,a=,",
+            "n,b=bob,",
+            "n,a=bo,b,",
+            "n,a=bob=2,",
+            "n,a=bob=41,",
+            "n,a=bob,extra,",
+            "",
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// A client-named SASL user is bounded and has no control characters.
+    #[test]
+    fn sasl_user_is_checked() {
+        let xoauth2 = |user: &str| {
+            let ir = base64::engine::general_purpose::STANDARD
+                .encode(format!("user={user}\x01auth=Bearer T\x01\x01"));
+            parse_sasl("XOAUTH2", &ir)
+        };
+        assert!(xoauth2(&"a".repeat(MAX_SASL_USER)).is_ok());
+        assert!(xoauth2(&"a".repeat(MAX_SASL_USER + 1)).is_err());
+        assert!(xoauth2("bob\x1b[2J@y.tld").is_err());
+        assert!(xoauth2("bob\n@y.tld").is_err());
+        let ir = base64::engine::general_purpose::STANDARD
+            .encode("n,a=bob\x7f@y.tld,\x01auth=Bearer T\x01\x01");
+        assert!(parse_sasl("OAUTHBEARER", &ir).is_err());
+    }
+
+    /// An empty `auth` value is a discovery request (RFC 7628 §4.3), not a
+    /// parse error; another scheme or no `auth` field stays one.
+    #[test]
+    fn empty_auth_is_discovery() {
+        let parse = |mech: &str, raw: &str| {
+            parse_sasl(mech, &base64::engine::general_purpose::STANDARD.encode(raw))
+        };
+        for (mech, raw) in [
+            ("OAUTHBEARER", "n,a=bob@y.tld,\x01host=h\x01auth=\x01\x01"),
+            ("OAUTHBEARER", "n,,\x01auth=Bearer\x01\x01"),
+            ("XOAUTH2", "user=bob@y.tld\x01auth=Bearer \x01\x01"),
+            ("XOAUTH2", "user=bob@y.tld\x01AUTH=bearer   \x01\x01"),
+        ] {
+            let e = parse(mech, raw).unwrap_err();
+            let d = e.downcast_ref::<Discovery>().expect(raw);
+            assert_eq!(d.mech, mech);
+        }
+        assert_eq!(
+            parse("OAUTHBEARER", "n,a=bob@y.tld,\x01auth=\x01\x01")
+                .unwrap_err()
+                .downcast_ref::<Discovery>()
+                .unwrap()
+                .user,
+            "bob@y.tld"
+        );
+        for raw in [
+            "user=bob\x01auth=Basic eDp5\x01\x01",
+            "user=bob\x01auth=BearerX T\x01\x01",
+            "user=bob\x01\x01",
+        ] {
+            let e = parse("XOAUTH2", raw).unwrap_err();
+            assert!(!e.is::<Discovery>(), "{raw:?}");
+        }
+        assert_eq!(
+            *parse("XOAUTH2", "user=bob\x01AUTH=BEARER T1\x01\x01")
+                .unwrap()
+                .token,
+            "T1"
+        );
+    }
+
+    /// The OAUTHBEARER `host` is read from the kvpairs and compared with
+    /// the SNI name ASCII case-insensitively, a trailing dot ignored.
+    #[test]
+    fn oauthbearer_host() {
+        let parse = |raw: &str| {
+            parse_sasl(
+                "OAUTHBEARER",
+                &base64::engine::general_purpose::STANDARD.encode(raw),
+            )
+        };
+        let c = parse("n,,\x01host=Mail.Example.org\x01port=993\x01auth=Bearer T\x01\x01").unwrap();
+        assert_eq!(c.host.as_deref(), Some("Mail.Example.org"));
+        assert_eq!(parse("n,,\x01auth=Bearer T\x01\x01").unwrap().host, None);
+        for bad in ["host=", "host=a b", "host=a\x7f"] {
+            assert!(parse(&format!("n,,\x01{bad}\x01auth=Bearer T\x01\x01")).is_err());
+        }
+        // XOAUTH2 has no host field.
+        let ir = build_xoauth2("u@x", "T");
+        assert_eq!(parse_sasl("XOAUTH2", &ir).unwrap().host, None);
+        assert!(host_matches("Mail.Example.org", "mail.example.org"));
+        assert!(host_matches("mail.example.org.", "mail.example.org"));
+        assert!(!host_matches("mail.example.org", "imap.example.org"));
+        assert!(!host_matches("mail.example.org.evil", "mail.example.org"));
+    }
+
+    #[test]
+    fn mechanism_names() {
+        assert_eq!(Mechanism::parse("xoauth2"), Some(Mechanism::XOAuth2));
+        assert_eq!(
+            Mechanism::parse("OAuthBearer"),
+            Some(Mechanism::OAuthBearer)
+        );
+        assert_eq!(Mechanism::parse("PLAIN"), Some(Mechanism::Plain));
+        assert_eq!(Mechanism::parse("login"), Some(Mechanism::Login));
+        assert_eq!(Mechanism::parse("CRAM-MD5"), None);
+        assert_eq!(Mechanism::parse("PLAINX"), None);
+        assert!(parse_sasl("PLAIN", &build_xoauth2("u@x", "T")).is_err());
     }
 
     #[test]

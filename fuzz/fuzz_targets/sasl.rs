@@ -65,7 +65,9 @@ fuzz_target!(|data: &[u8]| {
     let b = String::from_utf8_lossy(b).into_owned();
 
     // XOAUTH2: what the proxy builds for the backend parses back to itself.
-    let user: String = a.chars().filter(|&c| c != '\x01').collect();
+    // The parser refuses a user with control characters (\x01 included) or
+    // over 255 bytes.
+    let user: String = a.chars().filter(|&c| !c.is_control()).take(63).collect();
     let token: String = b.chars().filter(|&c| c != '\x01').collect();
     let token = token.trim();
     if !user.is_empty() && !token.is_empty() {
@@ -73,12 +75,13 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!((c.user.as_str(), c.token.as_str()), (user.as_str(), token));
     }
 
-    // PLAIN: the same for the password path. NUL separates the fields
-    // (RFC 4616), so a login never contains one.
+    // PLAIN: the same for the password path. NUL separates the fields and
+    // must not appear in any of them (RFC 4616 §2).
     let login: String = a.chars().filter(|&c| c != '\0').collect();
-    if !login.is_empty() && !b.is_empty() {
-        let (u, p) = parse_plain(&build_plain(&login, &b)).expect("PLAIN roundtrip");
-        assert_eq!((u.as_str(), p.as_str()), (login.as_str(), b.as_str()));
+    let pass: String = b.chars().filter(|&c| c != '\0').collect();
+    if !login.is_empty() && !pass.is_empty() {
+        let (u, p) = parse_plain(&build_plain(&login, &pass)).expect("PLAIN roundtrip");
+        assert_eq!((u.as_str(), p.as_str()), (login.as_str(), pass.as_str()));
     }
 
     // authzid rule (RFC 4422 §3.6): empty and the identity itself always

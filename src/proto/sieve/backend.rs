@@ -21,22 +21,38 @@ use zeroize::Zeroizing;
 /// Caching them means an unauthenticated client never causes a backend
 /// connection, which would hold a Dovecot login process and a backend TLS
 /// session for up to the pre-auth budget per TLS handshake on 4190. Only a
-/// cache miss (once per TTL) opens a probe connection.
+/// cache miss (once per TTL) opens a probe connection, one at a time; after a
+/// failed probe the next one waits `PROBE_RETRY`.
 #[derive(Default)]
-pub struct CapsCache(RwLock<Option<(Instant, Arc<Vec<String>>)>>);
+pub struct CapsCache {
+    caps: RwLock<Option<(Instant, Arc<Vec<String>>)>>,
+    /// Held while a probe runs; the time of the last failed probe.
+    probe: tokio::sync::Mutex<Option<Instant>>,
+}
+
+/// How long after a failed capability probe the next one may start.
+const PROBE_RETRY: Duration = Duration::from_secs(5);
 
 impl CapsCache {
     /// The backend's `"SIEVE"` capability line from the last successful probe,
-    /// whatever its age. The pre-TLS greeting must list SIEVE (RFC 5804 §1.7)
-    /// but must not open a backend connection for an unencrypted client, so
-    /// it is missing until the first probe after startup.
+    /// whatever its age. The pre-TLS greeting must list SIEVE (RFC 5804 §1.7);
+    /// `sieve::handle` waits for a probe while there is none (right after
+    /// startup).
     pub fn sieve_line(&self) -> Option<String> {
-        let caps = self.0.read().unwrap_or_else(|p| p.into_inner());
+        let caps = self.caps.read().unwrap_or_else(|p| p.into_inner());
         caps.as_ref()?
             .1
             .iter()
-            .find(|l| l.to_ascii_uppercase().starts_with("\"SIEVE\""))
+            .find(|l| is_cap(l, "SIEVE"))
             .cloned()
+    }
+
+    /// The cached capabilities if they are younger than `ttl`.
+    fn fresh(&self, ttl: Duration) -> Option<Arc<Vec<String>>> {
+        let caps = self.caps.read().unwrap_or_else(|p| p.into_inner());
+        caps.as_ref()
+            .filter(|(at, _)| at.elapsed() < ttl)
+            .map(|(_, caps)| caps.clone())
     }
 }
 
@@ -61,19 +77,35 @@ pub(super) async fn backend_session(
 }
 
 /// The backend's post-TLS capabilities, from the cache or a probe session.
+///
+/// One probe at a time: a caller that waited for another's probe finds the
+/// cache filled, or its failure. A failed probe counts in `backend_errors`;
+/// for `PROBE_RETRY` after it, callers fail without contacting the backend.
 pub(super) async fn backend_caps(sieve: &Sieve, tuning: &Tuning) -> Result<Arc<Vec<String>>> {
-    if let Some((at, caps)) = sieve
-        .caps
-        .0
-        .read()
-        .unwrap_or_else(|p| p.into_inner())
-        .as_ref()
-    {
-        if at.elapsed() < sieve.caps_ttl {
-            return Ok(caps.clone());
+    if let Some(caps) = sieve.caps.fresh(sieve.caps_ttl) {
+        return Ok(caps);
+    }
+    let mut last_failure = sieve.caps.probe.lock().await;
+    if let Some(caps) = sieve.caps.fresh(sieve.caps_ttl) {
+        return Ok(caps);
+    }
+    if let Some(at) = *last_failure {
+        if at.elapsed() < PROBE_RETRY {
+            return Err(anyhow!(
+                "backend capability probe failed {}s ago",
+                at.elapsed().as_secs()
+            ));
         }
     }
-    let (mut be, caps) = backend_session(&sieve.backend, None, tuning).await?;
+    let (mut be, caps) = match backend_session(&sieve.backend, None, tuning).await {
+        Ok(v) => v,
+        Err(e) => {
+            *last_failure = Some(Instant::now());
+            crate::obs::metrics::record_backend_error(crate::obs::metrics::Proto::Sieve);
+            return Err(e.context("backend capability probe"));
+        }
+    };
+    *last_failure = None;
     // End the probe politely; it carries no credential.
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
         be.write_all(b"LOGOUT\r\n").await?;
@@ -81,7 +113,8 @@ pub(super) async fn backend_caps(sieve: &Sieve, tuning: &Tuning) -> Result<Arc<V
     })
     .await;
     let caps = Arc::new(caps);
-    *sieve.caps.0.write().unwrap_or_else(|p| p.into_inner()) = Some((Instant::now(), caps.clone()));
+    *sieve.caps.caps.write().unwrap_or_else(|p| p.into_inner()) =
+        Some((Instant::now(), caps.clone()));
     Ok(caps)
 }
 
@@ -106,22 +139,85 @@ impl BackendLogin for SieveLogin<'_> {
                 ("PLAIN", crate::auth::sasl::build_plain(user, pass))
             }
         };
-        // `concat` sizes the line once; it is zeroized on drop like the response.
-        let auth_line =
-            Zeroizing::new(["AUTHENTICATE \"", mech, "\" \"", &response, "\"\r\n"].concat());
-        let (mut be, _caps) = backend_session(self.backend, Some(self.origin), self.tuning).await?;
+        // A quoted string holds at most 1024 octets (RFC 5804 §4); a longer
+        // response (any sizable token) goes as a literal `{n+}`. `concat`
+        // sizes the line once; it is zeroized on drop like the response.
+        let auth_line = if response.len() <= 1024 {
+            Zeroizing::new(["AUTHENTICATE \"", mech, "\" \"", &response, "\"\r\n"].concat())
+        } else {
+            let len = response.len().to_string();
+            Zeroizing::new(
+                [
+                    "AUTHENTICATE \"",
+                    mech,
+                    "\" {",
+                    &len,
+                    "+}\r\n",
+                    &response,
+                    "\r\n",
+                ]
+                .concat(),
+            )
+        };
+        let (mut be, caps) = backend_session(self.backend, Some(self.origin), self.tuning).await?;
+        // Checked before the credential is sent.
+        if caps.iter().any(|l| is_cap(l, "UNAUTHENTICATE")) {
+            return Err(anyhow!(crate::auth::UNAUTHENTICATE_OFFERED).into());
+        }
         be.write_all(auth_line.as_bytes()).await?;
         // The backend's reply; it is forwarded verbatim on OK.
         let be_reply = read_line(&mut be, self.tuning.idle).await?;
-        // `NO (TRYLATER)` (RFC 5804) is a temporary failure: an outage.
-        if be_reply.to_ascii_uppercase().starts_with("NO (TRYLATER)") {
-            return Err(anyhow!("backend temporarily unavailable: {be_reply}").into());
+        match classify_auth_reply(&be_reply) {
+            AuthReply::Ok => Ok((be, be_reply)),
+            AuthReply::Rejected => Err(BackendError::Rejected(be_reply)),
+            AuthReply::Unavailable => {
+                Err(anyhow!("backend temporarily unavailable: {be_reply}").into())
+            }
         }
-        if !be_reply.to_ascii_uppercase().starts_with("OK") {
-            return Err(BackendError::Rejected(be_reply));
-        }
-        Ok((be, be_reply))
     }
+}
+
+/// What the backend's reply to `AUTHENTICATE` means.
+#[derive(Debug, PartialEq, Eq)]
+enum AuthReply {
+    Ok,
+    /// A verdict on the credential.
+    Rejected,
+    /// No verdict: an outage.
+    Unavailable,
+}
+
+/// Classify the reply to `AUTHENTICATE`, case-insensitively.
+///
+/// - `OK`: logged in.
+/// - `NO (TRYLATER)` (RFC 5804 §1.3): a temporary failure, an outage.
+/// - `BYE` (RFC 5804 §1.3: the server is closing the connection, e.g. on
+///   shutdown or a connection limit): an outage, unless it carries
+///   `AUTH-TOO-WEAK` or `TRANSITION-NEEDED`, which judge the credential.
+///   Counting an outage as a rejection would feed the rate limit and CrowdSec
+///   bans against legitimate users.
+/// - Any other `NO` (and anything unexpected): a rejection.
+fn classify_auth_reply(reply: &str) -> AuthReply {
+    let upper = reply.to_ascii_uppercase();
+    if upper.starts_with("OK") {
+        AuthReply::Ok
+    } else if upper.starts_with("NO (TRYLATER)")
+        || (upper.starts_with("BYE")
+            && !upper.starts_with("BYE (AUTH-TOO-WEAK)")
+            && !upper.starts_with("BYE (TRANSITION-NEEDED)"))
+    {
+        AuthReply::Unavailable
+    } else {
+        AuthReply::Rejected
+    }
+}
+
+/// True if the capability line `line` names capability `name`: its first
+/// string, ASCII case-insensitive (`"SASL" "PLAIN"` is `SASL`).
+pub(super) fn is_cap(line: &str, name: &str) -> bool {
+    line.strip_prefix('"')
+        .and_then(|l| l.split_once('"'))
+        .is_some_and(|(cap, _)| cap.eq_ignore_ascii_case(name))
 }
 
 /// Most capability lines accepted from the backend. Pigeonhole sends a
@@ -193,6 +289,29 @@ mod tests {
             .is_err());
     }
 
+    /// A `BYE` is an outage, not a verdict on the credential.
+    #[test]
+    fn auth_reply_classification() {
+        use AuthReply::*;
+        for (reply, want) in [
+            ("OK \"Logged in.\"", Ok),
+            ("ok", Ok),
+            ("NO \"Authentication failed.\"", Rejected),
+            (
+                "NO (TRYLATER) \"Temporary authentication failure.\"",
+                Unavailable,
+            ),
+            ("BYE \"Server shutting down.\"", Unavailable),
+            ("bye \"Too many connections\"", Unavailable),
+            ("BYE", Unavailable),
+            ("BYE (AUTH-TOO-WEAK) \"x\"", Rejected),
+            ("BYE (TRANSITION-NEEDED) \"x\"", Rejected),
+            ("garbage", Rejected),
+        ] {
+            assert_eq!(classify_auth_reply(reply), want, "{reply}");
+        }
+    }
+
     /// read_caps_until_ok returns error on NO.
     #[tokio::test]
     async fn drain_caps_errors_on_no() {
@@ -204,9 +323,10 @@ mod tests {
             .is_err());
     }
 
-    /// A Pigeonhole capability block through `read_caps_until_ok` and a copy
-    /// of the relay rule of `sieve::handle`: SIEVE, IMPLEMENTATION and NOTIFY
-    /// kept, SASL rewritten, STARTTLS dropped.
+    /// A Pigeonhole capability block through `read_caps_until_ok` and the
+    /// relay rule of `sieve::handle` (`rewrite_caps`): SIEVE, IMPLEMENTATION,
+    /// NOTIFY and VERSION kept in order, SASL rewritten to what the endpoint
+    /// offers, STARTTLS and UNAUTHENTICATE dropped.
     #[tokio::test]
     async fn cap_rewrite_keeps_sieve_rewrites_sasl_drops_starttls() {
         use std::io::Cursor;
@@ -216,6 +336,7 @@ mod tests {
             "\"NOTIFY\" \"mailto\"\r\n",
             "\"SASL\" \"OAUTHBEARER XOAUTH2 LOGIN PLAIN\"\r\n",
             "\"STARTTLS\"\r\n",
+            "\"unauthenticate\"\r\n",
             "\"VERSION\" \"1.0\"\r\n",
             "OK \"TLS negotiation successful.\"\r\n",
         );
@@ -223,54 +344,27 @@ mod tests {
         let caps = read_caps_until_ok(&mut cursor, Duration::from_secs(30))
             .await
             .unwrap();
+        let kept = concat!(
+            "\"IMPLEMENTATION\" \"Dovecot Pigeonhole\"\r\n",
+            "\"SIEVE\" \"fileinto reject envelope vacation\"\r\n",
+            "\"NOTIFY\" \"mailto\"\r\n",
+        );
+        assert_eq!(
+            super::super::rewrite_caps(&caps, false),
+            format!("{kept}\"SASL\" \"XOAUTH2 OAUTHBEARER\"\r\n\"VERSION\" \"1.0\"\r\n")
+        );
+        assert_eq!(
+            super::super::rewrite_caps(&caps, true),
+            format!("{kept}\"SASL\" \"XOAUTH2 OAUTHBEARER PLAIN\"\r\n\"VERSION\" \"1.0\"\r\n")
+        );
+    }
 
-        let mut output_lines: Vec<String> = Vec::new();
-        for cap_line in &caps {
-            let upper = cap_line.to_ascii_uppercase();
-            if upper.starts_with("\"STARTTLS\"") {
-                continue;
-            }
-            if upper.starts_with("\"SASL\"") {
-                output_lines.push("\"SASL\" \"XOAUTH2 OAUTHBEARER\"".to_string());
-            } else {
-                output_lines.push(cap_line.clone());
-            }
-        }
-
-        assert!(
-            output_lines
-                .iter()
-                .any(|l| l.contains("\"SIEVE\"") && l.contains("fileinto")),
-            "SIEVE capability must be forwarded: {output_lines:?}"
-        );
-        assert!(
-            output_lines
-                .iter()
-                .any(|l| l.contains("\"IMPLEMENTATION\"")),
-            "IMPLEMENTATION capability must be forwarded"
-        );
-        assert!(
-            output_lines.iter().any(|l| l.contains("\"NOTIFY\"")),
-            "NOTIFY capability must be forwarded"
-        );
-        assert!(
-            output_lines
-                .iter()
-                .any(|l| l == "\"SASL\" \"XOAUTH2 OAUTHBEARER\""),
-            "SASL must be rewritten to OAuth-only: {output_lines:?}"
-        );
-        assert!(
-            !output_lines.iter().any(|l| {
-                let u = l.to_ascii_uppercase();
-                u.starts_with("\"SASL\"") && (u.contains("LOGIN") || u.contains("PLAIN"))
-            }),
-            "SASL must not contain LOGIN/PLAIN: {output_lines:?}"
-        );
-        assert!(
-            !output_lines
-                .iter()
-                .any(|l| l.to_ascii_uppercase().starts_with("\"STARTTLS\"")),
-            "STARTTLS must be dropped: {output_lines:?}"
-        );
+    #[test]
+    fn capability_names() {
+        assert!(is_cap("\"SASL\" \"PLAIN\"", "SASL"));
+        assert!(is_cap("\"starttls\"", "STARTTLS"));
+        assert!(!is_cap("\"SASLX\" \"PLAIN\"", "SASL"));
+        assert!(!is_cap("SASL", "SASL"));
+        assert!(!is_cap("\"SASL", "SASL"));
     }
 }

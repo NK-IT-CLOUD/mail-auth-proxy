@@ -5,6 +5,7 @@ mod backend;
 pub(crate) mod preauth;
 
 use crate::auth::discovery::{self, Answer};
+use crate::auth::token::TokenError;
 use crate::auth::{self, refused, sasl};
 use crate::limits;
 use crate::obs::{authlog, metrics};
@@ -52,37 +53,6 @@ pub async fn handle(
     // mechanisms the legacy gate offers on this connection; none → OAuth-only.
     let sni = client.get_ref().1.server_name().map(|s| s.to_string());
     let pw_mechs = ctx.password_mechs(metrics::Proto::Imap, sni.as_deref(), peer);
-    let auth = match wire::deadline_at(
-        preauth_until,
-        tuning.preauth,
-        "imap pre-auth",
-        read_client_auth(&mut client, pw_mechs, ctx.hostname(), tuning),
-    )
-    .await
-    {
-        Ok(Some(a)) => a,
-        // LOGOUT, or a disconnect right after the greeting, before
-        // authenticating: a clean end, e.g. a monitoring probe.
-        Ok(None) => return Ok(()),
-        Err(e) => {
-            // No credential was presented: a `protocol` record and a
-            // pre-auth abort, not a failed login.
-            authlog::AuthEvent {
-                proto: metrics::Proto::Imap,
-                scope,
-                mech: "other",
-                user: "",
-                peer: peer.ip(),
-                reason: authlog::Reason::Protocol,
-                pwfp: "",
-                rule: "",
-            }
-            .record();
-            metrics::record_preauth_abort(metrics::Proto::Imap, internal);
-            return Err(e);
-        }
-    };
-
     let session = auth::Session {
         proto: metrics::Proto::Imap,
         peer,
@@ -90,20 +60,66 @@ pub async fn handle(
         scope,
         sni: sni.as_deref(),
         pw_mechs,
+        preauth_until,
     };
-    let login = backend::ImapLogin {
-        backend: &ctx.protocol.backend,
-        tuning,
-        peer,
-        local,
-        mech: &auth.mech,
+    let (tag, mech, is_password, outcome) = match wire::deadline_at(
+        preauth_until,
+        tuning.preauth,
+        "imap pre-auth",
+        read_client_auth(&mut client, pw_mechs, ctx.hostname(), tuning),
+    )
+    .await
+    {
+        Ok(Some(auth)) => {
+            let login = backend::ImapLogin {
+                backend: &ctx.protocol.backend,
+                tuning,
+                peer,
+                local,
+                mech: &auth.mech,
+            };
+            let is_password = matches!(auth.kind, sasl::ClientAuthKind::Password { .. });
+            let host = auth.host.as_deref();
+            let outcome =
+                auth::authorize(&ctx, &session, &auth.mech, &auth.kind, host, &login).await;
+            // The credential is not needed after the login: dropping it
+            // zeroizes it before the splice, which can last for hours.
+            drop(auth.kind);
+            (auth.tag, auth.mech, is_password, outcome)
+        }
+        // LOGOUT, or a disconnect right after the greeting, before
+        // authenticating: a clean end, e.g. a monitoring probe.
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            // Answered already; recorded like a blocked password.
+            if let Some(w) = e.downcast_ref::<auth::Withheld>() {
+                return Err(auth::withheld(&ctx, &session, w));
+            }
+            // Answered with the error result like a rejected token.
+            if let Some(d) = e.downcast_ref::<sasl::Discovery>() {
+                auth::discovery(&session, d);
+                let asked = auth::Outcome::BadToken(TokenError::Invalid(d.to_string()));
+                (d.tag.clone(), d.mech.clone(), false, asked)
+            } else {
+                // No credential was presented: a `protocol` record and a
+                // pre-auth abort, not a failed login.
+                authlog::AuthEvent {
+                    proto: metrics::Proto::Imap,
+                    scope,
+                    mech: "other",
+                    user: "",
+                    peer: peer.ip(),
+                    reason: authlog::Reason::Protocol,
+                    pwfp: "",
+                    rule: "",
+                }
+                .record();
+                metrics::record_preauth_abort(metrics::Proto::Imap, internal);
+                return Err(e);
+            }
+        }
     };
-    let is_password = matches!(auth.kind, sasl::ClientAuthKind::Password { .. });
-    let tag = &auth.tag;
-    let outcome = auth::authorize(&ctx, &session, &auth.mech, &auth.kind, &login).await;
-    // The credential is not needed after the login: dropping it zeroizes it
-    // before the splice, which can last for hours.
-    drop(auth.kind);
+    let tag = &tag;
     let (reply, error) = match outcome {
         auth::Outcome::Ok {
             conn: (mut be, logged_in),
@@ -134,8 +150,7 @@ pub async fn handle(
         auth::Outcome::BadToken(e) => {
             let prompt = format!("+ {}", ctx.error_challenge.base64());
             let answer =
-                discovery::complete_line(&mut client, &prompt, &auth.mech, preauth_until, tuning)
-                    .await;
+                discovery::complete_line(&mut client, &prompt, &mech, preauth_until, tuning).await;
             let reply = match answer {
                 Ok(Answer::Cancelled | Answer::Undecodable) => {
                     format!("{tag} BAD AUTHENTICATE failed: invalid or cancelled response")

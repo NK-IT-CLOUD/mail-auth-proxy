@@ -13,8 +13,8 @@
 //! - `MockBackend`: records what each backend connection carried (PROXY v2
 //!   header, XCLIENT, mechanism, decoded login and secret, relayed lines). The
 //!   verdict is chosen by the login: `reject…` → rejected, `slowreject…` →
-//!   rejected after `SLOW_REJECT`, `unavail…` →
-//!   temporary failure, `garbled…` → SMTP `501` / IMAP `BAD`, anything else →
+//!   rejected after `SLOW_REJECT`, `stall…` → accepted after `STALL`,
+//!   `unavail…` → temporary failure, `garbled…` → SMTP `501` / IMAP `BAD`, anything else →
 //!   accepted, then every line is echoed as `ECHO <line>` until the line
 //!   `BACKEND-CLOSE`, on which the backend drops the connection. A rejected XOAUTH2
 //!   login first gets an error challenge (IMAP `+ <json>`, SMTP `334 <json>`)
@@ -91,10 +91,17 @@ pub fn xoauth2(user: &str, token: &str) -> String {
     b64(format!("user={user}\x01auth=Bearer {token}\x01\x01"))
 }
 
-/// SASL OAUTHBEARER initial response (base64), GS2 authzid `a=<user>`.
+/// SASL OAUTHBEARER initial response (base64), GS2 authzid `a=<user>`, or
+/// none (`n,,`, RFC 5801 §4) for an empty `user`. No `host` (optional, RFC
+/// 7628 §3.1): the proxy checks it against the SNI, which the caller picks.
 pub fn oauthbearer(user: &str, token: &str) -> String {
+    let authzid = if user.is_empty() {
+        String::new()
+    } else {
+        format!("a={user}")
+    };
     b64(format!(
-        "n,a={user},\x01host=proxy.test\x01port=993\x01auth=Bearer {token}\x01\x01"
+        "n,{authzid},\x01port=993\x01auth=Bearer {token}\x01\x01"
     ))
 }
 
@@ -460,10 +467,17 @@ enum Verdict {
 /// backend with an auth failure delay.
 pub const SLOW_REJECT: Duration = Duration::from_millis(800);
 
+/// How long the mock hangs before answering a `stall…` login.
+pub const STALL: Duration = Duration::from_secs(30);
+
 /// The verdict, after the backend's thinking time.
 async fn verdict_after(login: &str) -> Verdict {
     if login.starts_with("slowreject") {
         tokio::time::sleep(SLOW_REJECT).await;
+    }
+    if login.starts_with("stall") {
+        // A backend that hangs after the credential.
+        tokio::time::sleep(STALL).await;
     }
     verdict(login)
 }
@@ -485,16 +499,25 @@ pub struct MockBackend {
     pub addr: SocketAddr,
     seen: Log,
     accept: Mutex<Option<JoinHandle<()>>>,
-    /// If set, the IMAP and SMTP mocks answer the auth command itself
-    /// (`AUTHENTICATE …`, the bare `AUTH <mech>`) with this line and close,
-    /// whatever the credential: `* BYE` for a connection limit, `504` for an
-    /// unknown mechanism.
+    /// If set, the mocks answer the auth command itself (`AUTHENTICATE …`,
+    /// the bare `AUTH <mech>`) with this line and close, whatever the
+    /// credential: `* BYE` for a connection limit, `504` for an unknown
+    /// mechanism.
     pub auth_reply: Arc<Mutex<Option<String>>>,
     /// If set, the SMTP mock keeps advertising XCLIENT after an XCLIENT
     /// command, as Postfix does when the announced ADDR is itself in
     /// `smtpd_authorized_xclient_hosts`. Otherwise it stops, as Postfix does
     /// for an ordinary client address.
     pub xclient_sticky: Arc<AtomicBool>,
+    /// IMAP: the capability list after login, instead of `IMAP4rev1 IDLE
+    /// MOVE`. ManageSieve: one more post-TLS capability line.
+    pub login_caps: Arc<Mutex<Option<String>>>,
+    /// IMAP: the tagged OK of a login carries no CAPABILITY code; the list
+    /// comes as the answer to `P2 CAPABILITY`.
+    pub caps_untagged: Arc<AtomicBool>,
+    /// IMAP: the greeting does not advertise SASL-IR, and an AUTHENTICATE
+    /// with an initial response gets BAD (RFC 4959 §3).
+    pub no_sasl_ir: Arc<AtomicBool>,
 }
 
 impl MockBackend {
@@ -507,6 +530,12 @@ impl MockBackend {
         let quirk = auth_reply.clone();
         let xclient_sticky: Arc<AtomicBool> = Arc::default();
         let sticky = xclient_sticky.clone();
+        let login_caps: Arc<Mutex<Option<String>>> = Arc::default();
+        let caps = login_caps.clone();
+        let caps_untagged: Arc<AtomicBool> = Arc::default();
+        let untagged = caps_untagged.clone();
+        let no_sasl_ir: Arc<AtomicBool> = Arc::default();
+        let no_ir = no_sasl_ir.clone();
         let acceptor = tokio_rustls::TlsAcceptor::from(tls);
         let accept = tokio::spawn(async move {
             loop {
@@ -523,6 +552,9 @@ impl MockBackend {
                     idx,
                     auth_reply: quirk.lock().unwrap().clone(),
                     xclient_sticky: sticky.load(Ordering::SeqCst),
+                    login_caps: caps.lock().unwrap().clone(),
+                    caps_untagged: untagged.load(Ordering::SeqCst),
+                    no_sasl_ir: no_ir.load(Ordering::SeqCst),
                 };
                 let acceptor = acceptor.clone();
                 tokio::spawn(async move {
@@ -541,6 +573,9 @@ impl MockBackend {
             accept: Mutex::new(Some(accept)),
             auth_reply,
             xclient_sticky,
+            login_caps,
+            caps_untagged,
+            no_sasl_ir,
         }
     }
 
@@ -580,6 +615,12 @@ struct Rec {
     auth_reply: Option<String>,
     /// `MockBackend::xclient_sticky` when the connection was accepted.
     xclient_sticky: bool,
+    /// `MockBackend::login_caps` when the connection was accepted.
+    login_caps: Option<String>,
+    /// `MockBackend::caps_untagged` when the connection was accepted.
+    caps_untagged: bool,
+    /// `MockBackend::no_sasl_ir` when the connection was accepted.
+    no_sasl_ir: bool,
 }
 
 impl Rec {
@@ -687,8 +728,12 @@ async fn mock_imap(
     let hdr = read_proxy_header(&mut tcp, IO_TIMEOUT).await;
     rec.update(|s| s.proxy_header = hdr);
     let mut s = acceptor.accept(tcp).await?;
+    let sasl_ir = if rec.no_sasl_ir { "" } else { " SASL-IR" };
     s.write_all(
-        b"* OK [CAPABILITY IMAP4rev1 SASL-IR AUTH=PLAIN AUTH=XOAUTH2] mock dovecot ready\r\n",
+        format!(
+            "* OK [CAPABILITY IMAP4rev1{sasl_ir} AUTH=PLAIN AUTH=XOAUTH2] mock dovecot ready\r\n"
+        )
+        .as_bytes(),
     )
     .await?;
     let Some(line) = read_line_raw(&mut s).await else {
@@ -705,7 +750,18 @@ async fn mock_imap(
         cmd.eq_ignore_ascii_case("AUTHENTICATE"),
         "mock imap: {line}"
     );
-    let login = decode_ir(&rec, mech, ir);
+    let ir = if ir.is_empty() {
+        // The response after the empty challenge.
+        s.write_all(b"+ \r\n").await?;
+        read_line_raw(&mut s).await.unwrap_or_default()
+    } else if rec.no_sasl_ir {
+        s.write_all(format!("{tag} BAD SASL-IR not advertised\r\n").as_bytes())
+            .await?;
+        return Ok(());
+    } else {
+        ir.to_string()
+    };
+    let login = decode_ir(&rec, mech, &ir);
     if let Some(reply) = &rec.auth_reply {
         s.write_all(format!("{reply}\r\n").as_bytes()).await?;
         return Ok(());
@@ -731,17 +787,34 @@ async fn mock_imap(
             return Ok(());
         }
     }
+    let caps = rec.login_caps.as_deref().unwrap_or("IMAP4rev1 IDLE MOVE");
     let reply = match v {
-        Verdict::Ok => format!("{tag} OK [CAPABILITY IMAP4rev1 IDLE MOVE] Logged in"),
+        Verdict::Ok if rec.caps_untagged => format!("{tag} OK Logged in"),
+        Verdict::Ok => format!("{tag} OK [CAPABILITY {caps}] Logged in"),
         Verdict::Reject => format!("{tag} NO [AUTHENTICATIONFAILED] Authentication failed."),
         Verdict::Unavailable => {
             format!("{tag} NO [UNAVAILABLE] Temporary authentication failure.")
         }
     };
     s.write_all(format!("{reply}\r\n").as_bytes()).await?;
-    if verdict(&login) == Verdict::Ok {
-        echo(&mut s, &rec).await;
+    if verdict(&login) != Verdict::Ok {
+        return Ok(());
     }
+    if rec.caps_untagged {
+        let Some(l) = read_line_raw(&mut s).await else {
+            return Ok(());
+        };
+        rec.update(|r| r.relayed.push(l.clone()));
+        if l == "P2 CAPABILITY" {
+            s.write_all(
+                format!("* CAPABILITY {caps}\r\nP2 OK Capability completed.\r\n").as_bytes(),
+            )
+            .await?;
+        } else {
+            s.write_all(format!("ECHO {l}\r\n").as_bytes()).await?;
+        }
+    }
+    echo(&mut s, &rec).await;
     Ok(())
 }
 
@@ -878,8 +951,13 @@ async fn mock_sieve(
     tcp.write_all(b"OK \"Begin TLS negotiation now.\"\r\n")
         .await?;
     let mut s = acceptor.accept(tcp).await?;
+    let extra = rec
+        .login_caps
+        .as_ref()
+        .map(|l| format!("{l}\r\n"))
+        .unwrap_or_default();
     s.write_all(
-        b"\"IMPLEMENTATION\" \"Pigeonhole mock\"\r\n\"SIEVE\" \"fileinto reject envelope\"\r\n\"NOTIFY\" \"mailto\"\r\n\"SASL\" \"PLAIN XOAUTH2 OAUTHBEARER\"\r\n\"VERSION\" \"1.0\"\r\nOK \"TLS negotiation successful.\"\r\n",
+        format!("\"IMPLEMENTATION\" \"Pigeonhole mock\"\r\n\"SIEVE\" \"fileinto reject envelope\"\r\n\"NOTIFY\" \"mailto\"\r\n\"SASL\" \"PLAIN XOAUTH2 OAUTHBEARER\"\r\n{extra}\"VERSION\" \"1.0\"\r\nOK \"TLS negotiation successful.\"\r\n").as_bytes(),
     )
     .await?;
     let Some(l) = read_line_raw(&mut s).await else {
@@ -890,13 +968,39 @@ async fn mock_sieve(
         s.write_all(b"OK \"Logout completed.\"\r\n").await?;
         return Ok(());
     }
-    // AUTHENTICATE "MECH" "IR"
-    let q: Vec<&str> = l.split('"').collect();
+    // AUTHENTICATE "MECH" "IR" or AUTHENTICATE "MECH" {n+} CRLF IR. Strict
+    // like RFC 5804 §4: a quoted string holds at most 1024 octets.
+    let q: Vec<&str> = l.splitn(3, '"').collect();
     assert!(
-        q.len() >= 4 && q[0].trim().eq_ignore_ascii_case("AUTHENTICATE"),
+        q.len() == 3 && q[0].trim().eq_ignore_ascii_case("AUTHENTICATE"),
         "mock sieve: {l}"
     );
-    let login = decode_ir(&rec, q[1], q[3]);
+    let (mech, arg) = (q[1], q[2].trim());
+    let ir = if let Some(n) = arg.strip_prefix('{').and_then(|a| a.strip_suffix("+}")) {
+        let mut buf = vec![0u8; n.parse().unwrap()];
+        s.read_exact(&mut buf).await?;
+        assert_eq!(
+            read_line_raw(&mut s).await.as_deref(),
+            Some(""),
+            "mock sieve"
+        );
+        String::from_utf8(buf).unwrap()
+    } else {
+        let ir = arg
+            .strip_prefix('"')
+            .and_then(|a| a.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("mock sieve: {l}"));
+        if ir.len() > 1024 {
+            s.write_all(b"NO \"Quoted string too long\"\r\n").await?;
+            return Ok(());
+        }
+        ir.to_string()
+    };
+    let login = decode_ir(&rec, mech, &ir);
+    if let Some(reply) = &rec.auth_reply {
+        s.write_all(format!("{reply}\r\n").as_bytes()).await?;
+        return Ok(());
+    }
     let v = verdict_after(&login).await;
     let reply: &[u8] = match v {
         Verdict::Ok => b"OK \"Logged in.\"\r\n",
@@ -1914,6 +2018,18 @@ impl Client {
             .await
             .expect("connection stayed open");
         out
+    }
+
+    /// The end of a session of `kind` after a refused credential: SMTP
+    /// announces the close with `421` (RFC 5321 §3.8), then the peer closes.
+    pub async fn expect_end(&mut self, kind: Kind) {
+        if kind == Kind::Smtp {
+            assert_eq!(
+                self.line().await,
+                format!("421 4.7.0 {HOSTNAME} closing connection")
+            );
+        }
+        self.expect_closed().await;
     }
 
     /// The peer closes without sending anything more.

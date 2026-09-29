@@ -21,9 +21,11 @@ pub struct Tuning {
     pub idle: Duration,
     /// Backend TCP connect, TLS handshake and PROXY header, each.
     pub connect: Duration,
-    /// Total budget from accept to a presented credential. The idle timeout
-    /// alone is not enough: a client that drip-feeds one byte just under it
-    /// would reset it forever.
+    /// Total budget from accept to a judged credential: the dialog, token
+    /// validation (a JWKS refresh included), the legacy account check and
+    /// the backend login. The idle timeout alone is not enough: a client that
+    /// drip-feeds one byte just under it would reset it forever, and a slow
+    /// IdP or backend would hold the pre-auth slot.
     pub preauth: Duration,
     /// Commands accepted before authentication.
     pub max_preauth_commands: usize,

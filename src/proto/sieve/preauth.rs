@@ -1,7 +1,7 @@
 //! The ManageSieve `AUTHENTICATE` command: mechanism and initial response in
 //! quoted or literal form.
 
-use crate::wire::line::{read_client_line, verb_is};
+use crate::wire::line::{read_client_line, verb_is, LineError};
 use anyhow::{anyhow, Result};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -15,14 +15,15 @@ use zeroize::Zeroizing;
 ///
 /// The MECH is unquoted from the first quoted-string token.
 /// The IR is unquoted from the second token (quoted or literal); it carries
-/// the credential and is zeroized on drop.
+/// the credential and is zeroized on drop. Without one it is `None`: the
+/// caller decides whether to ask for it (`read_continuation`).
 pub(crate) async fn parse_authenticate_line<S>(
     line: &str,
     stream: &mut S,
     idle: Duration,
-) -> Result<(String, Zeroizing<String>)>
+) -> Result<(String, Option<Zeroizing<String>>)>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncRead + Unpin,
 {
     if !verb_is(line, "AUTHENTICATE") {
         // Never echo client text into an error: it is logged, and log
@@ -36,56 +37,133 @@ where
 
     let after_mech = after_mech.trim();
     if after_mech.is_empty() {
-        // No initial response — send an empty SASL challenge and read the IR.
-        // RFC 5804 §2.1: a challenge is a bare string on its own line. An "OK"
-        // prefix is a *command completion* — sending `OK ""` would tell the
-        // client its AUTHENTICATE had already succeeded.
-        stream.write_all(b"\"\"\r\n").await?;
-        let ir = read_client_line(stream, idle).await?;
-        return Ok((mech, ir));
+        return Ok((mech, None));
     }
 
     let ir = if after_mech.starts_with('"') {
-        let (s, _) = unquote_string(after_mech)
+        let (s, rest) = unquote_string(after_mech)
             .ok_or_else(|| anyhow!("AUTHENTICATE: malformed quoted IR"))?;
-        Zeroizing::new(s)
+        let s = Zeroizing::new(s);
+        if !rest.trim().is_empty() {
+            return Err(anyhow!("AUTHENTICATE: text after the initial response"));
+        }
+        s
     } else if after_mech.starts_with('{') {
         read_literal(stream, after_mech, idle).await?
     } else {
         return Err(anyhow!("AUTHENTICATE: unrecognised IR form"));
     };
 
-    Ok((mech, ir))
+    Ok((mech, Some(ir)))
 }
 
-/// Read the octets of the literal whose `{n+}` (or `{n}`) header starts
-/// `header`; they follow on the next read. They can carry the credential
-/// and are zeroized on drop.
+/// Ask for the response of an `AUTHENTICATE` without initial response: an
+/// empty SASL challenge, then the client's string (`read_sasl_string`). RFC
+/// 5804 §2.1: a challenge is a bare string on its own line. An "OK" prefix
+/// is a *command completion*: `OK ""` would tell the client its AUTHENTICATE
+/// had already succeeded. A response `"*"` cancels the exchange, which the
+/// server must answer with NO: an error here.
+pub(crate) async fn read_continuation<S>(
+    stream: &mut S,
+    idle: Duration,
+) -> Result<Zeroizing<String>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    stream.write_all(b"\"\"\r\n").await?;
+    let response = read_sasl_string(stream, idle).await?;
+    if response.as_str() == "*" {
+        return Err(anyhow!("client cancelled authentication"));
+    }
+    Ok(response)
+}
+
+/// The optional string argument of a command, `arg` being the rest of the
+/// line after the command name: quoted or a literal `{n+}` (RFC 5804 §4),
+/// `None` if there is none. Anything after the string is refused.
+pub(crate) async fn read_string_arg<S>(
+    stream: &mut S,
+    arg: &str,
+    idle: Duration,
+) -> Result<Option<Zeroizing<String>>>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    let arg = arg.trim();
+    if arg.is_empty() {
+        Ok(None)
+    } else if arg.starts_with('"') {
+        match unquote_string(arg) {
+            Some((s, rest)) if rest.trim().is_empty() => Ok(Some(Zeroizing::new(s))),
+            _ => Err(anyhow!("malformed quoted string")),
+        }
+    } else if arg.starts_with('{') {
+        Ok(Some(read_literal(stream, arg, idle).await?))
+    } else {
+        Err(anyhow!("argument is not a string"))
+    }
+}
+
+/// `s` as a ManageSieve string for a response: quoted (with `"` and `\`
+/// escaped) when it fits the 1024 octets of a quoted string and holds no
+/// CR, LF or NUL, a literal `{n}` otherwise (RFC 5804 §4).
+pub(crate) fn sieve_string(s: &str) -> String {
+    if s.len() <= 1024 && !s.contains(['\r', '\n', '\0']) {
+        let mut q = String::with_capacity(s.len() + 2);
+        q.push('"');
+        for c in s.chars() {
+            if c == '"' || c == '\\' {
+                q.push('\\');
+            }
+            q.push(c);
+        }
+        q.push('"');
+        q
+    } else {
+        format!("{{{}}}\r\n{s}", s.len())
+    }
+}
+
+/// Largest literal accepted from a client.
+const MAX_LITERAL: usize = 65536;
+
+/// Read the octets of the literal whose header `{n+}` is all of `header`
+/// (the rest of the line); they follow on the next read. They can carry the
+/// credential and are zeroized on drop.
+///
+/// RFC 5804 §4 has clients send only `literal-c2s = "{" number "+}" CRLF
+/// *OCTET`: the octets follow at once. The synchronising `{n}` would wait for
+/// a continuation ManageSieve does not have, so it is refused like any other
+/// malformed header (`{5++}`, text after `}`).
 async fn read_literal<S>(stream: &mut S, header: &str, idle: Duration) -> Result<Zeroizing<String>>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
-    let close = header
-        .find('}')
+    let count = header
+        .strip_prefix('{')
+        .and_then(|h| h.strip_suffix("+}"))
+        .filter(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
         .ok_or_else(|| anyhow!("AUTHENTICATE: malformed literal"))?;
-    let count_str = &header[1..close];
-    let count_str = count_str.trim_end_matches('+');
-    let n: usize = count_str
+    let n: usize = count
         .parse()
-        .map_err(|_| anyhow!("AUTHENTICATE: bad literal count"))?;
-    if n > 65536 {
+        .map_err(|_| anyhow!("AUTHENTICATE: literal too large"))?;
+    if n > MAX_LITERAL {
         return Err(anyhow!("AUTHENTICATE: literal too large ({n})"));
     }
-    // Client literals are always `{n+}` (RFC 5804 section 4): the octets
-    // follow at once, nothing is sent. A `{n}` is read the same way.
     use tokio::io::AsyncReadExt;
     let mut buf = Zeroizing::new(vec![0u8; n]);
     stream.read_exact(&mut buf).await?;
-    // Consume the CRLF terminating the literal octets so it does NOT leak
-    // into the post-auth byte relay (otherwise the backend sees a stray
-    // empty line → "Unknown command" and all responses shift by one).
-    // EOF-tolerant: a client that closes right after the literal is fine.
-    let _ = read_client_line(stream, idle).await;
+    // The octets end the command or response: the CRLF must follow, or it
+    // would reach the post-auth relay as an empty command and shift every
+    // response by one. Anything else on that line, an overlong one included,
+    // is refused, so none of it is relayed. A client that closes right after
+    // the octets is fine.
+    match read_client_line(stream, idle).await {
+        Ok(rest) if rest.is_empty() => {}
+        Err(LineError::Eof) => {}
+        Ok(_) => return Err(anyhow!("AUTHENTICATE: text after the literal")),
+        Err(e) => return Err(anyhow::Error::new(e).context("after the literal")),
+    }
     let text = std::str::from_utf8(&buf).map_err(|e| anyhow!("literal utf8: {e}"))?;
     Ok(Zeroizing::new(text.to_owned()))
 }
@@ -158,7 +236,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mech, "XOAUTH2");
-        assert_eq!(*ir, b64);
+        assert_eq!(ir.as_deref().map(String::as_str), Some(b64.as_str()));
     }
 
     /// OAUTHBEARER mechanism accepted in quoted form.
@@ -172,7 +250,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mech, "OAUTHBEARER");
-        assert_eq!(*ir, b64);
+        assert_eq!(ir.as_deref().map(String::as_str), Some(b64.as_str()));
     }
 
     /// Literal form {n+}: IR bytes follow immediately after the command line.
@@ -198,7 +276,7 @@ mod tests {
 
         let (mech, ir) = server_task.await.unwrap().unwrap();
         assert_eq!(mech, "XOAUTH2");
-        assert_eq!(*ir, b64);
+        assert_eq!(ir.as_deref().map(String::as_str), Some(b64.as_str()));
     }
 
     /// The CRLF terminating a literal must be consumed so it does not leak into
@@ -221,7 +299,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(mech, "XOAUTH2");
-        assert_eq!(*ir, b64);
+        assert_eq!(ir.as_deref().map(String::as_str), Some(b64.as_str()));
         // The trailing CRLF after the literal must have been consumed → the next
         // line read is the real command, not an empty line.
         let next = crate::wire::line::read_line(&mut server_side, IDLE)
@@ -258,6 +336,17 @@ mod tests {
             (b"\"AQ==\r\n", None),
             (b"\"AQ==\" x\r\n", None),
             (b"{99999999+}\r\n", None),
+            (b"{99999999999999999999999+}\r\n", None),
+            // RFC 5804 §4: only `{n+}` from a client, nothing after it, and
+            // only the CRLF after the octets.
+            (b"{4}\r\nAQ==\r\n", None),
+            (b"{4++}\r\nAQ==\r\n", None),
+            (b"{+}\r\n\r\n", None),
+            (b"{-1+}\r\n\r\n", None),
+            (b"{4+} x\r\nAQ==\r\n", None),
+            (b"{4+}x\r\nAQ==\r\n", None),
+            (b"{4+}\r\nAQ==x\r\n", None),
+            (b"{4+}\r\nAQ==", Some("AQ==")),
         ] {
             let got = read_sasl_string(&mut Cursor::new(wire.to_vec()), IDLE).await;
             assert_eq!(
@@ -267,6 +356,58 @@ mod tests {
                 String::from_utf8_lossy(wire)
             );
         }
+    }
+
+    /// The line after a literal's octets is refused when it is overlong, not
+    /// dropped: none of it may reach the relay.
+    #[tokio::test]
+    async fn overlong_line_after_literal_is_refused() {
+        use std::io::Cursor;
+        let mut wire = b"{4+}\r\nAQ==".to_vec();
+        wire.extend(std::iter::repeat_n(b'x', crate::wire::line::MAX_LINE + 1));
+        wire.extend_from_slice(b"\r\nLISTSCRIPTS\r\n");
+        assert!(read_sasl_string(&mut Cursor::new(wire), IDLE)
+            .await
+            .is_err());
+    }
+
+    /// The response after the empty challenge: quoted, literal or bare, and
+    /// `"*"` (or `*`) cancels.
+    #[tokio::test]
+    async fn continuation_reads_a_string_and_cancel() {
+        for (wire, want) in [
+            (&b"\"AQ==\"\r\n"[..], Some("AQ==")),
+            (b"{4+}\r\nAQ==\r\n", Some("AQ==")),
+            (b"AQ==\r\n", Some("AQ==")),
+            (b"\"*\"\r\n", None),
+            (b"*\r\n", None),
+        ] {
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            client.write_all(wire).await.unwrap();
+            let got = read_continuation(&mut server, IDLE).await;
+            assert_eq!(
+                got.ok().as_deref().map(String::as_str),
+                want,
+                "{:?}",
+                String::from_utf8_lossy(wire)
+            );
+            let mut challenge = [0u8; 4];
+            tokio::io::AsyncReadExt::read_exact(&mut client, &mut challenge)
+                .await
+                .unwrap();
+            assert_eq!(&challenge, b"\"\"\r\n");
+        }
+    }
+
+    /// Text after a quoted initial response is refused.
+    #[tokio::test]
+    async fn text_after_quoted_ir_is_refused() {
+        let (mut server, _client) = tokio::io::duplex(4096);
+        assert!(
+            parse_authenticate_line("AUTHENTICATE \"PLAIN\" \"AQ==\" x", &mut server, IDLE)
+                .await
+                .is_err()
+        );
     }
 
     /// unquote_string handles basic and escaped characters.

@@ -5,6 +5,8 @@
 //! the internal SNI from the internal source. Everywhere else the password is
 //! answered with the documented rejection, logged as `blocked_endpoint` with a
 //! fingerprint, counted as a failed attempt, and never reaches the backend.
+//! SASL LOGIN is refused there before the password is asked for, so its
+//! record has no fingerprint (and no login without an initial response).
 //! The advertised mechanisms follow the same rule in every cell.
 
 mod common;
@@ -80,6 +82,11 @@ impl Cell {
     fn accepted(&self) -> bool {
         !self.mech.is_password() || self.password_allowed()
     }
+    /// SASL LOGIN where it is not offered: refused before the password
+    /// prompt.
+    fn withheld(&self) -> bool {
+        !self.accepted() && matches!(self.mech, Mech::Login | Mech::LoginIr)
+    }
     /// Login for password cells, token email for OAuth cells.
     fn user(&self) -> String {
         format!("{}@example.test", self.id())
@@ -117,13 +124,17 @@ async fn check_cell(h: &Harness, kind: Kind, cell: &Cell, before: &Before, clien
         // The scope follows the source alone, whatever the SNI.
         scope: cell.src.scope().into(),
         mech: cell.mech.logged().into(),
-        user: cell.user(),
+        user: if cell.withheld() && cell.mech == Mech::Login {
+            String::new()
+        } else {
+            cell.user()
+        },
         peer: cell.src.ip().to_string(),
         reason: if ok { "ok" } else { "blocked_endpoint" }.into(),
         pwfp: ar.pwfp.clone(),
     };
     assert_eq!(ar, &expected, "{}", cell.id());
-    if ok {
+    if ok || cell.withheld() {
         assert_eq!(ar.pwfp, "", "{}", cell.id());
     } else {
         assert!(
@@ -236,9 +247,9 @@ async fn imap_gate_matrix() {
                 let before = Before::take(&h, Kind::Imap).await;
                 let (mut c, greeting) = h.imap(src, sni).await;
                 let caps = if cell.password_allowed() {
-                    "IMAP4rev1 IMAP4rev2 SASL-IR AUTH=XOAUTH2 AUTH=OAUTHBEARER AUTH=PLAIN AUTH=LOGIN"
+                    "IMAP4rev1 IMAP4rev2 SASL-IR ID AUTH=XOAUTH2 AUTH=OAUTHBEARER AUTH=PLAIN AUTH=LOGIN"
                 } else {
-                    "IMAP4rev1 IMAP4rev2 SASL-IR LOGINDISABLED AUTH=XOAUTH2 AUTH=OAUTHBEARER"
+                    "IMAP4rev1 IMAP4rev2 SASL-IR ID LOGINDISABLED AUTH=XOAUTH2 AUTH=OAUTHBEARER"
                 };
                 assert_eq!(
                     greeting,
@@ -260,16 +271,20 @@ async fn imap_gate_matrix() {
                     Mech::LoginCmd => c.send(&format!("a LOGIN {user} \"{pw}\"")).await,
                     Mech::Login => {
                         c.send("a AUTHENTICATE LOGIN").await;
-                        assert_eq!(c.line().await, "+ VXNlcm5hbWU6");
-                        c.send(&b64(&user)).await;
-                        assert_eq!(c.line().await, "+ UGFzc3dvcmQ6");
-                        c.send(&b64(&pw)).await;
+                        if !cell.withheld() {
+                            assert_eq!(c.line().await, "+ VXNlcm5hbWU6");
+                            c.send(&b64(&user)).await;
+                            assert_eq!(c.line().await, "+ UGFzc3dvcmQ6");
+                            c.send(&b64(&pw)).await;
+                        }
                     }
                     Mech::LoginIr => {
                         c.send(&format!("a AUTHENTICATE LOGIN {}", b64(&user)))
                             .await;
-                        assert_eq!(c.line().await, "+ UGFzc3dvcmQ6");
-                        c.send(&b64(&pw)).await;
+                        if !cell.withheld() {
+                            assert_eq!(c.line().await, "+ UGFzc3dvcmQ6");
+                            c.send(&b64(&pw)).await;
+                        }
                     }
                     Mech::Xoauth2 => {
                         c.send(&format!(
@@ -357,15 +372,19 @@ async fn smtp_gate_matrix() {
                     Mech::Plain => c.send(&format!("AUTH PLAIN {}", plain(&user, &pw))).await,
                     Mech::Login => {
                         c.send("AUTH LOGIN").await;
-                        assert_eq!(c.line().await, "334 VXNlcm5hbWU6");
-                        c.send(&b64(&user)).await;
-                        assert_eq!(c.line().await, "334 UGFzc3dvcmQ6");
-                        c.send(&b64(&pw)).await;
+                        if !cell.withheld() {
+                            assert_eq!(c.line().await, "334 VXNlcm5hbWU6");
+                            c.send(&b64(&user)).await;
+                            assert_eq!(c.line().await, "334 UGFzc3dvcmQ6");
+                            c.send(&b64(&pw)).await;
+                        }
                     }
                     Mech::LoginIr => {
                         c.send(&format!("AUTH LOGIN {}", b64(&user))).await;
-                        assert_eq!(c.line().await, "334 UGFzc3dvcmQ6");
-                        c.send(&b64(&pw)).await;
+                        if !cell.withheld() {
+                            assert_eq!(c.line().await, "334 UGFzc3dvcmQ6");
+                            c.send(&b64(&pw)).await;
+                        }
                     }
                     Mech::Xoauth2 => {
                         c.send(&format!(
@@ -394,7 +413,7 @@ async fn smtp_gate_matrix() {
                         "{}",
                         cell.id()
                     );
-                    c.expect_closed().await;
+                    c.expect_end(Kind::Smtp).await;
                 }
                 check_cell(&h, Kind::Smtp, &cell, &before, &c).await;
             }
@@ -417,17 +436,19 @@ async fn sieve_gate_matrix() {
                     mech,
                 };
                 let before = Before::take(&h, Kind::Sieve).await;
-                // The first session finds the capability cache cold.
-                let probed = h.sieve_be.seen().iter().any(|s| s.probe);
                 let (mut c, greeting, caps) = h.sieve(src, sni).await;
                 // Before TLS the greeting offers no mechanism anywhere, and
-                // lists the backend's SIEVE line once a probe has fetched it.
+                // lists the backend's SIEVE line, the first session's too
+                // (RFC 5804 §1.7).
                 let implementation = format!("\"IMPLEMENTATION\" \"{HOSTNAME}\"");
-                let mut expected = vec![implementation.as_str(), "\"SASL\" \"\""];
-                if probed {
-                    expected.push("\"SIEVE\" \"fileinto reject envelope\"");
-                }
-                expected.extend(["\"STARTTLS\"", "\"VERSION\" \"1.0\"", "OK \"ready\""]);
+                let expected = [
+                    implementation.as_str(),
+                    "\"SASL\" \"\"",
+                    "\"SIEVE\" \"fileinto reject envelope\"",
+                    "\"STARTTLS\"",
+                    "\"VERSION\" \"1.0\"",
+                    "OK \"ready\"",
+                ];
                 assert_eq!(greeting, expected, "{}", cell.id());
                 // After TLS: the backend's capabilities, STARTTLS dropped and
                 // SASL rewritten by the gate.

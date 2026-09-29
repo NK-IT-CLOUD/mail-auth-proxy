@@ -2,8 +2,13 @@
 //! credential of a LOGIN or AUTHENTICATE command.
 
 use crate::auth::legacy::MechSet;
-use crate::wire::line::{read_client_line, read_sasl_response, sasl_login_step};
+use crate::auth::sasl::{Discovery, Mechanism};
+use crate::auth::Withheld;
+use crate::wire::line::{
+    initial_response, is_bad_response, read_client_line, read_sasl_response, sasl_login_step,
+};
 use crate::wire::Tuning;
+use anyhow::Context as _;
 use anyhow::{anyhow, Result};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -12,9 +17,9 @@ use zeroize::Zeroizing;
 /// The pre-auth capabilities. OAuth mechanisms always; PLAIN/LOGIN only as
 /// far as the legacy gate offers them on this connection. LOGINDISABLED
 /// (RFC 3501 §6.2.3) tells clients not to try the LOGIN command, which counts
-/// as the LOGIN mechanism.
+/// as the LOGIN mechanism. ID is answered, so it is advertised (RFC 2971 §3).
 fn capabilities(pw: MechSet) -> String {
-    let mut caps = String::from("IMAP4rev1 IMAP4rev2 SASL-IR");
+    let mut caps = String::from("IMAP4rev1 IMAP4rev2 SASL-IR ID");
     if !pw.login {
         caps.push_str(" LOGINDISABLED");
     }
@@ -32,11 +37,16 @@ pub struct ClientAuth {
     pub tag: String,
     pub mech: String,
     pub kind: crate::auth::sasl::ClientAuthKind,
+    /// OAUTHBEARER `host`, if the client sent one.
+    pub host: Option<String>,
 }
 
-/// Read the client's pre-auth dialog up to a credential. `pw` only decides
-/// what is advertised; a password sent anyway is still parsed, so
-/// `auth::authorize` can log and refuse it.
+/// Read the client's pre-auth dialog up to a credential. `pw` decides what
+/// is advertised; a password sent anyway is still parsed, so
+/// `auth::authorize` can log and refuse it, but a mechanism `pw` does not
+/// offer never prompts for one: the answer is a tagged NO and the error
+/// `Withheld`. An OAuth response with an empty `auth` value is the error
+/// `Discovery`, unanswered: the caller answers it with the error result.
 ///
 /// RFC 3501 requires CAPABILITY/NOOP/LOGOUT to work in NOT-AUTHENTICATED state,
 /// and stock clients (Python imaplib) send an explicit CAPABILITY before
@@ -120,6 +130,7 @@ pub async fn read_client_auth<S: AsyncRead + AsyncWrite + Unpin>(
                     tag,
                     mech: "LOGIN".into(),
                     kind: crate::auth::sasl::ClientAuthKind::Password { user, pass },
+                    host: None,
                 }));
             }
             "AUTHENTICATE" => {
@@ -132,32 +143,62 @@ pub async fn read_client_auth<S: AsyncRead + AsyncWrite + Unpin>(
                         .await?;
                     return Err(anyhow!("no mechanism"));
                 };
-                let inline_ir = aparts.next().map(|s| Zeroizing::new(s.to_owned()));
-                let kind = match mech.to_ascii_uppercase().as_str() {
-                    "XOAUTH2" | "OAUTHBEARER" | "PLAIN" | "LOGIN" => {
-                        match read_sasl_credential(stream, &mech, inline_ir, tuning.idle).await {
-                            Ok(k) => k,
-                            Err(e) => {
-                                // Best effort: the client may already be gone.
-                                let _ = stream.write_all(format!("{tag} BAD AUTHENTICATE failed: invalid or cancelled response\r\n").as_bytes()).await;
-                                let _ = stream.flush().await;
-                                return Err(e);
-                            }
-                        }
+                let inline_ir = initial_response(aparts.next());
+                let Some(m) = Mechanism::parse(&mech) else {
+                    stream
+                        .write_all(format!("{tag} NO unsupported SASL mechanism\r\n").as_bytes())
+                        .await?;
+                    return Err(anyhow!(
+                        "unsupported mechanism {}",
+                        crate::obs::authlog::sanitize(&mech)
+                    ));
+                };
+                let (kind, host) = match read_sasl_credential(
+                    stream,
+                    &mech,
+                    m,
+                    inline_ir,
+                    pw,
+                    tuning.idle,
+                )
+                .await
+                {
+                    Ok(k) => k,
+                    // A discovery request: `imap::handle` answers it with the
+                    // error result and needs the tag.
+                    Err(e) if e.is::<Discovery>() => {
+                        let d = e.downcast_ref::<Discovery>().map(|d| Discovery {
+                            mech: d.mech.clone(),
+                            user: d.user.clone(),
+                            tag,
+                        });
+                        return Err(d.map_or(e, anyhow::Error::new));
                     }
-                    _ => {
-                        stream
-                            .write_all(
-                                format!("{tag} NO unsupported SASL mechanism\r\n").as_bytes(),
-                            )
-                            .await?;
-                        return Err(anyhow!(
-                            "unsupported mechanism {}",
-                            crate::obs::authlog::sanitize(&mech)
-                        ));
+                    Err(e) => {
+                        // RFC 9051 §6.2.2: BAD for a response that is not
+                        // base64 or a cancel, NO for one that decodes but
+                        // holds no valid credential.
+                        let reply = if e.is::<Withheld>() {
+                            "NO password authentication not available on this endpoint"
+                        } else if is_bad_response(&e) {
+                            "BAD AUTHENTICATE failed: invalid or cancelled response"
+                        } else {
+                            "NO [AUTHENTICATIONFAILED] Authentication failed"
+                        };
+                        // Best effort: the client may already be gone.
+                        let _ = stream
+                            .write_all(format!("{tag} {reply}\r\n").as_bytes())
+                            .await;
+                        let _ = stream.flush().await;
+                        return Err(e);
                     }
                 };
-                return Ok(Some(ClientAuth { tag, mech, kind }));
+                return Ok(Some(ClientAuth {
+                    tag,
+                    mech,
+                    kind,
+                    host,
+                }));
             }
             _ => {
                 stream
@@ -179,30 +220,46 @@ pub async fn read_client_auth<S: AsyncRead + AsyncWrite + Unpin>(
     Err(anyhow!("too many pre-auth commands"))
 }
 
-/// Gather the credential of an `AUTHENTICATE <mech>` whose mechanism is known
-/// to be supported.
+/// Gather the credential of an `AUTHENTICATE <mech>` (`m`, as the client
+/// spelled it), and the OAUTHBEARER `host`. A password mechanism `pw` does
+/// not offer is never asked for its password: `Withheld` unless the initial
+/// response carries it.
 async fn read_sasl_credential<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     mech: &str,
+    m: Mechanism,
     inline_ir: Option<Zeroizing<String>>,
+    pw: MechSet,
     idle: Duration,
-) -> Result<crate::auth::sasl::ClientAuthKind> {
-    Ok(match mech.to_ascii_uppercase().as_str() {
-        "PLAIN" => {
+) -> Result<(crate::auth::sasl::ClientAuthKind, Option<String>)> {
+    let withheld = |user: String| {
+        anyhow::Error::new(Withheld {
+            mech: mech.to_string(),
+            user,
+        })
+    };
+    let kind = match m {
+        Mechanism::Plain => {
+            if !pw.plain && inline_ir.as_ref().is_none_or(|ir| ir.is_empty()) {
+                return Err(withheld(String::new()));
+            }
             let ir = read_ir(stream, inline_ir, idle).await?;
-            let (user, pass) =
-                crate::auth::sasl::parse_plain(&ir).map_err(|e| anyhow!("plain parse: {e}"))?;
+            let (user, pass) = crate::auth::sasl::parse_plain(&ir).context("plain parse")?;
             crate::auth::sasl::ClientAuthKind::Password { user, pass }
         }
-        "LOGIN" => {
+        Mechanism::Login => {
             // Base64 challenge dialog. A client may send the username as the
             // initial response (`AUTHENTICATE LOGIN <b64user>`); asking for it
             // again would make it answer with the password, which would then
             // be taken — and logged — as the username.
-            let mut user = match inline_ir.filter(|s| !s.is_empty()) {
+            let mut user = match inline_ir {
                 Some(ir) => crate::wire::line::decode_login_field(&ir)?,
+                None if !pw.login => return Err(withheld(String::new())),
                 None => sasl_login_step(stream, "+ VXNlcm5hbWU6", idle).await?, // base64("Username:")
             };
+            if !pw.login {
+                return Err(withheld(std::mem::take(&mut *user)));
+            }
             let pass = sasl_login_step(stream, "+ UGFzc3dvcmQ6", idle).await?; // base64("Password:")
             if user.is_empty() || pass.is_empty() {
                 return Err(anyhow!("LOGIN empty field"));
@@ -212,16 +269,17 @@ async fn read_sasl_credential<S: AsyncRead + AsyncWrite + Unpin>(
                 pass,
             }
         }
-        _ => {
+        Mechanism::XOAuth2 | Mechanism::OAuthBearer => {
             let ir = read_ir(stream, inline_ir, idle).await?;
-            let creds =
-                crate::auth::sasl::parse_sasl(mech, &ir).map_err(|e| anyhow!("sasl parse: {e}"))?;
-            crate::auth::sasl::ClientAuthKind::OAuth {
+            let creds = crate::auth::sasl::parse_sasl(mech, &ir).context("sasl parse")?;
+            let kind = crate::auth::sasl::ClientAuthKind::OAuth {
                 user: creds.user,
                 token: creds.token,
-            }
+            };
+            return Ok((kind, creds.host));
         }
-    })
+    };
+    Ok((kind, None))
 }
 
 /// Parse the two astring arguments of a LOGIN command: each is either a bare
@@ -230,6 +288,11 @@ async fn read_sasl_credential<S: AsyncRead + AsyncWrite + Unpin>(
 /// buffers sized for the whole line (no reallocation leaves a partial copy)
 /// and zeroized on drop, also on a parse error.
 pub(crate) fn parse_two_astrings(rest: &str) -> Result<(String, Zeroizing<String>)> {
+    // No IMAP string holds a NUL (RFC 9051 §4.3), and the backend gets the
+    // credential as PLAIN, where NUL separates the fields.
+    if rest.contains('\0') {
+        return Err(anyhow!("NUL in LOGIN arguments"));
+    }
     let mut chars = rest.trim().chars().peekable();
     let mut out: Vec<Zeroizing<String>> = Vec::with_capacity(2);
     while out.len() < 2 {
@@ -271,15 +334,16 @@ pub(crate) fn parse_two_astrings(rest: &str) -> Result<(String, Zeroizing<String
     Ok((std::mem::take(&mut *out[0]), pass))
 }
 
-/// Return the SASL-IR: use the inline value if present, else send `+ \r\n` and read one line.
+/// Return the SASL-IR: use the inline value if present (empty for `=`), else
+/// send `+ \r\n` and read one line.
 async fn read_ir<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     inline: Option<Zeroizing<String>>,
     idle: Duration,
 ) -> Result<Zeroizing<String>> {
     match inline {
-        Some(ir) if !ir.is_empty() => Ok(ir),
-        _ => {
+        Some(ir) => Ok(ir),
+        None => {
             stream.write_all(b"+ \r\n").await?;
             read_sasl_response(stream, idle).await
         }
@@ -301,11 +365,11 @@ mod tests {
     fn capability_lines() {
         assert_eq!(
             capabilities(MechSet::default()),
-            "IMAP4rev1 IMAP4rev2 SASL-IR LOGINDISABLED AUTH=XOAUTH2 AUTH=OAUTHBEARER"
+            "IMAP4rev1 IMAP4rev2 SASL-IR ID LOGINDISABLED AUTH=XOAUTH2 AUTH=OAUTHBEARER"
         );
         assert_eq!(
             capabilities(BOTH),
-            "IMAP4rev1 IMAP4rev2 SASL-IR AUTH=XOAUTH2 AUTH=OAUTHBEARER AUTH=PLAIN AUTH=LOGIN"
+            "IMAP4rev1 IMAP4rev2 SASL-IR ID AUTH=XOAUTH2 AUTH=OAUTHBEARER AUTH=PLAIN AUTH=LOGIN"
         );
         let plain = MechSet {
             plain: true,
@@ -313,7 +377,7 @@ mod tests {
         };
         assert_eq!(
             capabilities(plain),
-            "IMAP4rev1 IMAP4rev2 SASL-IR LOGINDISABLED AUTH=XOAUTH2 AUTH=OAUTHBEARER AUTH=PLAIN"
+            "IMAP4rev1 IMAP4rev2 SASL-IR ID LOGINDISABLED AUTH=XOAUTH2 AUTH=OAUTHBEARER AUTH=PLAIN"
         );
     }
     use base64::Engine as _;
@@ -520,6 +584,8 @@ mod tests {
         );
         assert!(parse_two_astrings("onlyone").is_err());
         assert!(parse_two_astrings("user {5}").is_err());
+        assert!(parse_two_astrings("user \"p\0w\"").is_err());
+        assert!(parse_two_astrings("us\0er pw").is_err());
         assert!(parse_two_astrings("user \"unterminated").is_err());
     }
 

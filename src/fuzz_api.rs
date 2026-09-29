@@ -45,12 +45,19 @@ pub fn imap_parse_two_astrings(rest: &str) -> Result<(String, Zeroizing<String>)
     crate::proto::imap::preauth::parse_two_astrings(rest)
 }
 
-/// A ManageSieve `AUTHENTICATE` line; a literal is read from `stream`.
+/// A ManageSieve `AUTHENTICATE` line; a literal, or the response to the
+/// empty challenge without an initial response, is read from `stream`.
 pub async fn sieve_parse_authenticate_line<S: AsyncRead + AsyncWrite + Unpin>(
     line: &str,
     stream: &mut S,
 ) -> Result<(String, Zeroizing<String>)> {
-    crate::proto::sieve::preauth::parse_authenticate_line(line, stream, IDLE).await
+    use crate::proto::sieve::preauth;
+    let (mech, ir) = preauth::parse_authenticate_line(line, stream, IDLE).await?;
+    let ir = match ir {
+        Some(ir) => ir,
+        None => preauth::read_continuation(stream, IDLE).await?,
+    };
+    Ok((mech, ir))
 }
 
 /// The leading ManageSieve quoted string of `s` and the rest after it.
@@ -63,7 +70,14 @@ pub async fn smtp_read_auth<S: AsyncRead + AsyncWrite + Unpin>(
     line: &str,
     stream: &mut S,
 ) -> Result<(String, ClientAuthKind)> {
-    crate::proto::smtp::preauth::read_smtp_auth(line, stream, IDLE).await
+    let pw = MechSet {
+        plain: true,
+        login: true,
+    };
+    let challenge = ErrorChallenge::new(None, None);
+    crate::proto::smtp::preauth::read_smtp_auth(line, stream, pw, challenge.base64(), IDLE)
+        .await
+        .map(|(mech, kind, _host)| (mech, kind))
 }
 
 /// One (possibly multiline) SMTP reply from the backend.

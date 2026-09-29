@@ -95,7 +95,7 @@ async fn rejections(kind: Kind) {
             "{proto}: {case}"
         );
         assert_eq!(reply, rejection(kind), "{proto}: {case}");
-        c.expect_closed().await;
+        c.expect_end(kind).await;
 
         let ars = h.proxy.wait_authresults(i + 1).await;
         assert_eq!(ars.len(), i + 1, "{proto}: {case}");
@@ -147,7 +147,7 @@ async fn rejections(kind: Kind) {
         )
         .await;
     assert_eq!(reply, rejection(kind));
-    c.expect_closed().await;
+    c.expect_end(kind).await;
     h.wait_session_ended(kind, 7).await;
     assert_eq!(h.idp.fetches.load(std::sync::atomic::Ordering::SeqCst), 2);
 

@@ -19,19 +19,74 @@ use zeroize::Zeroizing;
 /// not pin this task forever.
 const MAX_AUTH_LINES: usize = 32;
 
+/// Connect and read the greeting. Also returns whether the greeting's
+/// capabilities include SASL-IR (without a CAPABILITY code: no).
 async fn connect_tls(
     backend: &BackendConn,
     client: SocketAddr,
     local: SocketAddr,
     tuning: &Tuning,
-) -> Result<TlsStream<TcpStream>> {
+) -> Result<(TlsStream<TcpStream>, bool)> {
     let tcp = connect::connect(backend, Some((client, local)), tuning.connect, "backend").await?;
     let mut stream = connect::tls(backend, tcp, tuning.connect, "backend").await?;
     let greeting = read_line(&mut stream, tuning.idle).await?;
     if !greeting.starts_with("* OK") {
         return Err(anyhow!("backend greeting: {greeting}"));
     }
-    Ok(stream)
+    let caps = capability_code(&greeting[2..]).unwrap_or_default();
+    if offers_unauthenticate(&caps) {
+        return Err(anyhow!(crate::auth::UNAUTHENTICATE_OFFERED));
+    }
+    let sasl_ir = caps.iter().any(|c| c.eq_ignore_ascii_case("SASL-IR"));
+    Ok((stream, sasl_ir))
+}
+
+/// The capabilities of the `[CAPABILITY …]` response code that starts the
+/// text of `resp` (`OK [CAPABILITY …] text`, status first), if it has one.
+fn capability_code(resp: &str) -> Option<Vec<&str>> {
+    let (_status, text) = resp.split_once(' ')?;
+    let code = text.strip_prefix('[')?.split_once(']')?.0;
+    let (name, caps) = code.split_once(' ')?;
+    name.eq_ignore_ascii_case("CAPABILITY")
+        .then(|| caps.split_ascii_whitespace().collect())
+}
+
+fn offers_unauthenticate<S: AsRef<str>>(caps: &[S]) -> bool {
+    caps.iter()
+        .any(|c| c.as_ref().eq_ignore_ascii_case("UNAUTHENTICATE"))
+}
+
+/// Ask a logged-in backend for its capabilities (`P2 CAPABILITY`), for a
+/// tagged OK without a CAPABILITY code. The exchange is the proxy's own; the
+/// client never sees it.
+async fn query_capabilities(
+    stream: &mut TlsStream<TcpStream>,
+    idle: Duration,
+) -> Result<Vec<String>> {
+    stream.write_all(b"P2 CAPABILITY\r\n").await?;
+    let mut caps = Vec::new();
+    for _ in 0..MAX_AUTH_LINES {
+        let l = read_line(stream, idle).await?;
+        if let Some(tagged) = l.strip_prefix("P2 ") {
+            if !tagged
+                .get(..3)
+                .is_some_and(|s| s.eq_ignore_ascii_case("OK "))
+            {
+                return Err(anyhow!("backend CAPABILITY failed: {l}"));
+            }
+            return Ok(caps);
+        }
+        if let Some(list) = l
+            .get(..13)
+            .filter(|p| p.eq_ignore_ascii_case("* CAPABILITY "))
+            .map(|_| &l[13..])
+        {
+            caps.extend(list.split_ascii_whitespace().map(str::to_string));
+        }
+    }
+    Err(anyhow!(
+        "backend sent no tagged CAPABILITY reply within {MAX_AUTH_LINES} lines"
+    ))
 }
 
 enum AuthReply {
@@ -150,11 +205,44 @@ impl BackendLogin for ImapLogin<'_> {
                 ("PLAIN", crate::auth::sasl::build_plain(user, pass))
             }
         };
-        // `concat` sizes the line once; it is zeroized on drop like the response.
-        let command = Zeroizing::new(["P1 AUTHENTICATE ", mech, " ", &response, "\r\n"].concat());
-        let mut stream = connect_tls(self.backend, self.peer, self.local, self.tuning).await?;
-        stream.write_all(command.as_bytes()).await?;
+        let (mut stream, sasl_ir) =
+            connect_tls(self.backend, self.peer, self.local, self.tuning).await?;
+        if sasl_ir {
+            // `concat` sizes the line once; it is zeroized on drop like the
+            // response.
+            let command =
+                Zeroizing::new(["P1 AUTHENTICATE ", mech, " ", &response, "\r\n"].concat());
+            stream.write_all(command.as_bytes()).await?;
+        } else {
+            // RFC 4959 §3: no initial response to a server that does not
+            // advertise SASL-IR; the response follows the empty challenge.
+            stream
+                .write_all(format!("P1 AUTHENTICATE {mech}\r\n").as_bytes())
+                .await?;
+            let challenge = read_line(&mut stream, self.tuning.idle).await?;
+            if !challenge.starts_with('+') {
+                // No credential was sent: the backend's configuration, an
+                // outage on both paths.
+                return Err(anyhow!(
+                    "backend refused AUTHENTICATE {mech} before the credential: {challenge}"
+                )
+                .into());
+            }
+            stream
+                .write_all(Zeroizing::new([&response, "\r\n"].concat()).as_bytes())
+                .await?;
+        }
         let ok = await_auth_ok(&mut stream, self.tuning.idle, xoauth2).await?;
+        // RFC 8437 advertises UNAUTHENTICATE in the authenticated state.
+        let unauthenticate = match capability_code(&ok) {
+            Some(caps) => offers_unauthenticate(&caps),
+            None => {
+                offers_unauthenticate(&query_capabilities(&mut stream, self.tuning.idle).await?)
+            }
+        };
+        if unauthenticate {
+            return Err(anyhow!(crate::auth::UNAUTHENTICATE_OFFERED).into());
+        }
         Ok((stream, ok))
     }
 }
@@ -162,6 +250,23 @@ impl BackendLogin for ImapLogin<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capability_codes() {
+        assert_eq!(
+            capability_code("OK [CAPABILITY IMAP4rev1 IDLE] Logged in"),
+            Some(vec!["IMAP4rev1", "IDLE"])
+        );
+        assert_eq!(
+            capability_code("OK [capability UNAUTHENTICATE]"),
+            Some(vec!["UNAUTHENTICATE"])
+        );
+        assert_eq!(capability_code("OK Logged in [CAPABILITY X]"), None);
+        assert_eq!(capability_code("OK [ALERT] x"), None);
+        assert_eq!(capability_code("OK"), None);
+        assert!(offers_unauthenticate(&["IMAP4rev1", "unauthenticate"]));
+        assert!(!offers_unauthenticate(&["IMAP4rev1", "UNAUTHENTICATEX"]));
+    }
 
     #[test]
     fn tagged_reply_classification() {
