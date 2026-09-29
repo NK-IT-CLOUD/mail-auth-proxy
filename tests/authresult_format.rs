@@ -1,4 +1,4 @@
-//! The `authresult` line is an API (CrowdSec, Wazuh). Every reason the
+//! The `authresult` line is an API for log parsers. Every reason the
 //! binary emits is produced here once and pinned byte for byte after the
 //! timestamp; every line must also match the CrowdSec grok pattern. The
 //! legacy-gate reasons are pinned in `legacy_gate.rs`. New fields (`rule`)

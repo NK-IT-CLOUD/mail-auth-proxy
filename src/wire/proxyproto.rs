@@ -1,21 +1,11 @@
 //! PROXY protocol v2 header construction.
 //!
-//! The proxy terminates the client's TCP/TLS connection and opens a *fresh*
-//! connection to the Dovecot backend. Without help, Dovecot only ever sees the
-//! proxy's own IP as the remote peer — every IMAP/ManageSieve session,
-//! successful or failed, is logged with `rip=` the proxy's address, which makes
-//! per-client attribution and any IP-based rate limiting impossible.
-//!
-//! PROXY protocol v2 (HAProxy's binary framing) fixes this at the transport
-//! layer: the proxy prepends a fixed binary header describing the ORIGINAL
-//! connection (real client → the address it dialed) as the very first bytes of
-//! the backend connection, *before* the TLS handshake. Dovecot, with
-//! `haproxy = yes` on the listener, consumes the header and records the real
-//! client IP in `rip=`.
-//!
-//! This module only *builds* the header bytes; writing them and the config gate
-//! live in `wire/connect.rs`. Keeping the serialization pure makes it
-//! unit-testable against the wire format without any I/O.
+//! The proxy opens a fresh connection to the backend, so without this header
+//! Dovecot logs the proxy's address as `rip=` for every IMAP and ManageSieve
+//! session. The header describes the original connection (client → the
+//! address it dialed) and must be the first bytes on the backend connection,
+//! before the TLS handshake; Dovecot needs `haproxy = yes` on that listener.
+//! Writing it is `wire/connect.rs`.
 //!
 //! Spec: <https://www.haproxy.org/download/2.9/doc/proxy-protocol.txt> §2.2.
 
@@ -33,15 +23,9 @@ const VER_CMD_PROXY: u8 = 0x21;
 const AF_INET_STREAM: u8 = 0x11; // TCP over IPv4
 const AF_INET6_STREAM: u8 = 0x21; // TCP over IPv6
 
-/// Build a PROXY protocol v2 header describing a TCP connection from `src`
-/// (the real client) to `dst` (the address the client connected to).
-///
-/// `src` and `dst` must share an address family; the accepted client socket and
-/// its local address always do, so callers pass the client peer and the
-/// listener-side local address of the *same* socket. Returns `None` if the two
-/// families differ (defensive — should never happen for one socket).
-/// version (0x2) << 4 | command LOCAL (0x0): the proxy's own connection
-/// (health check, probe) — the backend keeps the socket's real addresses.
+/// version (0x2) << 4 | command LOCAL (0x0): the proxy's own connection (the
+/// ManageSieve capability probe); the backend keeps the socket's real
+/// addresses.
 const VER_CMD_LOCAL: u8 = 0x20;
 
 /// A PROXY protocol v2 LOCAL header: signature, LOCAL, family UNSPEC, no
@@ -53,6 +37,13 @@ pub fn v2_local_header() -> Vec<u8> {
     out
 }
 
+/// Build a PROXY protocol v2 header describing a TCP connection from `src`
+/// (the real client) to `dst` (the address the client connected to).
+///
+/// `src` and `dst` must share an address family; the accepted client socket and
+/// its local address always do, so callers pass the client peer and the
+/// listener-side local address of the *same* socket. Returns `None` if the two
+/// families differ (defensive — should never happen for one socket).
 pub fn v2_header(src: SocketAddr, dst: SocketAddr) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(28);
     out.extend_from_slice(&SIG);

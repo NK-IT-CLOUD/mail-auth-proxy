@@ -115,7 +115,9 @@ pub trait BackendLogin {
 /// oversized credential with a protocol error instead of a verdict (Postfix
 /// `500` beyond `smtpd_sasl_response_limit`), and an instant retry-later for
 /// accounts that pass the gate, next to a delayed rejection for those that do
-/// not, would tell them apart.
+/// not, would tell them apart. For the same reason a protocol error answering
+/// a password (IMAP `BAD`, SMTP `50x`) counts as a rejection; with this cap
+/// that is defence in depth.
 pub const MAX_PASSWORD: usize = 1024;
 
 /// Largest bearer token the proxy validates; a longer one is a `bad_token`.
@@ -137,7 +139,9 @@ pub struct Session<'a> {
 }
 
 /// How `authorize` ended. Logging and metrics are done; the protocol only
-/// answers the client.
+/// answers the client, then ends a failed session with an error for the
+/// journal. The answer is best effort: a client that is already gone must not
+/// replace the reason (an outage's cause above all) with a write error.
 pub enum Outcome<C> {
     /// Logged in as `identity`.
     Ok { conn: C, identity: String },

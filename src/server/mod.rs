@@ -90,7 +90,6 @@ impl Shared {
         self.legacy.advertised(proto, peer.ip(), sni)
     }
 
-    /// Name used in greetings and EHLO.
     pub fn hostname(&self) -> &str {
         &self.hostname
     }
@@ -231,7 +230,6 @@ pub fn file_problems(cfg: &config::Config) -> Vec<String> {
             )
         }));
     for (name, path, check) in lists {
-        // An empty path is a configuration error, reported by validation.
         if path.is_empty() {
             continue;
         }
@@ -250,7 +248,7 @@ pub fn file_problems(cfg: &config::Config) -> Vec<String> {
 const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Serve `cfg` (already validated): build the listeners' shared context,
-/// fetch the JWKS, start the metrics endpoint and the three listeners, then
+/// fetch the JWKS, start the metrics endpoint and the configured listeners, then
 /// serve until SIGTERM or SIGINT.
 ///
 /// SIGHUP reloads the client certificate and refreshes every JWKS without

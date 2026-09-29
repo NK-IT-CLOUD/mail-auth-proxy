@@ -63,11 +63,8 @@ enum AuthVerdict {
 ///   a malformed response, an unknown mechanism): for a token, the backend
 ///   did not understand the exchange and never judged the credential; counting
 ///   it as a rejection would feed CrowdSec bans against legitimate users. For
-///   a password it is a rejection: the client chose the credential bytes, and
-///   a crafted password must not turn a gate-passing account into an instant
-///   retry-later (an enumeration oracle next to the delayed refusals). The
-///   size cap (`auth::MAX_PASSWORD`) keeps valid passwords far from Postfix's
-///   limits, so this is defence in depth.
+///   a password it is a rejection: the client chose the credential bytes (see
+///   `auth::MAX_PASSWORD`).
 /// - Any other `5xx` (535, 534, 554, …): a rejection.
 /// - Anything else (a stray `334`, `2xx`): a protocol failure, an outage.
 fn auth_verdict(code: u16, password: bool) -> AuthVerdict {
@@ -98,13 +95,11 @@ impl SmtpLogin<'_> {
         )
         .await?;
 
-        // Step B1: expect 220 greeting
         let (code, _) = read_smtp_reply(&mut tcp_be, self.tuning.idle).await?;
         if code != 220 {
             return Err(anyhow!("backend greeting code {code}"));
         }
 
-        // Step B2: EHLO, expect 250 with STARTTLS advertised
         tcp_be
             .write_all(format!("EHLO {}\r\n", self.name).as_bytes())
             .await?;
@@ -116,7 +111,6 @@ impl SmtpLogin<'_> {
             return Err(anyhow!("backend did not advertise STARTTLS"));
         }
 
-        // Step B3: STARTTLS
         tcp_be.write_all(b"STARTTLS\r\n").await?;
         let (code, _) = read_smtp_reply(&mut tcp_be, self.tuning.idle).await?;
         if code != 220 {
@@ -131,7 +125,6 @@ impl SmtpLogin<'_> {
         )
         .await?;
 
-        // Step B4: EHLO over TLS
         be.write_all(format!("EHLO {}\r\n", self.name).as_bytes())
             .await?;
         let (code, ehlo_lines) = read_smtp_reply(&mut be, self.tuning.idle).await?;
@@ -139,19 +132,15 @@ impl SmtpLogin<'_> {
             return Err(anyhow!("backend post-TLS EHLO code {code}"));
         }
 
-        // Step B4b (optional): announce the real client IP to Postfix via XCLIENT so
-        // it logs `client=<real ip>` and stamps it into the Received header, instead
-        // of attributing every submission to the proxy's own address. Gated on the
-        // config flag AND on the backend actually advertising XCLIENT; a backend
-        // that does not authorize this proxy simply never advertises it, so we skip
-        // silently rather than risk a rejected session.
+        // XCLIENT (optional): Postfix then logs and stamps the real client
+        // address. Only when configured and advertised; a backend that does
+        // not authorize this proxy never advertises it.
         //
-        // A backend that offers XCLIENT to a proxy configured without it is a
-        // misconfiguration the proxy must not relay into: Postfix accepts
-        // XCLIENT from an authorized host until ADDR is sent, so after the
-        // splice the client could send its own `XCLIENT LOGIN=<other> ADDR=…`
-        // on the proxy's authorization and act as another user. Fail closed,
-        // before any credential is sent: an outage.
+        // A backend that advertises XCLIENT to a proxy configured without it
+        // would let the client, after the splice, send its own
+        // `XCLIENT LOGIN=<other> ADDR=…` on the proxy's authorization (Postfix
+        // accepts XCLIENT from an authorized host until ADDR is sent). Fail
+        // closed before any credential is sent: an outage.
         let offers_xclient = ehlo_lines.iter().any(|l| verb_is(l, "XCLIENT"));
         if !self.xclient && offers_xclient {
             return Err(anyhow!(
@@ -198,7 +187,6 @@ impl SmtpLogin<'_> {
             }
         }
 
-        // Step B5: forward the client's OWN credential (token or password) — never a master password.
         let (mech, response) = match credential {
             BackendCredential::Token { identity, token } => {
                 ("XOAUTH2", crate::auth::sasl::build_xoauth2(identity, token))
@@ -236,8 +224,8 @@ impl SmtpLogin<'_> {
     }
 }
 
-/// Most lines accepted in one SMTP reply. Postfix's EHLO reply has about
-/// fifteen; a backend that never ends a reply must not grow it without bound.
+/// Most lines accepted in one SMTP reply. An EHLO reply has a dozen or so; a
+/// backend that never ends a reply must not grow it without bound.
 const MAX_REPLY_LINES: usize = 64;
 
 /// Reads an SMTP reply that may span multiple `NNN-...` lines ending with

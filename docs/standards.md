@@ -183,22 +183,32 @@ Bearer tokens are validated locally as signed JWTs (JWS compact serialisation) a
 
 ## 8. Metrics
 
-Metric names follow the Prometheus naming guidelines: an application prefix (`mail_auth_proxy_`), `_total` on counters, `_info` for build metadata, no unit mixing, and label sets that give meaningful sums. The exposition uses `text/plain; version=0.0.4`.
+Metric names follow the Prometheus naming guidelines: an application prefix (`mail_auth_proxy_`), `_total` on counters, `_info` for build metadata, base units (`_seconds`, `_timestamp_seconds`), and label sets that give meaningful sums. `process_start_time_seconds` is the standard process metric and has no prefix. The exposition uses `text/plain; version=0.0.4`. The meaning of each metric is in [operations.md](operations.md#prometheus-metrics).
 
 | Metric | Type |
 |---|---|
-| `mail_auth_proxy_build_info{version}` | gauge (1) |
+| `mail_auth_proxy_build_info{version,commit}` | gauge (1) |
+| `process_start_time_seconds` | gauge |
 | `mail_auth_proxy_auth_attempts_total{proto,scope,mechanism,result}` | counter |
 | `mail_auth_proxy_auth_refusals_total{proto,reason}` | counter |
 | `mail_auth_proxy_preauth_aborts_total{proto,scope}` | counter |
 | `mail_auth_proxy_token_validate_total{result}` | counter |
 | `mail_auth_proxy_connections_total{proto}` | counter |
-| `mail_auth_proxy_connections_rejected_total{proto}` | counter |
 | `mail_auth_proxy_backend_errors_total{proto}` | counter |
+| `mail_auth_proxy_connections_rejected_total{proto}` | counter |
 | `mail_auth_proxy_legacy_list_errors_total{list}` | counter |
+| `mail_auth_proxy_legacy_throttle_evictions_total` | counter |
+| `mail_auth_proxy_ratelimit_blocks_total{proto}` | counter |
+| `mail_auth_proxy_ratelimit_bans_total` | counter |
+| `mail_auth_proxy_ratelimit_active_blocks` | gauge |
+| `mail_auth_proxy_ratelimit_evictions_total` | counter |
 | `mail_auth_proxy_active_connections{proto}` | gauge |
 | `mail_auth_proxy_upstream_forward_total{proto}` | counter |
 | `mail_auth_proxy_sessions_ended_total{proto,reason}` | counter |
+| `mail_auth_proxy_tls_cert_expiry_timestamp_seconds` | gauge |
+| `mail_auth_proxy_jwks_last_success_timestamp_seconds{issuer}` | gauge |
+| `mail_auth_proxy_jwks_refresh_failures_total{issuer}` | counter |
+| `mail_auth_proxy_backend_login_duration_seconds{proto,le}` | histogram |
 
 ## Known deviations
 

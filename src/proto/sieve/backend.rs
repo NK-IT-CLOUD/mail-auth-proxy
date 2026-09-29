@@ -49,8 +49,7 @@ pub(super) async fn backend_session(
     origin: Option<(SocketAddr, SocketAddr)>,
     tuning: &Tuning,
 ) -> Result<(TlsStream<TcpStream>, Vec<String>)> {
-    // The PROXY protocol header goes first, before the backend speaks its
-    // greeting, so Dovecot (haproxy = yes) records the real client IP.
+    // The PROXY header goes first, before the backend's greeting.
     let mut tcp_be = connect::connect(backend, origin, tuning.connect, "sieve backend").await?;
     // Greeting capabilities, then STARTTLS and its OK.
     read_caps_until_ok(&mut tcp_be, tuning.idle).await?;
@@ -125,8 +124,8 @@ impl BackendLogin for SieveLogin<'_> {
     }
 }
 
-/// Most capability lines accepted from the backend. Pigeonhole sends about
-/// ten; a backend that never ends the list must not grow it without bound.
+/// Most capability lines accepted from the backend. Pigeonhole sends a
+/// handful; a backend that never ends the list must not grow it without bound.
 const MAX_CAP_LINES: usize = 64;
 
 /// Read ManageSieve capability lines until (and not including) the `OK` line.
@@ -205,11 +204,12 @@ mod tests {
             .is_err());
     }
 
-    /// read_caps_until_ok: SIEVE/IMPLEMENTATION/NOTIFY kept, SASL rewritten, STARTTLS dropped.
+    /// A Pigeonhole capability block through `read_caps_until_ok` and a copy
+    /// of the relay rule of `sieve::handle`: SIEVE, IMPLEMENTATION and NOTIFY
+    /// kept, SASL rewritten, STARTTLS dropped.
     #[tokio::test]
     async fn cap_rewrite_keeps_sieve_rewrites_sasl_drops_starttls() {
         use std::io::Cursor;
-        // Simulate backend post-TLS capability block (as Dovecot Pigeonhole sends it)
         let input = concat!(
             "\"IMPLEMENTATION\" \"Dovecot Pigeonhole\"\r\n",
             "\"SIEVE\" \"fileinto reject envelope vacation\"\r\n",
@@ -224,7 +224,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Build what we would write to client (replicating the relay logic)
         let mut output_lines: Vec<String> = Vec::new();
         for cap_line in &caps {
             let upper = cap_line.to_ascii_uppercase();
@@ -238,33 +237,28 @@ mod tests {
             }
         }
 
-        // SIEVE line present and unchanged
         assert!(
             output_lines
                 .iter()
                 .any(|l| l.contains("\"SIEVE\"") && l.contains("fileinto")),
             "SIEVE capability must be forwarded: {output_lines:?}"
         );
-        // IMPLEMENTATION unchanged
         assert!(
             output_lines
                 .iter()
                 .any(|l| l.contains("\"IMPLEMENTATION\"")),
             "IMPLEMENTATION capability must be forwarded"
         );
-        // NOTIFY unchanged
         assert!(
             output_lines.iter().any(|l| l.contains("\"NOTIFY\"")),
             "NOTIFY capability must be forwarded"
         );
-        // SASL rewritten to OAuth-only
         assert!(
             output_lines
                 .iter()
                 .any(|l| l == "\"SASL\" \"XOAUTH2 OAUTHBEARER\""),
             "SASL must be rewritten to OAuth-only: {output_lines:?}"
         );
-        // SASL must NOT contain LOGIN or PLAIN
         assert!(
             !output_lines.iter().any(|l| {
                 let u = l.to_ascii_uppercase();
@@ -272,7 +266,6 @@ mod tests {
             }),
             "SASL must not contain LOGIN/PLAIN: {output_lines:?}"
         );
-        // STARTTLS dropped
         assert!(
             !output_lines
                 .iter()

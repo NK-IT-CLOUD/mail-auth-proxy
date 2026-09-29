@@ -24,10 +24,8 @@ async fn main() -> Result<()> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .ok();
-    // Logs go to journald/stderr, never a TTY. ANSI colour escapes corrupt the
-    // fixed `authresult` field format that CrowdSec and Wazuh parse (field names
-    // wrapped in \x1b[..m), so disable colour deterministically here rather than
-    // relying on a NO_COLOR env override at deploy time.
+    // Logs go to journald or stderr: ANSI escapes would break the `authresult`
+    // fields that log parsers match (CrowdSec), so colour is always off.
     tracing_subscriber::fmt()
         // Without RUST_LOG the authresult lines must still be written.
         .with_env_filter(

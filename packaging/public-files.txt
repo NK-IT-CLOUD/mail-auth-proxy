@@ -1,6 +1,6 @@
 # Paths in the public root commit (one per line, directories recursive).
 # docs/ is listed per file: docs/internal/ must never be public.
-# Everything else stays in the private ops repository.
+# Everything else is not published.
 .gitignore
 .github/
 Cargo.toml

@@ -155,7 +155,7 @@ mod tests {
             decoded(&c),
             serde_json::json!({"status": "invalid_token", "scope": "openid", "openid-configuration": url})
         );
-        // JSON escaping, although validation never lets a quote through.
+        // JSON escaping: a configured URL may contain a quote.
         let c = ErrorChallenge::new(Some("https://x.example/\"}"), None);
         assert_eq!(decoded(&c)["openid-configuration"], "https://x.example/\"}");
     }

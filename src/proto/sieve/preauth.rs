@@ -30,10 +30,7 @@ where
         return Err(anyhow!("expected AUTHENTICATE"));
     }
 
-    // Everything after "AUTHENTICATE "
     let rest = line.get("AUTHENTICATE".len()..).unwrap_or("").trim();
-
-    // Extract first quoted-string: the mechanism
     let (mech, after_mech) =
         unquote_string(rest).ok_or_else(|| anyhow!("AUTHENTICATE: missing quoted mechanism"))?;
 
@@ -48,14 +45,11 @@ where
         return Ok((mech, ir));
     }
 
-    // IR is either a quoted-string or a literal {n+}
     let ir = if after_mech.starts_with('"') {
-        // Quoted form
         let (s, _) = unquote_string(after_mech)
             .ok_or_else(|| anyhow!("AUTHENTICATE: malformed quoted IR"))?;
         Zeroizing::new(s)
     } else if after_mech.starts_with('{') {
-        // Literal form: {n+} — the n bytes follow on the NEXT read
         read_literal(stream, after_mech, idle).await?
     } else {
         return Err(anyhow!("AUTHENTICATE: unrecognised IR form"));
@@ -75,7 +69,6 @@ where
         .find('}')
         .ok_or_else(|| anyhow!("AUTHENTICATE: malformed literal"))?;
     let count_str = &header[1..close];
-    // Strip trailing '+' (non-synchronising literal)
     let count_str = count_str.trim_end_matches('+');
     let n: usize = count_str
         .parse()
@@ -83,9 +76,8 @@ where
     if n > 65536 {
         return Err(anyhow!("AUTHENTICATE: literal too large ({n})"));
     }
-    // RFC 5804 §4: server sends continuation "OK ..." for non-synchronising literals,
-    // but for synchronising ones it must wait.  We send nothing for non-sync (+).
-    // Read exactly n bytes.
+    // Client literals are always `{n+}` (RFC 5804 section 4): the octets
+    // follow at once, nothing is sent. A `{n}` is read the same way.
     use tokio::io::AsyncReadExt;
     let mut buf = Zeroizing::new(vec![0u8; n]);
     stream.read_exact(&mut buf).await?;

@@ -29,9 +29,8 @@ pub async fn handle(
     mut permit: limits::ConnPermit,
 ) -> Result<()> {
     let _conn = metrics::ConnGuard::open(metrics::Proto::Imap);
-    // The address the client dialed (post-DNAT local addr of this socket). Used
-    // only as the PROXY protocol destination; falls back to `peer` so the two
-    // ends always share an address family if the lookup ever fails.
+    // The address the client dialed, for the PROXY header; `peer` as the
+    // fallback keeps both ends in one address family.
     let local = tcp.local_addr().unwrap_or(peer);
     let (internal, scope) = ctx.scope(peer);
     // One budget for TLS handshake + pre-auth dialog together.
@@ -66,11 +65,8 @@ pub async fn handle(
         // authenticating: a clean end, e.g. a monitoring probe.
         Ok(None) => return Ok(()),
         Err(e) => {
-            // Pre-auth failure: the client never presented a credential (TLS
-            // stack mismatch, portscan, EOF, unsupported mechanism). Keep the
-            // detail in the journal for CrowdSec, but count it as a pre-auth
-            // abort — NOT an auth fail — so the "failed logins" metric stays
-            // truthful.
+            // No credential was presented: a `protocol` record and a
+            // pre-auth abort, not a failed login.
             authlog::AuthEvent {
                 proto: metrics::Proto::Imap,
                 scope,
@@ -104,10 +100,6 @@ pub async fn handle(
     };
     let is_password = matches!(auth.kind, sasl::ClientAuthKind::Password { .. });
     let tag = &auth.tag;
-    // Every failure answers the client, then ends the session with an error
-    // for the journal. The answer is best effort: a client that is already
-    // gone must not replace the reason (an outage's cause above all) with a
-    // write error.
     let outcome = auth::authorize(&ctx, &session, &auth.mech, &auth.kind, &login).await;
     // The credential is not needed after the login: dropping it zeroizes it
     // before the splice, which can last for hours.
@@ -120,7 +112,7 @@ pub async fn handle(
             permit.authenticated();
             // Relay the backend's own tagged OK under the client's tag: its
             // CAPABILITY response code is what the client may cache for the
-            // session (RFC 3501 §7.1), so it must list the backend's real
+            // session (RFC 9051 section 7.1), so it must list the backend's real
             // post-login capabilities.
             client
                 .write_all(format!("{tag} {logged_in}\r\n").as_bytes())

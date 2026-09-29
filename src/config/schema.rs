@@ -13,7 +13,8 @@ pub const DEFAULT_ALGORITHMS: &[&str] = &[
 
 /// ESMTP extensions advertised after STARTTLS, besides AUTH. The client keeps
 /// this view for the whole session (it does not send EHLO again after AUTH),
-/// so the list must match what the backend offers. These are Postfix defaults.
+/// so the list must match what the backend offers. A subset of what Postfix
+/// offers by default (SIZE, VRFY and ETRN are left out).
 pub const DEFAULT_EHLO_EXTENSIONS: &[&str] = &[
     "PIPELINING",
     "ENHANCEDSTATUSCODES",
@@ -262,8 +263,8 @@ fn default_client_claim() -> String {
     "azp".into()
 }
 
-/// The short form of one legacy rule. `enabled`
-/// means one rule named `password_gate`: passwords only if the client asked
+/// The short form of one legacy rule: `enabled` means one rule named
+/// `password_gate`: passwords only if the client asked
 /// for one of `sni` AND comes from `internal_networks`. The networks also set
 /// the scope label when `[scope]` is absent.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -501,7 +502,7 @@ pub struct Timeouts {
     /// Total time from accept to a presented credential.
     #[serde(default = "default_preauth_secs")]
     pub preauth_secs: u64,
-    /// Longest silence on any single read.
+    /// Longest silence on any single line read, before the relay starts.
     #[serde(default = "default_idle_secs")]
     pub idle_secs: u64,
     /// Backend TCP connect, TLS handshake and PROXY header, each.
@@ -565,7 +566,7 @@ pub struct AuthRateLimit {
     pub window_secs: u64,
     #[serde(default = "default_ratelimit_block_secs")]
     pub block_secs: u64,
-    /// Longest block; equal to `block_secs`: no escalation.
+    /// Longest block after escalation; set it to `block_secs` for none.
     #[serde(default = "default_ratelimit_max_block_secs")]
     pub max_block_secs: u64,
     /// Never block sources inside `scope.internal_networks`.
@@ -728,7 +729,7 @@ users_file = "/etc/mail-auth-proxy/legacy-users"
 mechanisms = ["PLAIN"]
 "#;
 
-    /// The target schema's legacy section parses, validates and round-trips.
+    /// The legacy section parses, validates and round-trips.
     #[test]
     fn legacy_rules_parse_and_round_trip() {
         let l = parse(&format!("{V2}{RULES}")).unwrap();

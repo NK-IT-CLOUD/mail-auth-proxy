@@ -11,13 +11,13 @@ pub use relay::splice;
 use anyhow::{anyhow, Result};
 use std::time::Duration;
 
-/// Timeouts and the pre-auth command limit, from the configuration
-/// (`[timeouts]`, `[limits]`).
+/// Timeouts, the pre-auth command limit and the session settings, from the
+/// configuration (`[timeouts]`, `[limits]`, `[session]`).
 #[derive(Debug, Clone, Copy)]
 pub struct Tuning {
-    /// Longest silence on any single wire read. Every protocol read goes
-    /// through `read_line`, so this bounds a stalled peer everywhere: a client
-    /// that never speaks, or a backend that accepts and goes silent.
+    /// Longest silence on any single line read, client or backend, until the
+    /// relay starts: a client that never speaks, or a backend that accepts
+    /// and goes silent. The relay has its own limit, `session_idle`.
     pub idle: Duration,
     /// Backend TCP connect, TLS handshake and PROXY header, each.
     pub connect: Duration,

@@ -156,8 +156,7 @@ impl Policy {
 struct KeyEntry {
     key: DecodingKey,
     policy: Arc<Policy>,
-    /// Built once per key at JWKS load, not per auth: algorithm pinned to the
-    /// key, issuer pinned to the realm that published it, audiences fixed.
+    /// Built once per key at JWKS load, not per auth.
     validation: Validation,
 }
 
@@ -182,10 +181,9 @@ type KeyMap = HashMap<String, Vec<KeyEntry>>;
 
 pub struct Validator {
     /// kid -> keys published under that kid. A `Vec` because two issuers may
-    /// legitimately use the same kid (or omit it, falling back to "default"),
-    /// and a key without `alg` gets one entry per algorithm it may be used
-    /// with; each candidate is tried against its *own* issuer, so a collision
-    /// can never widen what is accepted.
+    /// legitimately use the same kid (or omit it, falling back to "default");
+    /// each candidate is tried against its *own* issuer, so a collision can
+    /// never widen what is accepted.
     ///
     /// The lock only guards swapping the map: a validation clones the `Arc`
     /// and decodes without holding it, so a panic while decoding a hostile
@@ -287,11 +285,9 @@ impl Validator {
             let issuer = &policy.issuer;
             match fetch_jwks(&self.client, &policy.jwks_url).await {
                 Ok(jwks) => {
-                    // Stage into a scratch map first: merge_jwks_keys can insert
-                    // some keys and *then* fail on a malformed one, which would
-                    // otherwise leave a half-merged issuer in the shared map
-                    // while also marking it failed (so refresh would re-add its
-                    // previous keys on top).
+                    // Staged, so a JWKS that fails half-way leaves none of its
+                    // keys in the map (refresh would add the previous keys on
+                    // top).
                     let mut staged = HashMap::new();
                     match Self::merge_jwks_keys(&jwks, policy, self.leeway, &mut staged) {
                         // A realm that publishes zero usable keys is treated as
@@ -571,11 +567,9 @@ impl Validator {
         let entries = keys.get(&kid).ok_or(TokenError::UnknownKid)?;
         let mut last: Option<jsonwebtoken::errors::Error> = None;
         for e in entries {
-            // The validation carries the STORED algorithm from the JWKS key,
-            // not the untrusted header alg — this closes algorithm confusion
-            // (alg=none, HS256 forgery). The issuer is the one that PUBLISHED
-            // this key, not any configured issuer, so a token cannot borrow
-            // realm A's identity while being signed by realm B.
+            // Algorithm and issuer come from the stored key, never from the
+            // token: no algorithm confusion (alg=none, HS256 forgery), no
+            // issuer borrowed from another realm (see `KeyEntry`).
             match decode::<Map<String, Value>>(token, &e.key, &e.validation) {
                 Ok(data) => return check_claims(&data.claims, &header, &e.policy),
                 Err(err) => last = Some(err),
@@ -800,7 +794,7 @@ mod tests {
         assert!(v.validate(&tok).is_err());
     }
 
-    /// THE cross-realm test: a token signed with realm B's key but claiming
+    /// The cross-realm case: a token signed with realm B's key but claiming
     /// realm A's issuer must be rejected. With a flat kid->key map and a global
     /// issuer allow-list this passes validation, collapsing both realms into a
     /// single trust domain.

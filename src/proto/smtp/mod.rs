@@ -37,20 +37,15 @@ pub async fn handle(
 ) -> Result<()> {
     let _conn = crate::obs::metrics::ConnGuard::open(crate::obs::metrics::Proto::Smtp);
     let name = ctx.hostname();
-    // `internal`/`scope` tag metrics + logs so we can see intern-vs-extern auth outcomes.
     let (internal, scope) = ctx.scope(peer);
-    // One budget from the greeting to the credential: plaintext dialog, TLS
-    // handshake and post-TLS dialog together. A per-read idle deadline alone
-    // can be reset forever by a drip-feeding client, and separate budgets per
-    // phase would add up.
+    // One pre-auth budget from the greeting to the credential, across the
+    // plaintext dialog, the TLS handshake and the post-TLS dialog (see
+    // `Tuning::preauth`).
     let tuning = &ctx.tuning;
     let preauth_until = tokio::time::Instant::now() + tuning.preauth;
 
-    // ── Front: plaintext preamble until STARTTLS ──────────────────────────────
-
-    // Step 1+2+3: greeting, then read EHLO (tolerating NOOP/RSET) and reply
-    // capabilities. AUTH is refused until STARTTLS (creds must never cross
-    // plaintext).
+    // Greeting, then EHLO (tolerating NOOP/RSET) up to STARTTLS. AUTH is
+    // refused until STARTTLS: no credential crosses in the clear.
     let starttls = deadline_at(preauth_until, tuning.preauth, "submission pre-TLS", async {
         tcp.write_all(format!("220 {name} ESMTP\r\n").as_bytes())
             .await?;
@@ -64,9 +59,8 @@ pub async fn handle(
             }
             let line = read_client_line(&mut tcp, tuning.idle).await?;
             if verb_is(&line, "EHLO") {
-                // RFC 3207 §4.2: do not advertise AUTH before the session is
-                // encrypted, so a client can never be tempted to send
-                // credentials in the clear. An AUTH here is still answered 530.
+                // No AUTH before STARTTLS (RFC 4954 section 4: no plaintext
+                // password mechanisms without it). An AUTH here is answered 530.
                 tcp.write_all(format!("250-{name}\r\n250 STARTTLS\r\n").as_bytes())
                     .await?;
             } else if verb_is(&line, "HELO") {
@@ -96,7 +90,7 @@ pub async fn handle(
         }
     })
     .await;
-    // No credential was ever presented on these paths: pre-auth abort only.
+    // No credential was presented: a pre-auth abort.
     let starttls = match starttls {
         Ok(v) => v,
         Err(e) => {
@@ -108,7 +102,6 @@ pub async fn handle(
         return Ok(());
     }
 
-    // TLS upgrade — client side
     let mut client_tls = match deadline_at(
         preauth_until,
         tuning.preauth,
@@ -124,15 +117,13 @@ pub async fn handle(
         }
     };
 
-    // SNI + source IP decide whether password auth is offered. External clients
-    // (public mail.dev) and forged-SNI attackers get OAuth-only.
+    // SNI and source address decide which password mechanisms the legacy
+    // rules offer; none means OAuth only.
     let sni = client_tls.get_ref().1.server_name().map(|s| s.to_string());
     let pw_mechs = ctx.password_mechs(Proto::Smtp, sni.as_deref(), peer);
 
-    // ── Front: post-TLS dialog ────────────────────────────────────────────────
-
-    // Step 5: read EHLO after TLS, send capabilities without STARTTLS. Password
-    // mechanisms are advertised only as far as the legacy gate offers them.
+    // The EHLO reply after TLS: no STARTTLS, password mechanisms only as far
+    // as the legacy gate offers them.
     let extensions: String = ctx
         .protocol
         .ehlo_extensions
@@ -144,13 +135,11 @@ pub async fn handle(
         if pw_mechs.plain { " PLAIN" } else { "" },
         if pw_mechs.login { " LOGIN" } else { "" },
     );
-    // Step 5+6: run the post-TLS dialogue until AUTH arrives. Clients may send
-    // EHLO more than once (and NOOP/RSET in between); only AUTH ends this phase.
-    // The SASL continuation reads (AUTH LOGIN's two 334 round-trips, AUTH PLAIN
-    // with no inline IR) run inside the same budget: they are client-paced too.
-    // The block is also the single exit for every way this phase can end without
-    // a credential, so those outcomes land in preauth_aborts rather than
-    // inflating auth_attempts{result="fail"}. `Ok(None)` is a clean QUIT.
+    // The post-TLS dialog until AUTH arrives. Clients may send EHLO more than
+    // once (and NOOP/RSET in between); only AUTH ends this phase. The SASL
+    // continuation reads (AUTH LOGIN's two 334 round-trips, AUTH PLAIN
+    // without an initial response) run inside the same budget: they are
+    // client-paced too. `Ok(None)` is a clean QUIT.
     let authed = match deadline_at(
         preauth_until,
         tuning.preauth,
@@ -201,9 +190,8 @@ pub async fn handle(
     {
         Ok(v) => v,
         Err(e) => {
-            // The client went away before presenting a credential (EOF, total
-            // timeout, command flood, unparsable AUTH). Detail to the journal
-            // for CrowdSec; count it as a pre-auth abort, never an auth fail.
+            // No credential was presented (EOF, total timeout, command flood,
+            // unparsable AUTH): a `protocol` record and a pre-auth abort.
             crate::obs::authlog::AuthEvent {
                 proto: crate::obs::metrics::Proto::Smtp,
                 scope,
@@ -225,8 +213,8 @@ pub async fn handle(
         None => return Ok(()),
     };
 
-    // Step 6b+7: gate, token validation and backend login (connect,
-    // STARTTLS, AUTH with the client's own credential).
+    // Gate, token validation and backend login (connect, STARTTLS, AUTH with
+    // the client's own credential).
     let session = auth::Session {
         proto: Proto::Smtp,
         peer,
@@ -242,10 +230,6 @@ pub async fn handle(
         xclient: ctx.protocol.xclient,
         peer,
     };
-    // Every failure answers the client, then ends the session with an error
-    // for the journal. The answer is best effort: a client that is already
-    // gone must not replace the reason (an outage's cause above all) with a
-    // write error.
     const INVALID: &str = "535 5.7.8 Authentication credentials invalid";
     let outcome = auth::authorize(&ctx, &session, &mech, &kind, &login).await;
     // The credential is not needed after the login: dropping it zeroizes it
@@ -256,7 +240,6 @@ pub async fn handle(
             conn: mut be,
             identity,
         } => {
-            // Step B6: success — tell client and splice
             permit.authenticated();
             client_tls
                 .write_all(b"235 2.7.0 Authentication successful\r\n")

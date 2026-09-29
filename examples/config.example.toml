@@ -123,7 +123,7 @@ max_preauth_commands = 8
 
 [timeouts]
 preauth_secs = 60                          # accept to credential, in total
-idle_secs = 30                             # silence on any single read
+idle_secs = 30                             # silence on any single read before the relay
 connect_secs = 10                          # backend connect / TLS / PROXY header
 
 [session]                                  # optional: defaults shown

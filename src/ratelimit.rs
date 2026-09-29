@@ -23,8 +23,9 @@
 //!   clear the way for guesses at others.
 //!
 //! Bounded: at most `CAPACITY` sources. When full, entries with nothing left
-//! to remember go first, then the least valuable ones (unblocked before
-//! blocked, oldest first), counted as evictions.
+//! to remember go first; if that is not enough, the least valuable ones
+//! (unblocked before blocked, oldest first), and only those count as
+//! evictions.
 
 use crate::auth::sasl::ClientAuthKind;
 use crate::config;

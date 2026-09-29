@@ -1,6 +1,6 @@
 //! OAuth2 authentication proxy for IMAP, SMTP submission and ManageSieve in front
 //! of Dovecot/Postfix. The binary (`src/main.rs`) parses the command line and
-//! calls [`server::run`]; see `README.md` for the architecture.
+//! calls [`server::run`]; see `docs/architecture.md` for the architecture.
 
 mod auth;
 pub mod config;

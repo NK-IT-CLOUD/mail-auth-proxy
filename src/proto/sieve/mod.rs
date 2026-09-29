@@ -45,10 +45,9 @@ fn sieve_challenge(b64: &str) -> String {
     }
 }
 
-// Post-TLS SASL line advertised to the client, chosen by the legacy gate
-// (source IP + SNI + protocol) — same rules as IMAP/SMTP. LOGIN
-// is intentionally not offered here: unlike IMAP/SMTP this proxy has no
-// two-step SASL LOGIN challenge dialog implemented for ManageSieve, only PLAIN.
+/// Post-TLS SASL lines, chosen by the legacy gate (source address, SNI,
+/// protocol). LOGIN is never offered: the proxy has no SASL LOGIN challenge
+/// dialog for ManageSieve, only PLAIN.
 const SASL_OAUTH_ONLY: &[u8] = b"\"SASL\" \"XOAUTH2 OAUTHBEARER\"\r\n";
 const SASL_FULL: &[u8] = b"\"SASL\" \"XOAUTH2 OAUTHBEARER PLAIN\"\r\n";
 
@@ -67,24 +66,17 @@ pub async fn handle(
     mut permit: ConnPermit,
 ) -> Result<()> {
     let _conn = crate::obs::metrics::ConnGuard::open(crate::obs::metrics::Proto::Sieve);
-    // The address the client dialed (this socket's local addr), captured before
-    // `tcp` is consumed by the TLS accept. Used only as the PROXY protocol
-    // destination; falls back to `peer` so both ends share an address family.
+    // The address the client dialed, for the PROXY header; `peer` as the
+    // fallback keeps both ends in one address family.
     let local = tcp.local_addr().unwrap_or(peer);
-    // `internal`/`scope` tag metrics + logs so sieve auth outcomes are visible
-    // per intern/extern too.
     let (internal, scope) = ctx.scope(peer);
-    // One budget for the whole pre-auth phase: plaintext dialog, TLS handshake
-    // and AUTHENTICATE. A per-read idle deadline alone can be reset forever by a
-    // client feeding one byte just under the idle timeout.
+    // One pre-auth budget across the plaintext dialog, the TLS handshake and
+    // AUTHENTICATE (see `Tuning::preauth`).
     let tuning = &ctx.tuning;
     let preauth_until = Instant::now() + tuning.preauth;
 
-    // ── Front: plaintext preamble ─────────────────────────────────────────────
-
-    // Step 1+2: capability greeting, then wait for STARTTLS (RFC 5804 §2.2 says
-    // client MUST send STARTTLS before any authenticated command; we reject
-    // everything else).
+    // Capability greeting, then only STARTTLS or LOGOUT: AUTHENTICATE gets
+    // ENCRYPT-NEEDED, everything else NO.
     let starttls = deadline_at(preauth_until, tuning.preauth, "sieve pre-TLS", async {
         let greeting = caps_plain(ctx.hostname(), ctx.protocol.caps.sieve_line().as_deref());
         tcp.write_all(greeting.as_bytes()).await?;
@@ -109,14 +101,13 @@ pub async fn handle(
                 tcp.write_all(b"NO (ENCRYPT-NEEDED) \"STARTTLS required\"\r\n")
                     .await?;
             } else {
-                // Unknown command before TLS — politely reject
                 tcp.write_all(b"NO \"Command not permitted before STARTTLS\"\r\n")
                     .await?;
             }
         }
     })
     .await;
-    // No credential was ever presented on these paths: pre-auth abort only.
+    // No credential was presented: a pre-auth abort.
     let starttls = match starttls {
         Ok(v) => v,
         Err(e) => {
@@ -128,7 +119,6 @@ pub async fn handle(
         return Ok(());
     }
 
-    // Step 3: TLS upgrade — client side
     let mut client_tls = match deadline_at(
         preauth_until,
         tuning.preauth,
@@ -148,13 +138,12 @@ pub async fn handle(
     // rules as IMAP/SMTP. External clients and forged-SNI attackers stay
     // OAuth-only unless a rule names their network.
     let sni = client_tls.get_ref().1.server_name().map(|s| s.to_string());
-    // Only PLAIN exists here (no SASL LOGIN dialog for ManageSieve).
     let pw_mechs = crate::auth::legacy::MechSet {
         plain: ctx.password_mechs(Proto::Sieve, sni.as_deref(), peer).plain,
         login: false,
     };
 
-    // Step 4: relay the backend's post-TLS capabilities, rewriting SASL to what
+    // Relay the backend's post-TLS capabilities, rewriting SASL to what
     // this endpoint allows and dropping STARTTLS (already done).
     let be_caps = match deadline_at(
         preauth_until,
@@ -196,8 +185,8 @@ pub async fn handle(
         .write_all(b"OK \"TLS negotiation successful.\"\r\n")
         .await?;
 
-    // Step 5: read commands until AUTHENTICATE and parse the credential, inside
-    // the pre-auth budget. RFC 5804 allows CAPABILITY, NOOP and LOGOUT before
+    // Read commands until AUTHENTICATE and parse the credential, inside the
+    // pre-auth budget. RFC 5804 allows CAPABILITY, NOOP and LOGOUT before
     // authenticating. Every other way this ends without a credential is a
     // pre-auth abort; LOGOUT is a clean end.
     let (mech, kind) = match deadline_at(
@@ -279,10 +268,8 @@ pub async fn handle(
         Ok(Some(v)) => v,
         Ok(None) => return Ok(()),
         Err(e) => {
-            // The client never got as far as presenting a credential (EOF,
-            // timeout, unparsable AUTHENTICATE). Same treatment as IMAP: the
-            // detail goes to the journal for CrowdSec, the counter goes to
-            // preauth_aborts — not to auth_attempts{result="fail"}.
+            // No credential was presented (EOF, timeout, unparsable
+            // AUTHENTICATE): a `protocol` record and a pre-auth abort.
             crate::obs::authlog::AuthEvent {
                 proto: crate::obs::metrics::Proto::Sieve,
                 scope,
@@ -300,8 +287,8 @@ pub async fn handle(
         }
     };
 
-    // Step 6: gate, token validation and backend login. The backend is
-    // contacted only with a credential that passed the local checks.
+    // Gate, token validation and backend login. The backend is contacted
+    // only with a credential that passed the local checks.
     let session = auth::Session {
         proto: Proto::Sieve,
         peer,
@@ -315,10 +302,6 @@ pub async fn handle(
         tuning,
         origin: (peer, local),
     };
-    // Every failure answers the client, then ends the session with an error
-    // for the journal. The answer is best effort: a client that is already
-    // gone must not replace the reason (an outage's cause above all) with a
-    // write error.
     const FAILED: &str = "NO \"Authentication failed\"";
     let outcome = auth::authorize(&ctx, &session, &mech, &kind, &login).await;
     // The credential is not needed after the login: dropping it zeroizes it
@@ -409,9 +392,8 @@ mod tests {
         assert_eq!(sieve_challenge(&long), format!("{{1025}}\r\n{long}\r\n"));
     }
 
-    /// The password-gated SASL line advertises PLAIN when allowed, never LOGIN
-    /// (no two-step SASL LOGIN dialog is implemented for ManageSieve), and the
-    /// OAuth-only line never advertises a password mechanism.
+    /// The password-gated SASL line advertises PLAIN, never LOGIN; the
+    /// OAuth-only line no password mechanism.
     #[test]
     fn sasl_capability_lines_match_gate() {
         let full = std::str::from_utf8(SASL_FULL).unwrap();

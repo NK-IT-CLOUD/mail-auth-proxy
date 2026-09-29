@@ -5,7 +5,7 @@
 # VERSION is never hardcoded; SOURCE_DATE_EPOCH makes the output deterministic.
 # RPM_SIGNING_KEY_FILE (armored secret signing subkey, passphrase in
 # NFPM_RPM_PASSPHRASE) signs the rpm header; unset or empty gives an unsigned rpm
-# (CI, RC). Only the publish workflow sets it.
+# (CI, RC). Only release builds set it.
 # All contents stay in this list, scoped with `packager:` — overrides.<fmt>.contents
 # would replace the list instead of extending it.
 name: mail-auth-proxy

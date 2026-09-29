@@ -1,10 +1,10 @@
 //! Prometheus metrics for the mail authentication proxy.
 //!
-//! Design constraints (this is a PROD mail auth path):
-//! - Zero new dependencies: counters are plain atomics, the `/metrics` endpoint
-//!   is a minimal HTTP/1.1 responder over the tokio runtime we already use.
-//! - Instrumentation is off the hot path: every hook is a single relaxed
-//!   atomic add; nothing here can fail an auth or drop a connection.
+//! Design constraints:
+//! - No dependencies: counters are plain atomics, the `/metrics` endpoint is a
+//!   minimal HTTP/1.1 responder over the tokio runtime the proxy already uses.
+//! - Instrumentation is off the hot path: every hook is a few relaxed atomic
+//!   operations; nothing here can fail an auth or drop a connection.
 //! - The endpoint runs in its own task; a bind failure is logged and the mail
 //!   listeners keep serving (see `serve`).
 
@@ -71,12 +71,7 @@ fn mech_idx(mech: &str) -> usize {
 // auth_attempts[proto][scope][mech][result]; result 0 = ok, 1 = fail
 static AUTH_ATTEMPTS: [[[[AtomicU64; 2]; N_MECH]; N_SCOPE]; N_PROTO] =
     [const { [const { [const { [const { AtomicU64::new(0) }; 2] }; N_MECH] }; N_SCOPE] }; N_PROTO];
-// preauth_aborts[proto][scope]: connections that died BEFORE a credential was
-// ever presented (TLS-stack incompatibility, portscan, EOF, unsupported SASL
-// mechanism, pre-auth command flood). Counted as failed logins they would
-// make portscan noise indistinguishable from a real rejected login; kept
-// apart, `auth_attempts_total{result="fail"}` means exactly "a credential was
-// evaluated and rejected".
+// preauth_aborts[proto][scope]: see `record_preauth_abort`.
 static PREAUTH_ABORTS: [[AtomicU64; N_SCOPE]; N_PROTO] =
     [const { [const { AtomicU64::new(0) }; N_SCOPE] }; N_PROTO];
 /// The `reason` label values of `mail_auth_proxy_auth_refusals_total`: every
@@ -92,8 +87,8 @@ const REFUSAL_REASONS: [Reason; 8] = [
     Reason::Oversize,
 ];
 // auth_refusals[proto][reason]: the refused credentials of
-// auth_attempts{result="fail"}, split by why. A separate family, so the
-// label set of auth_attempts (and the dashboards on it) stays as it is.
+// auth_attempts{result="fail"}, split by why. A separate family keeps the
+// label set of auth_attempts small.
 static AUTH_REFUSALS: [[AtomicU64; REFUSAL_REASONS.len()]; N_PROTO] =
     [const { [const { AtomicU64::new(0) }; REFUSAL_REASONS.len()] }; N_PROTO];
 // token_validate[result]; result 0 = ok, 1 = fail
@@ -124,11 +119,12 @@ pub fn record_refusal(proto: Proto, reason: Reason) {
     }
 }
 
-/// Record a connection that aborted BEFORE any credential was presented
-/// (pre-auth protocol/TLS failure, portscan, unsupported mechanism). Kept out
-/// of `auth_attempts_total` so a rejected login is never confused with scanner
-/// noise. The full reason stays in the journal (`authlog`, `reason="protocol"`)
-/// for CrowdSec; only the coarse proto/scope split is exposed as a time series.
+/// Record a connection that ended before any credential was presented
+/// (TLS or protocol failure, portscan, EOF, unsupported mechanism, command
+/// flood). Kept out of `auth_attempts_total`, so `result="fail"` there means
+/// exactly "a credential was evaluated and rejected" and scanner noise never
+/// looks like a failed login. The detail stays in the journal (`authlog`,
+/// `reason="protocol"`); only the proto/scope split is a time series.
 #[inline]
 pub fn record_preauth_abort(proto: Proto, internal: bool) {
     PREAUTH_ABORTS[proto.idx()][scope_idx(internal)].fetch_add(1, Ordering::Relaxed);
@@ -1100,7 +1096,7 @@ mod tests {
     #[test]
     fn preauth_abort_is_separate_from_auth_fail() {
         // A pre-auth abort must land in its own series, never inflate the
-        // per-mechanism auth-fail bucket that the "failed logins" panels read.
+        // per-mechanism auth-fail series.
         record_preauth_abort(Proto::Imap, false);
         let out = render();
         assert!(out.contains("# TYPE mail_auth_proxy_preauth_aborts_total counter"));

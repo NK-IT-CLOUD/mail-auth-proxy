@@ -1,6 +1,6 @@
 //! Configuration.
 //!
-//! The current format is version 2: sectioned, strict (unknown keys are an
+//! The format is version 2: sectioned, strict (unknown keys are an
 //! error), with per-issuer token rules and per-backend TLS. A file without
 //! `config_version = 2` is rejected.
 //!
@@ -85,7 +85,7 @@ mod tests {
         Ok(l)
     }
 
-    /// A flat file of the kind earlier releases read: no `config_version`.
+    /// A flat file without sections and without `config_version`.
     const FLAT: &str = r#"
 listen = "0.0.0.0:993"
 tls_cert = "/c.pem"

@@ -34,20 +34,17 @@ pub struct ClientAuth {
     pub kind: crate::auth::sasl::ClientAuthKind,
 }
 
-/// Read the client's pre-auth dialog up to a credential. `pw` gates only
-/// the *advertisement*: on an OAuth-only endpoint PLAIN/LOGIN are not offered
-/// in the capabilities. The credential is still parsed if a client sends it
-/// anyway, so the handler can log the attempt (user + password fingerprint)
-/// before rejecting it — the handler is where the SNI+source-IP policy is
-/// actually enforced.
+/// Read the client's pre-auth dialog up to a credential. `pw` only decides
+/// what is advertised; a password sent anyway is still parsed, so
+/// `auth::authorize` can log and refuse it.
 ///
 /// RFC 3501 requires CAPABILITY/NOOP/LOGOUT to work in NOT-AUTHENTICATED state,
 /// and stock clients (Python imaplib) send an explicit CAPABILITY before
 /// authenticating and use the LOGIN *command* (not the SASL LOGIN mechanism).
 /// The loop is bounded so an unauthenticated peer can't hold the slot.
 ///
-/// `Ok(None)` is a LOGOUT before authenticating — a clean end, not a failure.
-/// Every error path answers the client before returning.
+/// `Ok(None)`: LOGOUT, or a close right after the greeting — a clean end, not
+/// a failure. Every refusal is answered; a read error or timeout is not.
 /// `name` is the server name shown in the greeting.
 pub async fn read_client_auth<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
@@ -427,9 +424,8 @@ mod tests {
 
     #[tokio::test]
     async fn oauth_only_greeting_omits_password_but_still_parses() {
-        // OAuth-only endpoint (no password mechanism): PLAIN/LOGIN are NOT advertised,
-        // but a PLAIN attempt is still parsed so the handler can log it before it
-        // enforces the block (the block lives in the handler, not the parser).
+        // OAuth-only endpoint: PLAIN/LOGIN are not advertised, a PLAIN
+        // attempt is still parsed (see `read_client_auth`).
         let (mut client, mut server) = tokio::io::duplex(4096);
         let ir = base64::engine::general_purpose::STANDARD.encode("\0bob@example.invalid\0pw");
         let t = tokio::spawn(async move {

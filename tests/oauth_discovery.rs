@@ -168,11 +168,10 @@ async fn error_result_is_the_same_for_every_rejection() {
     assert!(ars.iter().all(|a| a.reason == "bad_token"), "{ars:?}");
 }
 
-/// Answers other than the dummy: the other mechanism's dummy (Thunderbird
-/// for Android sends an empty line to OAUTHBEARER) still ends in the usual
-/// failure; an abort or undecodable answer (Thunderbird's IMAP client resends
-/// its AUTHENTICATE line) in the protocol's abort reply. The record stays
-/// one `bad_token`, and the session end names the answer.
+/// Answers other than the dummy: the other mechanism's dummy (an empty line
+/// to OAUTHBEARER) still ends in the usual failure; an abort or undecodable
+/// answer (a resent AUTHENTICATE line) in the protocol's abort reply. The
+/// record stays one `bad_token`, and the session end names the answer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn answers_other_than_the_dummy() {
     let h = harness(Opts::default()).await;

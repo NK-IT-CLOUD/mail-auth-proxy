@@ -2,8 +2,8 @@ use anyhow::{anyhow, Result};
 use base64::Engine;
 use zeroize::Zeroizing;
 
-/// The credential of an OAuth SASL response. No `Debug` derive and no
-/// `Clone`: the token must not reach a log line or be copied.
+/// The credential of an OAuth SASL response. `Debug` redacts the token and
+/// there is no `Clone`: the token must not reach a log line or be copied.
 pub struct SaslCreds {
     pub user: String,
     pub token: Zeroizing<String>,
@@ -40,7 +40,7 @@ pub fn decode_secret_b64(b64: &str) -> Result<Zeroizing<Vec<u8>>> {
 }
 
 /// Extract the `auth=Bearer <token>` value from ^A-separated fields. The
-/// scheme name is case-insensitive (RFC 6750 §2.1, RFC 7628 §3.1).
+/// scheme name is case-insensitive (RFC 7628 §3.1).
 fn extract_bearer(s: &str) -> Option<Zeroizing<String>> {
     const PREFIX: &str = "auth=bearer ";
     s.split('\x01')
@@ -63,7 +63,8 @@ pub fn parse_sasl(mechanism: &str, b64_ir: &str) -> Result<SaslCreds> {
             .find_map(|f| f.strip_prefix("user=").map(|u| u.to_string()))
             .ok_or_else(|| anyhow!("no user= in XOAUTH2"))?,
         // gs2 header: n,a=<user>, — the authzid is optional (RFC 7628 §3.1,
-        // `n,,`). It is only logged; the mailbox comes from the token.
+        // `n,,`). It is checked against the token's identity
+        // (`authzid_allowed`); the mailbox comes from the token.
         "OAUTHBEARER" => {
             let first = s.split('\x01').next().unwrap_or("");
             first

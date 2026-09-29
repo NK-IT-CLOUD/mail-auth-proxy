@@ -336,8 +336,8 @@ fn is_plain_name(s: &str) -> bool {
 /// the proxy's EHLO to the backend, the IMAP greeting and the ManageSieve
 /// IMPLEMENTATION string. It must be a `Domain` of RFC 5321 section 4.1.2:
 /// dot-separated labels of letters, digits and hyphens, no hyphen at either
-/// end of a label, 1-63 characters each and 253 in all (RFC 1035 section
-/// 2.3.4). An address literal (`[192.0.2.1]`) is not accepted: the EHLO
+/// end of a label, 1-63 characters each and 253 in all (the 255-octet limit
+/// of RFC 1035 section 2.3.4, in text form). An address literal (`[192.0.2.1]`) is not accepted: the EHLO
 /// reply (`ehlo-ok-rsp`) takes a Domain only.
 fn check_hostname(h: &str) -> Result<(), String> {
     if h.starts_with('[') || h.parse::<IpAddr>().is_ok() {

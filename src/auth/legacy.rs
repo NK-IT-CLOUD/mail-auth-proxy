@@ -56,8 +56,8 @@ fn mechanism(mech: &str) -> Option<Mechanism> {
     }
 }
 
-/// Longest login the gate looks at (a mailbox name; RFC 4616 limits PLAIN
-/// fields to 255 octets).
+/// Longest login the gate looks at (a mailbox name; RFC 4616 requires
+/// servers to accept at least 255 octets).
 const MAX_LOGIN: usize = 255;
 
 /// Backend-rejection latencies kept per protocol for refusal timing.
@@ -608,19 +608,16 @@ impl Gate {
         self.rules.is_empty()
     }
 
-    /// Rule names, for the startup log.
-    pub fn rule_names(&self) -> Vec<&str> {
-        self.rules.iter().map(|r| r.name.as_str()).collect()
-    }
-
     /// The password mechanisms to offer on a connection: those of every rule
     /// whose network, SNI and protocol match. Users are checked on the
     /// attempt.
     ///
-    /// SASL LOGIN must not be offered where PLAIN and a plaintext login
-    /// command are both prohibited (draft-murchison-sasl-login §1): SMTP has
-    /// no such command, so there LOGIN needs PLAIN. In IMAP the LOGIN command
-    /// is the same setting as SASL LOGIN.
+    /// SASL LOGIN "MUST NOT be advertised or used in any configuration that
+    /// prohibits the PLAIN mechanism or plaintext LOGIN (or USER/PASS)
+    /// command" (draft-murchison-sasl-login §1). SMTP has no plaintext login
+    /// command, so there LOGIN needs PLAIN. In IMAP the LOGIN command is the
+    /// same setting as SASL LOGIN, so LOGIN is never offered where the
+    /// command is prohibited.
     pub fn advertised(&self, proto: Proto, peer: IpAddr, sni: Option<&str>) -> MechSet {
         let p = protocol(proto);
         let mut set = MechSet::default();
@@ -789,7 +786,7 @@ mod tests {
         }
     }
 
-    // The attacks the short form must stop (formerly `policy::password_allowed`).
+    // The attacks the short form must stop.
 
     #[test]
     fn internal_sni_and_internal_ip_allows() {

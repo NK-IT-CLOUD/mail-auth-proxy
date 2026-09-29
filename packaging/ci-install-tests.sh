@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install, upgrade and remove the packages in throwaway containers; the assertions
-# are in packaging/smoke-test.sh. CONTAINER_ENGINE is buildah (rootless, the
-# maintainer's runner) or docker (GitHub-hosted runners).
+# are in packaging/smoke-test.sh. CONTAINER_ENGINE is buildah (rootless,
+# self-hosted runners) or docker (GitHub-hosted runners).
 #   ci-install-tests.sh OLD_DIR NEW_DIR   (each with one .deb and one .rpm)
 set -euo pipefail
 old=$1 new=$2

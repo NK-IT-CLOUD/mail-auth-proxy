@@ -1,20 +1,19 @@
 //! Structured auth-outcome logging for downstream consumers.
 //!
-//! CrowdSec parses these lines to ban brute-force sources; Grafana reads the
-//! counters in `obs/metrics.rs`. One event per auth outcome, emitted on a stable
-//! `authlog` target with a fixed `authresult` message so a log parser can
-//! anchor reliably. Fields: result, proto, scope (internal/external), mech,
-//! user, peer (source IP), reason, pwfp, rule (the legacy rule that decided,
-//! empty otherwise). New fields are only ever appended at the end.
+//! Log parsers such as CrowdSec read these lines to ban brute-force sources;
+//! the counters are in `obs/metrics.rs`. One event per auth outcome, emitted
+//! on a stable `authlog` target with a fixed `authresult` message so a log
+//! parser can anchor reliably. Fields: result, proto, scope
+//! (internal/external), mech, user, peer (source IP), reason, pwfp, rule (the
+//! legacy rule that decided, empty otherwise). New fields are only ever
+//! appended at the end.
 //!
-//! SECURITY:
-//! - The attempted password is NEVER logged in clear. Only a truncated
-//!   HMAC-SHA256 fingerprint (`pwfp`, keyed per process) is emitted — enough to correlate password-spraying
-//!   ("same password from many IPs") without exposing a possibly-real secret.
-//! - `user`/`mech` are attacker-controlled, so they are sanitised before
-//!   logging (control chars / spaces / newlines stripped) to prevent log
-//!   injection — otherwise a crafted username could forge extra log lines and
-//!   mislead CrowdSec.
+//! - The attempted password is never logged. Only a truncated HMAC-SHA256
+//!   fingerprint (`pwfp`, keyed per process) is, to correlate password
+//!   spraying ("same password from many IPs").
+//! - `user` and `mech` are attacker-controlled: `sanitize` replaces
+//!   everything but a safe set of characters with `?`, so a crafted value
+//!   cannot forge a field or a log line.
 
 use super::metrics::Proto;
 use std::fmt::Write as _;
@@ -29,8 +28,7 @@ use std::net::IpAddr;
 /// removes that, because the key never leaves memory.
 ///
 /// The trade-off is deliberate: fingerprints are comparable only within one
-/// process lifetime, so spraying correlation resets on restart. That is the
-/// window CrowdSec acts on anyway.
+/// process lifetime, so spraying correlation resets on restart.
 fn fingerprint_key() -> &'static aws_lc_rs::hmac::Key {
     static KEY: std::sync::OnceLock<aws_lc_rs::hmac::Key> = std::sync::OnceLock::new();
     KEY.get_or_init(|| {
@@ -199,7 +197,7 @@ mod tests {
         assert!(!a.contains("hunter"), "must not leak the clear password");
     }
 
-    /// The `reason` values are parsed by CrowdSec and Wazuh.
+    /// The `reason` values are parsed by log parsers (CrowdSec).
     #[test]
     fn reason_strings_are_stable() {
         let all = [

@@ -1,8 +1,8 @@
 //! Who the backend sees: the mailbox login is the token's email (a SASL
-//! authorisation identity naming anyone else fails), OAUTHBEARER is converted to XOAUTH2 with the
-//! same token, a password is forwarded as PLAIN with an empty authzid, and the
-//! client address travels in a PROXY v2 header (IMAP, ManageSieve) or XCLIENT
-//! (SMTP).
+//! authorisation identity naming anyone else fails), OAUTHBEARER is converted
+//! to XOAUTH2 with the same token, a password is forwarded as PLAIN with an
+//! empty authzid, and the client address travels in a PROXY v2 header (IMAP,
+//! ManageSieve) or XCLIENT (SMTP).
 
 mod common;
 use common::*;

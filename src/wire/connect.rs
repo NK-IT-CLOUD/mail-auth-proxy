@@ -30,8 +30,7 @@ pub async fn connect(
     Ok(tcp)
 }
 
-/// TLS handshake with `backend` on `tcp`, verified against its `verify_name`
-/// (the certificate is issued for that name, not for the raw backend IP).
+/// TLS handshake with `backend` on `tcp`, verified against its `verify_name`.
 pub async fn tls(
     backend: &BackendConn,
     tcp: TcpStream,
@@ -44,12 +43,11 @@ pub async fn tls(
     .await
 }
 
-/// Write the PROXY protocol v2 header if enabled. It must be the very first
-/// bytes on a backend connection, before the TLS handshake, so Dovecot
-/// (haproxy = yes) attributes the real client. `origin` is `(client, local)`,
-/// local being the address the client dialed (this socket's local addr); the
-/// two always share an address family. `None` marks a connection the proxy
-/// makes for itself and sends a LOCAL header.
+/// Write the PROXY protocol v2 header if enabled (see `proxyproto`): the
+/// first bytes on the connection, before the TLS handshake. `origin` is
+/// `(client, local)`, local being the address the client dialed (this
+/// socket's local addr); the two always share an address family. `None`
+/// marks a connection the proxy makes for itself and sends a LOCAL header.
 async fn send_proxy_header(
     backend: &BackendConn,
     tcp: &mut TcpStream,

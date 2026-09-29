@@ -2,9 +2,9 @@
 //! against them. The legacy rules (`auth/legacy.rs`) and the scope label use
 //! it.
 //!
-//! The mail proxy is a public edge. SNI is chosen by the client (an attacker
-//! can forge it), so the source address is the hard boundary of every legacy
-//! rule; NAT/DNAT preserves the real source address for external clients.
+//! SNI is chosen by the client (an attacker can forge it), so the source
+//! address is the hard boundary of every legacy rule. The proxy must see real
+//! client addresses: DNAT keeps them, SNAT or a load balancer do not.
 
 use anyhow::{Context, Result};
 use ipnet::IpNet;

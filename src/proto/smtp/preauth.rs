@@ -8,7 +8,8 @@ use zeroize::Zeroizing;
 
 /// Parse `AUTH <MECH> [<IR>]` (already-read line) and gather the credential.
 /// Returns the mechanism name and a classified `ClientAuthKind`. Never logs
-/// secrets. Every error path answers the client (501/504) before returning.
+/// secrets. Every error path answers the client (501, 503 or 504) before
+/// returning.
 pub(crate) async fn read_smtp_auth<S>(
     line: &str,
     stream: &mut S,
@@ -46,8 +47,8 @@ where
             crate::obs::authlog::sanitize(&mech)
         ));
     }
-    // Always parse the credential (even password mechs on an OAuth-only endpoint):
-    // the handler logs the attempt then enforces the SNI+source-IP block.
+    // Parsed also where passwords are not offered, so `auth::authorize` can
+    // log and refuse it.
     match read_smtp_credential(stream, &mech, inline, idle).await {
         Ok(kind) => Ok((mech, kind)),
         Err(e) => {
@@ -105,7 +106,7 @@ where
     })
 }
 
-/// SASL-IR for SMTP: inline if present, else send `334 \r\n` and read one line.
+/// The initial response: inline if present, else send `334 \r\n` and read one line.
 async fn smtp_ir<S>(
     stream: &mut S,
     inline: Option<Zeroizing<String>>,
@@ -215,8 +216,6 @@ mod tests {
 
     #[tokio::test]
     async fn smtp_plain_parses_for_handler_enforcement() {
-        // read_smtp_auth always parses PLAIN (so the handler can log the attempt);
-        // the OAuth-only block is enforced by the handler, not here.
         let ir = base64::engine::general_purpose::STANDARD.encode("\0bob@example.invalid\0pw");
         let (_client, mut server) = tokio::io::duplex(4096);
         let line = format!("AUTH PLAIN {ir}");
@@ -251,8 +250,7 @@ mod tests {
         }
     }
 
-    /// `AUTH LOGIN <b64user>`: only the password is asked for. Asking for the
-    /// username again would make clients send the password as the username.
+    /// `AUTH LOGIN <b64user>`: only the password is asked for.
     #[tokio::test]
     async fn smtp_auth_login_with_initial_response() {
         let (mut client, mut server) = tokio::io::duplex(4096);

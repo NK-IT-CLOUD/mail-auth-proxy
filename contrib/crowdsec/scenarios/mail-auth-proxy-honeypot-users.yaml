@@ -1,6 +1,6 @@
 # Instant ban for a failed password login from an external IP with a role or
-# test account name (postmaster@, admin@, test@, ...). Bots walk such wordlists
-# with one or two attempts per IP to stay below per-IP thresholds.
+# test account name (postmaster@, admin@, test@, ...): one attempt is enough,
+# so a wordlist walked with few attempts per IP still gets caught.
 #
 # Adjust the list: remove any name that is a real login on your server (names
 # such as mail, test or user often are), or the first mistyped password of that

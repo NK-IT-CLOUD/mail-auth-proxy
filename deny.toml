@@ -28,7 +28,7 @@ confidence-threshold = 0.93
 multiple-versions = "warn"
 wildcards = "deny"
 deny = [
-    # aws-lc-rs is the single crypto library (decision 2026-09-13).
+    # aws-lc-rs is the single crypto library.
     { crate = "ring", reason = "aws-lc-rs is the only crypto provider" },
     { crate = "openssl-sys", reason = "rustls on aws-lc-rs, no system OpenSSL" },
     { crate = "rsa", reason = "RUSTSEC-2023-0071, not constant-time" },

@@ -44,21 +44,17 @@ enum AuthReply {
     Unavailable,
 }
 
-/// RFC 5530 response codes that say the attempt failed for a reason other
-/// than the credential and may succeed later: `UNAVAILABLE` (a subsystem is
-/// down), `INUSE` (the mailbox is locked by another session), `SERVERBUG`
-/// and `LIMIT` (a server-side limit, e.g. connections per user). A `NO` with
-/// one of them is no verdict on the credential.
+/// RFC 5530 response codes that name a server-side cause: `UNAVAILABLE` (a
+/// subsystem is down), `INUSE` (a lock someone else holds), `SERVERBUG` and
+/// `LIMIT` (an implementation limit). A `NO` with one of them is treated as
+/// an outage, not a verdict on the credential.
 const TEMPORARY_CODES: [&str; 4] = ["[UNAVAILABLE]", "[INUSE]", "[SERVERBUG]", "[LIMIT]"];
 
 /// Classify the tagged reply (tag already stripped), case-insensitively.
 ///
 /// `bad_is_verdict`: a `BAD` answers a password credential the proxy sent
 /// unchanged (not its own cancel). The client chose those bytes, so a `BAD`
-/// is a rejection: a crafted password must not turn an account that passed
-/// the legacy gate into an instant retry-later, an enumeration oracle next
-/// to the delayed refusals. `auth::MAX_PASSWORD` keeps the command far below
-/// Dovecot's input limits, so this is defence in depth.
+/// is a rejection, not an outage (see `auth::MAX_PASSWORD`).
 fn classify_tagged(reply: &str, bad_is_verdict: bool) -> AuthReply {
     let mut words = reply.splitn(3, ' ');
     let status = words.next().unwrap_or("");

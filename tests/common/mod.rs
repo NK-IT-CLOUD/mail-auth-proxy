@@ -1120,20 +1120,32 @@ pub struct AuthResult {
     pub pwfp: String,
 }
 
-/// The CrowdSec grok pattern for the authresult line, translated to a regex:
-/// `authresult result="%{DATA}" proto="%{DATA}" scope="%{DATA}"
-/// mech=%{NOTSPACE} user=%{DATA} peer=%{IP} reason="%{DATA}"`
-/// (DATA = `.*?`, NOTSPACE = `\S+`, IP = grok's IPV4 | IPV6).
+/// The grok pattern of the shipped CrowdSec parser
+/// (`contrib/crowdsec/parsers/s01-parse/mail-auth-proxy-logs.yaml`),
+/// translated to a regex: WORD = `\b\w+\b`, DATA = `.*?`, NOTSPACE = `\S+`,
+/// IP = grok's IPV4 | IPV6. Each field is a capture group, in pattern order
+/// (1 result … 7 reason).
 pub fn grok_regex() -> regex::Regex {
+    const PARSER: &str =
+        include_str!("../../contrib/crowdsec/parsers/s01-parse/mail-auth-proxy-logs.yaml");
     const IPV4: &str = r"(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9])";
     const IPV6: &str = r"(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}";
-    regex::Regex::new(&format!(
-        r#"authresult result="(.*?)" proto="(.*?)" scope="(.*?)" mech=(\S+) user=(.*?) peer=({IPV4}|{IPV6}) reason="(.*?)""#
-    ))
-    .unwrap()
+    let pattern = PARSER
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("pattern: '")?.strip_suffix('\''))
+        .expect("grok pattern in the CrowdSec parser");
+    let token = regex::Regex::new(r"%\{(\w+):\w+\}").unwrap();
+    let translated = token.replace_all(pattern, |c: &regex::Captures| match &c[1] {
+        "WORD" => r"(\b\w+\b)".to_string(),
+        "DATA" => "(.*?)".to_string(),
+        "NOTSPACE" => r"(\S+)".to_string(),
+        "IP" => format!("({IPV4}|{IPV6})"),
+        other => panic!("grok pattern {other} is not translated"),
+    });
+    regex::Regex::new(&translated).unwrap()
 }
 
-/// Strict parser for the full line as the binary writes it today. Group 10
+/// Strict parser for the full line as the binary writes it. Group 10
 /// is the `rule` field, appended after `pwfp`.
 fn line_regex() -> regex::Regex {
     regex::Regex::new(
