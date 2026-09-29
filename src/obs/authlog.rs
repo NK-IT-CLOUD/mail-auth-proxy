@@ -19,8 +19,29 @@ use super::metrics::Proto;
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
-/// Process-lifetime HMAC key for password fingerprints, generated once at first
-/// use from the system RNG and never persisted.
+static FINGERPRINT_KEY: std::sync::OnceLock<aws_lc_rs::hmac::Key> = std::sync::OnceLock::new();
+
+/// A fresh HMAC-SHA256 key from the system RNG.
+pub(crate) fn generate_hmac_key() -> anyhow::Result<aws_lc_rs::hmac::Key> {
+    aws_lc_rs::hmac::Key::generate(
+        aws_lc_rs::hmac::HMAC_SHA256,
+        &aws_lc_rs::rand::SystemRandom::new(),
+    )
+    .map_err(|_| anyhow::anyhow!("system RNG unavailable"))
+}
+
+/// Generate the fingerprint key now. Called at startup, so a missing system
+/// RNG stops the start instead of panicking the first session that logs a
+/// password failure (and every one after it).
+pub fn init_fingerprint_key() -> anyhow::Result<()> {
+    if FINGERPRINT_KEY.get().is_none() {
+        let _ = FINGERPRINT_KEY.set(generate_hmac_key()?);
+    }
+    Ok(())
+}
+
+/// Process-lifetime HMAC key for password fingerprints, generated once from
+/// the system RNG (at startup, `init_fingerprint_key`) and never persisted.
 ///
 /// A plain digest of the attempted password is offline-guessable: anyone who
 /// obtains the logs can hash a wordlist and recover every weak password that was
@@ -30,14 +51,8 @@ use std::net::IpAddr;
 /// The trade-off is deliberate: fingerprints are comparable only within one
 /// process lifetime, so spraying correlation resets on restart.
 fn fingerprint_key() -> &'static aws_lc_rs::hmac::Key {
-    static KEY: std::sync::OnceLock<aws_lc_rs::hmac::Key> = std::sync::OnceLock::new();
-    KEY.get_or_init(|| {
-        aws_lc_rs::hmac::Key::generate(
-            aws_lc_rs::hmac::HMAC_SHA256,
-            &aws_lc_rs::rand::SystemRandom::new(),
-        )
-        .expect("system RNG unavailable for fingerprint key")
-    })
+    // Only reached without `init_fingerprint_key` in unit tests.
+    FINGERPRINT_KEY.get_or_init(|| generate_hmac_key().expect("fingerprint key"))
 }
 
 /// 64-bit hex fingerprint of an attempted password, keyed with a per-process
@@ -176,6 +191,17 @@ impl AuthEvent<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The startup check generates the key that fingerprints then use, so
+    /// no session ever generates it (or panics trying).
+    #[test]
+    fn startup_generates_the_fingerprint_key() {
+        init_fingerprint_key().unwrap();
+        let key = FINGERPRINT_KEY.get().expect("key set at startup");
+        assert!(std::ptr::eq(key, fingerprint_key()));
+        init_fingerprint_key().unwrap();
+        assert!(std::ptr::eq(key, fingerprint_key()), "generated once");
+    }
 
     #[test]
     fn fingerprint_is_stable_and_16_hex() {

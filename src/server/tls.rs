@@ -97,7 +97,16 @@ pub(crate) fn not_after(der: &[u8]) -> Option<u64> {
     }
     let field = |i: usize| -> i64 { rest[i..i + 2].parse().unwrap_or(0) };
     let (month, day, h, m, s) = (field(0), field(2), field(4), field(6), field(8));
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    // Second 60 is a leap second (X.680 time values, RFC 5280 §4.1.2.5).
+    if !(1..=12).contains(&month) || !(1..=month_days).contains(&day) || h > 23 || m > 59 || s > 60
+    {
         return None;
     }
     // Days since 1970-01-01 of a proleptic Gregorian date (H. Hinnant's
@@ -202,6 +211,42 @@ mod tests {
         assert_eq!(not_after(&cert_until(2028, 2, 29)), Some(1_835_395_200));
         assert_eq!(not_after(&cert_until(2049, 12, 31)), Some(2_524_521_600));
         assert_eq!(not_after(&cert_until(2051, 3, 1)), Some(2_561_241_600));
+    }
+
+    /// The time fields are range-checked: hour ≤ 23, minute ≤ 59, second ≤ 60
+    /// (a leap second), and the day within its month.
+    #[test]
+    fn not_after_rejects_impossible_times() {
+        let der = cert_until(2030, 1, 1);
+        let at = der
+            .windows(13)
+            .position(|w| w == b"300101000000Z")
+            .expect("UTCTime notAfter");
+        let with = |time: &[u8; 13]| {
+            let mut d = der.clone();
+            d[at..at + 13].copy_from_slice(time);
+            not_after(&d)
+        };
+        assert_eq!(with(b"300101000000Z"), Some(1_893_456_000));
+        assert_eq!(with(b"300101235960Z"), Some(1_893_456_000 + 86_400));
+        assert_eq!(with(b"280229000000Z"), Some(1_835_395_200));
+        assert_eq!(
+            with(b"000229000000Z"),
+            Some(951_782_400),
+            "2000 is a leap year"
+        );
+        for bad in [
+            b"300101240000Z",
+            b"300101006000Z",
+            b"300101000061Z",
+            b"300101999999Z",
+            b"300231000000Z",
+            b"290229000000Z",
+            b"300431000000Z",
+            b"301131000000Z",
+        ] {
+            assert_eq!(with(bad), None, "{}", String::from_utf8_lossy(bad));
+        }
     }
 
     #[test]

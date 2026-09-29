@@ -31,13 +31,19 @@ impl Config {
 
         if let Err(e) = check_hostname(&self.server.hostname) {
             err(format!("server.hostname = {:?} {e}", self.server.hostname));
+        } else if !self.server.hostname.contains('.') {
+            // RFC 5321 §4.1.4: the EHLO domain MUST be the client's primary
+            // host name, a fully-qualified domain name (§2.3.5). The proxy
+            // sends it to the backend; a single label is syntactically fine.
+            warnings.push(format!(
+                "server.hostname = {:?} is not a fully-qualified domain name; the proxy sends it in its EHLO to the backend, where RFC 5321 section 4.1.4 requires the primary host name",
+                self.server.hostname
+            ));
         }
         // Empty file paths are reported here only; `server::file_problems`
         // skips them.
         for (name, path) in [("tls.cert", &self.tls.cert), ("tls.key", &self.tls.key)] {
-            if path.is_empty() {
-                err(format!("{name} is empty"));
-            }
+            check_path(name, Some(path), &mut err);
         }
 
         let mut listens = vec![("imap.listen", &self.imap.listen)];
@@ -94,9 +100,7 @@ impl Config {
             }
         }
         for (name, b) in &backends {
-            if b.ca_file.as_deref() == Some("") {
-                err(format!("{name}.ca_file is empty"));
-            }
+            check_path(&format!("{name}.ca_file"), b.ca_file.as_deref(), &mut err);
             let address_ok = b
                 .address
                 .rsplit_once(':')
@@ -153,7 +157,7 @@ impl Config {
                     "{at}.audiences must list at least one non-empty audience"
                 ));
             }
-            if iss.identity_claim.is_empty() || iss.client_claim.is_empty() {
+            if iss.identity_claim.is_empty() || iss.client_claim().is_empty() {
                 err(format!(
                     "{at}: identity_claim and client_claim must not be empty"
                 ));
@@ -257,6 +261,11 @@ impl Config {
         if l.max_connections == 0 || l.max_preauth_per_ip == 0 || l.max_preauth_commands == 0 {
             err("limits: max_connections, max_preauth_per_ip and max_preauth_commands must be at least 1".into());
         }
+        // Longer than /64 would give a host with its own /64 (RFC 7934) a
+        // separate budget per address again.
+        if !(32..=64).contains(&l.ipv6_source_prefix) {
+            err("limits.ipv6_source_prefix must be between 32 and 64".into());
+        }
         if l.max_connections > tokio::sync::Semaphore::MAX_PERMITS {
             err(format!(
                 "limits.max_connections is larger than {}",
@@ -330,6 +339,20 @@ fn is_plain_name(s: &str) -> bool {
         && s.len() <= 64
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+}
+
+/// A configured file path: not empty, and absolute. A relative path would
+/// resolve against the working directory, which differs between the service,
+/// `--check-config` in a shell and a reload, so the check could pass on a
+/// file the service never reads.
+fn check_path(name: &str, path: Option<&str>, err: &mut impl FnMut(String)) {
+    match path {
+        Some("") => err(format!("{name} is empty")),
+        Some(p) if !std::path::Path::new(p).is_absolute() => {
+            err(format!("{name} = {p:?} must be an absolute path"))
+        }
+        _ => {}
+    }
 }
 
 /// `server.hostname` goes unchanged into the SMTP greeting and EHLO reply,
@@ -413,9 +436,7 @@ impl Legacy {
                 err(format!("legacy.allowed_domains: {e}"));
             }
         }
-        if self.domains_file.as_deref() == Some("") {
-            err("legacy.domains_file is empty".into());
-        }
+        check_path("legacy.domains_file", self.domains_file.as_deref(), err);
         match self.account_check {
             AccountCheck::Doveadm => {
                 match self.doveadm_url.as_deref() {
@@ -433,12 +454,13 @@ impl Legacy {
                         "legacy.doveadm_key_file is required with account_check = \"doveadm\""
                             .into(),
                     ),
-                    Some("") => err("legacy.doveadm_key_file is empty".into()),
-                    Some(_) => {}
+                    key => check_path("legacy.doveadm_key_file", key, err),
                 }
-                if self.doveadm_ca_file.as_deref() == Some("") {
-                    err("legacy.doveadm_ca_file is empty".into());
-                }
+                check_path(
+                    "legacy.doveadm_ca_file",
+                    self.doveadm_ca_file.as_deref(),
+                    err,
+                );
             }
             AccountCheck::None => {
                 if self.doveadm_url.is_some()
@@ -509,9 +531,7 @@ impl Legacy {
                 }
                 None => {}
             }
-            if r.users_file.as_deref() == Some("") {
-                err(format!("{at}.users_file is empty"));
-            }
+            check_path(&format!("{at}.users_file"), r.users_file.as_deref(), err);
             if r.protocols.as_ref().is_some_and(Vec::is_empty) {
                 err(empty("protocols"));
             }
@@ -1083,7 +1103,14 @@ mod tests {
     /// literals are refused.
     #[test]
     fn hostname_is_a_domain() {
-        let with = |h: &str| errors_with(&format!("[server]\nhostname = {h:?}\n"));
+        let with = |h: &str| {
+            crate::config::parse(&V2.replace(
+                "hostname = \"proxy.example.org\"",
+                &format!("hostname = {h:?}"),
+            ))
+            .map(|l| l.errors.join("\n"))
+            .unwrap_or_else(|e| format!("parse: {e}"))
+        };
         let long_label = "a".repeat(63);
         let long_name = format!("{0}.{0}.{0}.{1}", long_label, "a".repeat(61));
         assert_eq!(long_name.len(), 253);
@@ -1120,6 +1147,32 @@ mod tests {
             assert!(with(bad).contains("server.hostname"), "{bad:?} accepted");
         }
         assert!(with("192.0.2.1").contains("address literals are not allowed"));
+    }
+
+    /// A single-label `server.hostname` is valid but warned about: the
+    /// backend EHLO takes the primary host name, an FQDN (RFC 5321 §4.1.4,
+    /// §2.3.5).
+    #[test]
+    fn single_label_hostname_warns() {
+        let warnings = |h: &str| {
+            parse(&V2.replace(
+                "hostname = \"proxy.example.org\"",
+                &format!("hostname = {h:?}"),
+            ))
+            .unwrap()
+            .warnings
+            .join("\n")
+        };
+        for single in ["mail-auth-proxy", "localhost", "MX1"] {
+            assert!(
+                warnings(single).contains("server.hostname"),
+                "{single}: {}",
+                warnings(single)
+            );
+        }
+        for fqdn in ["mail.example.org", "mx1.example"] {
+            assert!(!warnings(fqdn).contains("server.hostname"), "{fqdn}");
+        }
     }
 
     /// Each extension is an `ehlo-line`; keywords are unique and never AUTH
@@ -1214,6 +1267,71 @@ mod tests {
             e.contains("must be host:port") && e.contains("certificate name"),
             "{e}"
         );
+    }
+
+    /// `limits.ipv6_source_prefix`: 64 by default, 32-64 allowed.
+    #[test]
+    fn ipv6_source_prefix_is_bounded() {
+        assert_eq!(parse(V2).unwrap().config.limits.ipv6_source_prefix, 64);
+        for (prefix, ok) in [
+            (32, true),
+            (48, true),
+            (64, true),
+            (31, false),
+            (65, false),
+            (128, false),
+        ] {
+            let errors = errors_with(&format!("[limits]\nipv6_source_prefix = {prefix}\n"));
+            assert_eq!(errors.is_empty(), ok, "{prefix}: {errors}");
+        }
+    }
+
+    /// Every file path must be absolute: a relative one resolves against the
+    /// working directory, which differs between `--check-config` in a shell
+    /// and the service.
+    #[test]
+    fn relative_file_paths_are_errors() {
+        let rel = "\"certs/x.pem\"";
+        let doveadm = "[legacy]\naccount_check = \"doveadm\"\ndoveadm_url = \"https://127.0.0.1/doveadm/v1\"\ndoveadm_key_file = \"/k\"\n";
+        let rule = "[[legacy.rules]]\nname = \"a\"\nnetworks = [\"10.0.0.0/8\"]\n";
+        let mut wrong = Vec::new();
+        for (text, key) in [
+            (V2.replace("\"/c.pem\"", rel), "tls.cert"),
+            (V2.replace("\"/k.pem\"", rel), "tls.key"),
+            (V2.replace("\"/k.pem\"", "\"./k.pem\""), "tls.key"),
+            (
+                V2.replace(
+                    "verify_name = ",
+                    &format!("ca_file = {rel}, verify_name = "),
+                ),
+                "imap.backend.ca_file",
+            ),
+            (
+                format!("{V2}{}", doveadm.replace("\"/k\"", rel)),
+                "legacy.doveadm_key_file",
+            ),
+            (
+                format!("{V2}{doveadm}doveadm_ca_file = {rel}\n"),
+                "legacy.doveadm_ca_file",
+            ),
+            (
+                format!("{V2}[legacy]\ndomains_file = {rel}\n{rule}"),
+                "legacy.domains_file",
+            ),
+            (
+                format!("{V2}{rule}users_file = {rel}\n"),
+                "legacy.rules[a].users_file",
+            ),
+        ] {
+            let errors = crate::config::parse(&text).unwrap().errors;
+            if !(errors.len() == 1
+                && errors[0].starts_with(key)
+                && errors[0].ends_with("must be an absolute path"))
+            {
+                wrong.push(format!("{key}: {errors:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// Every file path is checked for the empty string, with one message per

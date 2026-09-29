@@ -6,9 +6,8 @@
 use libfuzzer_sys::fuzz_target;
 use mail_auth_proxy::fuzz_api::*;
 
-/// 9999-12-31 plus the largest unchecked day (31), hour, minute and second
-/// fields (99 each): no parsed time can lie beyond it.
-const LATEST: u64 = 253_402_214_400 + 99 * 3600 + 99 * 60 + 99;
+/// 9999-12-31 23:59:60 (a leap second): no parsed time can lie beyond it.
+const LATEST: u64 = 253_402_214_400 + 23 * 3600 + 59 * 60 + 60;
 
 /// One DER element with a definite length.
 fn der(tag: u8, content: &[u8]) -> Vec<u8> {
@@ -60,8 +59,9 @@ fuzz_target!(|data: &[u8]| {
     let cert = der(0x30, &der(0x30, &tbs));
     check(&cert);
 
-    // A well-formed time must parse: YYMMDDHHMMSSZ / YYYYMMDDHHMMSSZ with a
-    // month and day in range, from 1970 on.
+    // A well-formed time (YYMMDDHHMMSSZ / YYYYMMDDHHMMSSZ, from 1970 on)
+    // parses exactly when its fields are in range: the day within its month
+    // (Gregorian leap years), hour ≤ 23, minute ≤ 59, second ≤ 60.
     let well_formed = time.last() == Some(&b'Z')
         && time[..time.len() - 1].iter().all(u8::is_ascii_digit)
         && time.len() == if tag == 0x17 { 13 } else { 15 };
@@ -73,9 +73,26 @@ fuzz_target!(|data: &[u8]| {
         } else {
             (d(0) * 100 + d(2), 4)
         };
-        let (month, day) = (d(m), d(m + 2));
-        if year >= 1970 && (1..=12).contains(&month) && (1..=31).contains(&day) {
-            assert!(tls_not_after(&cert).is_some(), "{time:?} refused");
+        let (month, day, h, min, s) = (d(m), d(m + 2), d(m + 4), d(m + 6), d(m + 8));
+        let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let month_days = match month {
+            2 if leap => 29,
+            2 => 28,
+            4 | 6 | 9 | 11 => 30,
+            _ => 31,
+        };
+        let valid = (1..=12).contains(&month)
+            && (1..=month_days).contains(&day)
+            && h <= 23
+            && min <= 59
+            && s <= 60;
+        if year >= 1970 {
+            assert_eq!(
+                tls_not_after(&cert).is_some(),
+                valid,
+                "{:?}",
+                String::from_utf8_lossy(time)
+            );
         }
     }
 });

@@ -329,6 +329,9 @@ struct TurnSlot {
 
 const THROTTLE_CAPACITY: usize = 65_536;
 
+/// Accounts a full throttle table drops at once (see `Throttle::make_room`).
+const THROTTLE_EVICT_BATCH: usize = THROTTLE_CAPACITY / 64;
+
 impl Throttle {
     fn key(user: &str) -> String {
         user.to_ascii_lowercase()
@@ -348,27 +351,38 @@ impl Throttle {
     }
 
     fn failure(&self, user: &str) {
+        let key = Self::key(user);
         let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
-        if seen.len() >= THROTTLE_CAPACITY {
-            let window = self.window;
-            seen.retain(|_, (_, start)| start.elapsed() < window);
-            if seen.len() >= THROTTLE_CAPACITY {
-                // Still full of live windows: drop the oldest one.
-                if let Some(k) = seen
-                    .iter()
-                    .min_by_key(|(_, (_, start))| *start)
-                    .map(|(k, _)| k.clone())
-                {
-                    seen.remove(&k);
-                    crate::obs::metrics::record_throttle_eviction();
-                }
-            }
+        if seen.len() >= THROTTLE_CAPACITY && !seen.contains_key(&key) {
+            self.make_room(&mut seen);
         }
-        let e = seen.entry(Self::key(user)).or_insert((0, Instant::now()));
+        let e = seen.entry(key).or_insert((0, Instant::now()));
         if e.1.elapsed() >= self.window {
             *e = (0, Instant::now());
         }
         e.0 = e.0.saturating_add(1);
+    }
+
+    /// Bring a full table down to `THROTTLE_CAPACITY - THROTTLE_EVICT_BATCH`:
+    /// expired windows first, then the oldest running ones. One scan per
+    /// batch of new accounts instead of one per account, all under the lock.
+    fn make_room(&self, seen: &mut HashMap<String, (u32, Instant)>) {
+        let window = self.window;
+        seen.retain(|_, (_, start)| start.elapsed() < window);
+        let target = THROTTLE_CAPACITY - THROTTLE_EVICT_BATCH;
+        if seen.len() <= target {
+            return;
+        }
+        let n = seen.len() - target;
+        let mut order: Vec<(Instant, String)> = seen
+            .iter()
+            .map(|(k, (_, start))| (*start, k.clone()))
+            .collect();
+        order.select_nth_unstable(n - 1);
+        for (_, k) in &order[..n] {
+            seen.remove(k);
+            crate::obs::metrics::record_throttle_eviction();
+        }
     }
 
     fn success(&self, user: &str) {
@@ -1064,10 +1078,23 @@ mod tests {
         for i in 0..THROTTLE_CAPACITY + 10 {
             t.failure(&format!("u{i}@x"));
         }
-        assert!(t.seen.lock().unwrap().len() <= THROTTLE_CAPACITY);
+        // The first account beyond capacity made room for a whole batch at
+        // once (the oldest windows); the next nine needed no scan.
+        let len = t.seen.lock().unwrap().len();
+        assert_eq!(len, THROTTLE_CAPACITY - THROTTLE_EVICT_BATCH + 10);
         assert!(t.is_throttled(&format!("u{}@x", THROTTLE_CAPACITY + 9)));
+        assert!(!t.is_throttled("u0@x"), "oldest window dropped");
+        assert!(t.is_throttled(&format!("u{THROTTLE_EVICT_BATCH}@x")));
         // Each live window pushed out is counted.
-        assert_eq!(evictions() - e0, 10);
+        assert_eq!(evictions() - e0, THROTTLE_EVICT_BATCH as u64);
+        // A full table: another failure of a tracked account evicts nothing.
+        for i in 0..THROTTLE_EVICT_BATCH - 10 {
+            t.failure(&format!("v{i}@x"));
+        }
+        assert_eq!(t.seen.lock().unwrap().len(), THROTTLE_CAPACITY);
+        t.failure(&format!("u{}@x", THROTTLE_CAPACITY + 9));
+        assert_eq!(t.seen.lock().unwrap().len(), THROTTLE_CAPACITY);
+        assert_eq!(evictions() - e0, THROTTLE_EVICT_BATCH as u64);
     }
 
     /// A list file that becomes missing or invalid fails closed: the rule

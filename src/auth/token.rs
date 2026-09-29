@@ -121,7 +121,7 @@ impl Policy {
             allowed,
             infer_key_algorithm: i.infer_key_algorithm,
             allowed_clients: i.allowed_clients.clone(),
-            client_claim: i.client_claim.clone(),
+            client_claim: i.client_claim().to_owned(),
         })
     }
 
@@ -203,7 +203,12 @@ pub struct Validator {
 }
 
 async fn fetch_jwks(client: &reqwest::Client, url: &str) -> Result<Value> {
-    let resp = client.get(url).send().await?.error_for_status()?;
+    let resp = client.get(url).send().await?;
+    // Redirects are not followed (see `Validator::new`), so a 3xx would reach
+    // the JSON parser; only a success status carries the JWKS.
+    if !resp.status().is_success() {
+        return Err(anyhow!("JWKS endpoint answered {}", resp.status()));
+    }
     if resp
         .content_length()
         .is_some_and(|n| n > MAX_JWKS_BYTES as u64)
@@ -278,12 +283,30 @@ impl Validator {
     /// fails is reported but does not discard the ones that succeeded, so one
     /// unreachable IdP cannot take the other realm's keys down with it.
     /// Returns the keys plus the issuers that failed.
+    ///
+    /// The issuers are fetched concurrently, so a refresh takes at most
+    /// `JWKS_TIMEOUT` however many issuers are down, not one timeout per
+    /// issuer; tokens waiting on the refresh lock wait that long at most.
+    /// The results are merged in configuration order.
     async fn fetch_all(&self) -> (HashMap<String, Vec<KeyEntry>>, Vec<String>) {
+        let mut fetches = tokio::task::JoinSet::new();
+        for (i, policy) in self.policies.iter().enumerate() {
+            let (client, url) = (self.client.clone(), policy.jwks_url.clone());
+            fetches.spawn(async move { (i, fetch_jwks(&client, &url).await) });
+        }
+        let mut fetched: Vec<Option<Result<Value>>> = self.policies.iter().map(|_| None).collect();
+        while let Some(done) = fetches.join_next().await {
+            // A fetch task that panicked leaves its slot empty: failed below.
+            if let Ok((i, result)) = done {
+                fetched[i] = Some(result);
+            }
+        }
         let mut keys: HashMap<String, Vec<KeyEntry>> = HashMap::new();
         let mut failed = Vec::new();
-        for policy in &self.policies {
+        for (policy, result) in self.policies.iter().zip(fetched) {
             let issuer = &policy.issuer;
-            match fetch_jwks(&self.client, &policy.jwks_url).await {
+            let result = result.unwrap_or_else(|| Err(anyhow!("JWKS fetch task failed")));
+            match result {
                 Ok(jwks) => {
                     // Staged, so a JWKS that fails half-way leaves none of its
                     // keys in the map (refresh would add the previous keys on
@@ -293,11 +316,11 @@ impl Validator {
                         // A realm that publishes zero usable keys is treated as
                         // failed: replacing its keys with nothing would lock
                         // that realm's users out until the next refresh.
-                        Ok(()) if staged.is_empty() => {
+                        Ok(_) if staged.is_empty() => {
                             tracing::warn!(target: crate::obs::target::TOKEN, %issuer, "JWKS has no usable signing keys");
                             failed.push(issuer.clone());
                         }
-                        Ok(()) => {
+                        Ok(_) => {
                             crate::obs::metrics::record_jwks_fetch(issuer, true);
                             for (kid, entries) in staged {
                                 keys.entry(kid).or_default().extend(entries);
@@ -405,12 +428,15 @@ impl Validator {
     /// default) for RSA — if the issuer's `allowed_algorithms` contain it.
     /// Never more than one: RFC 8725 §3.1 requires each key to be used with
     /// exactly one algorithm.
+    ///
+    /// Returns how many keys were skipped because they could not be decoded.
     fn merge_jwks_keys(
         jwks: &Value,
         policy: &Arc<Policy>,
         leeway: u64,
         keys: &mut HashMap<String, Vec<KeyEntry>>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
+        let mut skipped = 0;
         for k in jwks["keys"]
             .as_array()
             .ok_or_else(|| anyhow!("jwks.keys missing"))?
@@ -444,16 +470,29 @@ impl Validator {
             if algs.is_empty() {
                 continue;
             }
-            let key = match kty {
-                Some("EC") => DecodingKey::from_ec_components(
-                    k["x"].as_str().ok_or_else(|| anyhow!("EC x"))?,
-                    k["y"].as_str().ok_or_else(|| anyhow!("EC y"))?,
-                )?,
-                Some("RSA") => DecodingKey::from_rsa_components(
-                    k["n"].as_str().ok_or_else(|| anyhow!("RSA n"))?,
-                    k["e"].as_str().ok_or_else(|| anyhow!("RSA e"))?,
-                )?,
-                _ => continue,
+            let member = |name: &str| {
+                k[name]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("{} key without {name}", kty.unwrap_or("?")))
+            };
+            let key =
+                match kty {
+                    Some("EC") => member("x")
+                        .and_then(|x| Ok(DecodingKey::from_ec_components(x, member("y")?)?)),
+                    Some("RSA") => member("n")
+                        .and_then(|n| Ok(DecodingKey::from_rsa_components(n, member("e")?)?)),
+                    _ => continue,
+                };
+            // RFC 7517 §5: a key with missing or bad members is ignored, not
+            // the whole set, so one broken key cannot stop key rotation or
+            // revocation for the realm.
+            let key = match key {
+                Ok(key) => key,
+                Err(e) => {
+                    tracing::warn!(target: crate::obs::target::TOKEN, issuer = %policy.issuer, kid = ?kid, error = %e, "skipping unusable JWK");
+                    skipped += 1;
+                    continue;
+                }
             };
             let entries = keys.entry(kid).or_default();
             for alg in algs {
@@ -464,7 +503,7 @@ impl Validator {
                 });
             }
         }
-        Ok(())
+        Ok(skipped)
     }
 
     /// Build a Validator from already-parsed JWKS values. Used in tests.
@@ -528,9 +567,7 @@ impl Validator {
         }
         // The issuer the token claims, unverified: it only picks whose
         // refresh result decides between verdict and outage, it is never
-        // trusted. Absent or not configured: a verdict. An array `iss` (which
-        // validation accepts when it contains the issuer) is an outage if any
-        // of its entries failed.
+        // trusted. Absent, not a string or not configured: a verdict.
         let claimed = unverified_iss(token);
         let stale = |failed: &[String]| {
             if claimed.iter().any(|iss| failed.contains(iss)) {
@@ -562,6 +599,12 @@ impl Validator {
         // serde puts the offending header value into its error text; that value
         // is attacker-chosen, so the detail is dropped.
         let header = decode_header(token).map_err(|_| invalid!("malformed header"))?;
+        // RFC 7515 §4.1.11: a recipient that does not understand every
+        // extension listed in `crit` MUST reject the JWS. The proxy
+        // understands none; an empty or null `crit` is invalid as well.
+        if header_has_crit(token) {
+            return Err(invalid!("unsupported critical header parameter"));
+        }
         let kid = header.kid.clone().unwrap_or_else(|| "default".into());
         let keys = self.snapshot();
         let entries = keys.get(&kid).ok_or(TokenError::UnknownKid)?;
@@ -582,24 +625,32 @@ impl Validator {
     }
 }
 
-/// The issuers the `iss` claim of `token` names, without any verification:
-/// the string, or every string in an array; empty if the payload does not
-/// decode or has no such claim. Only for choosing whose refresh result
-/// applies to an unknown kid; never for trusting the token.
-pub(crate) fn unverified_iss(token: &str) -> Vec<String> {
+/// Segment `n` of a compact JWS, base64url-decoded and parsed as JSON,
+/// without any verification.
+fn unverified_segment(token: &str, n: usize) -> Option<Value> {
     use base64::Engine as _;
-    let claims: Option<Value> = token.split('.').nth(1).and_then(|payload| {
-        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(payload)
-            .ok()?;
-        serde_json::from_slice(&bytes).ok()
-    });
-    match claims.as_ref().and_then(|c| c.get("iss")) {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token.split('.').nth(n)?)
+        .ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Whether the JOSE header of `token` has a `crit` member, whatever its
+/// value (jsonwebtoken reads `"crit": null` as absent).
+fn header_has_crit(token: &str) -> bool {
+    unverified_segment(token, 0).is_some_and(|h| h.get("crit").is_some())
+}
+
+/// The issuer the `iss` claim of `token` names, without any verification;
+/// empty if the payload does not decode or `iss` is not a string (such a
+/// token is invalid, see `check_claims`). Only for choosing whose refresh
+/// result applies to an unknown kid; never for trusting the token.
+pub(crate) fn unverified_iss(token: &str) -> Vec<String> {
+    match unverified_segment(token, 1)
+        .as_ref()
+        .and_then(|c| c.get("iss"))
+    {
         Some(Value::String(iss)) => vec![iss.clone()],
-        Some(Value::Array(all)) => all
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_owned))
-            .collect(),
         _ => Vec::new(),
     }
 }
@@ -623,6 +674,11 @@ pub(crate) fn check_claims(
     policy: &Policy,
 ) -> Result<String, TokenError> {
     let text = |name: &str| claims.get(name).and_then(Value::as_str);
+    // RFC 7519 §4.1.1: `iss` is a string. jsonwebtoken also accepts an array
+    // whose entries are all allowed issuers.
+    if text("iss").is_none() {
+        return Err(invalid!("iss is not a string"));
+    }
     let is_access_token = match policy.token_type {
         TokenType::Keycloak => text("typ").is_some_and(|t| t.eq_ignore_ascii_case("Bearer")),
         TokenType::Rfc9068 => header.typ.as_deref().is_some_and(|t| {
@@ -891,6 +947,47 @@ mod tests {
         json!({"iss":ISS_A,"aud":"dovecot","exp":4102444800usize,"email":"nk@x"})
     }
 
+    /// Sign `claims` under exactly the JOSE header `header` (ES256).
+    fn sign_raw(priv_pem: &str, header: &serde_json::Value, claims: &serde_json::Value) -> String {
+        use base64::Engine as _;
+        let b64 = |v: &serde_json::Value| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v.to_string())
+        };
+        let input = format!("{}.{}", b64(header), b64(claims));
+        let key = EncodingKey::from_ec_pem(priv_pem.as_bytes()).unwrap();
+        let sig = jsonwebtoken::crypto::sign(input.as_bytes(), &key, Algorithm::ES256).unwrap();
+        format!("{input}.{sig}")
+    }
+
+    /// RFC 7515 §4.1.11: `crit` names extensions the recipient MUST
+    /// understand. The proxy understands none, so any `crit` is refused,
+    /// also on a correctly signed token.
+    #[test]
+    fn rejects_critical_header_parameters() {
+        let (priv_pem, jwks) = test_es256_keypair("kid1");
+        let v = validator_with(jwks, ISS_A, "dovecot");
+        let mut c = claims();
+        c["email_verified"] = json!(true);
+        c["typ"] = json!("Bearer");
+        let plain = json!({"alg":"ES256","kid":"kid1"});
+        assert_eq!(
+            v.validate(&sign_raw(&priv_pem, &plain, &c)).unwrap(),
+            "nk@x"
+        );
+        for crit in [json!(["exp"]), json!(["b64"]), json!([]), json!(null)] {
+            let mut h = plain.clone();
+            h["crit"] = crit.clone();
+            if crit == json!(["b64"]) {
+                h["b64"] = json!(true);
+            }
+            let err = v.validate(&sign_raw(&priv_pem, &h, &c)).unwrap_err();
+            assert!(
+                matches!(&err, TokenError::Invalid(why) if why.contains("critical")),
+                "{crit}: {err:?}"
+            );
+        }
+    }
+
     /// A token for another client of the realm carries no `aud` at all; it
     /// must not pass just because there is nothing to compare.
     #[test]
@@ -909,6 +1006,21 @@ mod tests {
         let mut c = claims();
         c.as_object_mut().unwrap().remove("iss");
         assert!(v.validate(&mint(&priv_pem, "kid1", c)).is_err());
+    }
+
+    /// RFC 7519 §4.1.1: `iss` is a string. An array naming only the
+    /// configured issuer is refused although jsonwebtoken accepts it.
+    #[test]
+    fn rejects_issuer_array() {
+        let (priv_pem, jwks) = test_es256_keypair("kid1");
+        let v = validator_with(jwks, ISS_A, "dovecot");
+        let mut c = claims();
+        c["iss"] = json!([ISS_A]);
+        let err = v.validate(&mint(&priv_pem, "kid1", c)).unwrap_err();
+        assert!(
+            matches!(&err, TokenError::Invalid(why) if why.contains("iss")),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -975,6 +1087,32 @@ mod tests {
         assert!(staged.is_empty());
         Validator::merge_jwks_keys(&jwks, &p, 60, &mut staged).unwrap();
         assert_eq!(staged.len(), 1);
+    }
+
+    /// RFC 7517 §5: a key with missing or undecodable members is skipped;
+    /// the other keys of the set stay usable.
+    #[test]
+    fn broken_jwk_is_skipped_not_fatal() {
+        let (priv_pem, jwks) = test_es256_keypair("kid1");
+        let good = jwks["keys"][0].clone();
+        let mut no_y = good.clone();
+        no_y["kid"] = json!("broken-1");
+        no_y.as_object_mut().unwrap().remove("y");
+        let mut bad_x = good.clone();
+        bad_x["kid"] = json!("broken-2");
+        bad_x["x"] = json!("!!not base64!!");
+        let rsa_no_e = json!({"kty":"RSA","kid":"broken-3","alg":"RS256","n":"AQAB"});
+        let set = json!({"keys": [no_y, bad_x, rsa_no_e, good]});
+        let p = Arc::new(Policy::keycloak(ISS_A, "dovecot"));
+        let mut staged = HashMap::new();
+        let skipped = Validator::merge_jwks_keys(&set, &p, 60, &mut staged).unwrap();
+        assert_eq!(skipped, 3);
+        assert_eq!(staged.keys().collect::<Vec<_>>(), ["kid1"]);
+        let v = validator_with(set, ISS_A, "dovecot");
+        assert_eq!(
+            v.validate(&mint(&priv_pem, "kid1", claims())).unwrap(),
+            "nk@x"
+        );
     }
 
     /// Header and claim values are attacker-chosen and must not reach the
@@ -1064,6 +1202,20 @@ mod tests {
 
     /// Serve `jwks` over plain http on 127.0.0.1 (any path); returns the URL.
     async fn serve_jwks(jwks: serde_json::Value) -> String {
+        serve_jwks_after(jwks, Duration::ZERO).await
+    }
+
+    /// Like `serve_jwks`, answering each request `delay` after its head.
+    async fn serve_jwks_after(jwks: serde_json::Value, delay: Duration) -> String {
+        serve_jwks_with("200 OK", jwks, delay).await
+    }
+
+    /// Like `serve_jwks_after`, with the given HTTP status.
+    async fn serve_jwks_with(
+        status: &'static str,
+        jwks: serde_json::Value,
+        delay: Duration,
+    ) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1080,8 +1232,9 @@ mod tests {
                             Ok(n) => head.extend_from_slice(&buf[..n]),
                         }
                     }
+                    tokio::time::sleep(delay).await;
                     let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = s.write_all(resp.as_bytes()).await;
@@ -1143,21 +1296,11 @@ mod tests {
                 "{iss:?}"
             );
         }
-        // An array `iss`: an outage if any configured entry failed.
-        for (iss, stale) in [
-            (&[ISS_A, "https://unknown.example/realms/x"][..], false),
-            (&[ISS_A, ISS_B][..], true),
-            (&[ISS_B][..], true),
-            (&[][..], false),
-        ] {
+        // An array `iss` is invalid whatever it names: a verdict.
+        for iss in [&[ISS_A, ISS_B][..], &[ISS_B][..], &[][..]] {
             let got = v.validate_fresh(&claiming_all(iss)).await;
-            assert_eq!(
-                matches!(got, Err(TokenError::KeysStale)),
-                stale,
-                "{iss:?}: {got:?}"
-            );
             assert!(
-                matches!(got, Err(TokenError::KeysStale | TokenError::UnknownKid)),
+                matches!(got, Err(TokenError::UnknownKid)),
                 "{iss:?}: {got:?}"
             );
         }
@@ -1172,6 +1315,58 @@ mod tests {
             .validate_fresh(&mint(&pem_a, "kid-a", claims()))
             .await
             .is_ok());
+    }
+
+    /// Only a 2xx response is a JWKS: a redirect (not followed) or another
+    /// non-success status is a failed fetch even with a JWKS body.
+    #[tokio::test]
+    async fn jwks_fetch_requires_a_success_status() {
+        let (_pem, jwks) = test_es256_keypair("kid1");
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let url = serve_jwks_with("200 OK", jwks.clone(), Duration::ZERO).await;
+        assert!(fetch_jwks(&client, &url).await.is_ok());
+        for status in ["302 Found", "304 Not Modified", "404 Not Found"] {
+            let url = serve_jwks_with(status, jwks.clone(), Duration::ZERO).await;
+            assert!(fetch_jwks(&client, &url).await.is_err(), "{status}");
+        }
+    }
+
+    /// The issuers' JWKS are fetched concurrently: three slow IdPs cost one
+    /// delay, not three, and the keys of each still land under their issuer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn jwks_of_all_issuers_are_fetched_concurrently() {
+        const DELAY: Duration = Duration::from_millis(800);
+        let mut parts = Vec::new();
+        let mut pems = Vec::new();
+        for (n, iss) in [ISS_A, ISS_B, "https://third.example/realms/c"]
+            .into_iter()
+            .enumerate()
+        {
+            let (pem, jwks) = test_es256_keypair(&format!("kid-{n}"));
+            let mut p = policy(iss);
+            p.jwks_url = serve_jwks_after(jwks.clone(), DELAY).await;
+            parts.push((jwks, p));
+            pems.push((pem, iss));
+        }
+        let v = Validator::from_parts(parts).unwrap();
+        v.set_keys(KeyMap::new());
+        let t0 = std::time::Instant::now();
+        v.refresh().await.unwrap();
+        let took = t0.elapsed();
+        assert!(took >= DELAY, "{took:?}");
+        assert!(took < DELAY * 2, "sequential: {took:?}");
+        for (n, (pem, iss)) in pems.iter().enumerate() {
+            let mut c = claims();
+            c["iss"] = json!(iss);
+            assert_eq!(
+                v.validate(&mint(pem, &format!("kid-{n}"), c)).unwrap(),
+                "nk@x"
+            );
+        }
     }
 
     fn policy(issuer: &str) -> Policy {
@@ -1196,6 +1391,47 @@ mod tests {
         assert!(
             v.validate(&encode(&h, &c, &key).unwrap()).is_err(),
             "plain JWT is not an access token"
+        );
+    }
+
+    /// RFC 9068 §2.2: the client of an RFC 9068 access token is `client_id`;
+    /// with `allowed_clients` and no `client_claim`, that is the claim
+    /// checked. Keycloak tokens keep `azp`.
+    #[test]
+    fn client_claim_defaults_by_token_type() {
+        let issuer = |token_type: &str| {
+            let text = format!(
+                "config_version = 2\n[tls]\ncert = \"/c.pem\"\nkey = \"/k.pem\"\n[imap]\nlisten = \"127.0.0.1:993\"\nbackend = {{ address = \"192.0.2.10:993\" }}\n[oauth]\n[[oauth.issuers]]\nissuer = \"{ISS_A}\"\njwks_url = \"https://idp.example/certs\"\naudiences = [\"dovecot\"]\ntoken_type = \"{token_type}\"\nallowed_clients = [\"webmail\"]\n"
+            );
+            crate::config::parse(&text).unwrap().config.oauth.issuers[0].clone()
+        };
+        let (priv_pem, jwks) = test_es256_keypair("kid1");
+        let key = EncodingKey::from_ec_pem(priv_pem.as_bytes()).unwrap();
+        let mut h = Header::new(Algorithm::ES256);
+        h.kid = Some("kid1".into());
+        h.typ = Some("at+jwt".into());
+        let v = Validator::from_parts(vec![(
+            jwks.clone(),
+            Policy::from_config(&issuer("rfc9068")).unwrap(),
+        )])
+        .unwrap();
+        let mut c = claims();
+        c["email_verified"] = json!(true);
+        c["client_id"] = json!("webmail");
+        assert_eq!(v.validate(&encode(&h, &c, &key).unwrap()).unwrap(), "nk@x");
+        c["client_id"] = json!("other");
+        c["azp"] = json!("webmail");
+        assert!(v.validate(&encode(&h, &c, &key).unwrap()).is_err());
+
+        let v = Validator::from_parts(vec![(
+            jwks,
+            Policy::from_config(&issuer("keycloak")).unwrap(),
+        )])
+        .unwrap();
+        c["typ"] = json!("Bearer");
+        assert_eq!(
+            v.validate(&mint_raw(&priv_pem, "kid1", &c)).unwrap(),
+            "nk@x"
         );
     }
 

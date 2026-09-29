@@ -218,9 +218,10 @@ pub struct Issuer {
     /// If not empty, only tokens whose `client_claim` is listed are accepted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_clients: Vec<String>,
-    /// Claim naming the OAuth client (`azp` for Keycloak/OIDC, `client_id`, `appid`).
-    #[serde(default = "default_client_claim")]
-    pub client_claim: String,
+    /// Claim naming the OAuth client (`azp` for Keycloak/OIDC, `client_id`,
+    /// `appid`). Default: by `token_type`, see `client_claim()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_claim: Option<String>,
     /// https URL of the issuer's OpenID Provider configuration, sent as
     /// `openid-configuration` to a client whose token failed validation
     /// (RFC 7628 section 3.2.2). At most one issuer sets it or `scope`.
@@ -245,6 +246,16 @@ impl Issuer {
         self.require_email_verified
             .unwrap_or(self.identity_claim == "email")
     }
+
+    /// `client_claim` with its default applied: `client_id` for RFC 9068
+    /// access tokens (RFC 9068 §2.2), otherwise `azp` (Keycloak, OIDC).
+    pub fn client_claim(&self) -> &str {
+        match (&self.client_claim, self.token_type) {
+            (Some(c), _) => c,
+            (None, TokenType::Rfc9068) => "client_id",
+            (None, TokenType::Keycloak | TokenType::Any) => "azp",
+        }
+    }
 }
 
 fn default_identity_claim() -> String {
@@ -257,10 +268,6 @@ fn default_algorithms() -> Vec<String> {
 
 fn default_true() -> bool {
     true
-}
-
-fn default_client_claim() -> String {
-    "azp".into()
 }
 
 /// The short form of one legacy rule: `enabled` means one rule named
@@ -472,6 +479,10 @@ pub struct Limits {
     /// Commands a client may send before it authenticates.
     #[serde(default = "default_max_preauth_commands")]
     pub max_preauth_commands: usize,
+    /// Prefix length by which IPv6 sources are grouped for
+    /// `max_preauth_per_ip` and the auth rate limit (32-64).
+    #[serde(default = "default_ipv6_source_prefix")]
+    pub ipv6_source_prefix: u8,
 }
 
 impl Default for Limits {
@@ -480,8 +491,13 @@ impl Default for Limits {
             max_connections: default_max_connections(),
             max_preauth_per_ip: default_max_preauth_per_ip(),
             max_preauth_commands: default_max_preauth_commands(),
+            ipv6_source_prefix: default_ipv6_source_prefix(),
         }
     }
+}
+
+fn default_ipv6_source_prefix() -> u8 {
+    64
 }
 
 fn default_max_connections() -> usize {
@@ -675,8 +691,14 @@ mod tests {
 
     #[test]
     fn minimal_v2_has_safe_defaults() {
-        let c = parse(V2).unwrap().config;
-        assert_eq!(c.server.hostname, "mail-auth-proxy");
+        let l = parse(&V2.replace("[server]\nhostname = \"proxy.example.org\"\n", "")).unwrap();
+        assert_eq!(l.config.server.hostname, "mail-auth-proxy");
+        assert!(
+            l.warnings.iter().any(|w| w.contains("server.hostname")),
+            "the default is no FQDN: {:?}",
+            l.warnings
+        );
+        let c = l.config;
         assert!(
             c.legacy.rules.is_empty(),
             "password access is off unless configured"

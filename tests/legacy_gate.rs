@@ -100,7 +100,7 @@ fn offered(kind: Kind, advert: &[String]) -> (bool, bool) {
 }
 
 /// One password attempt: the advertised mechanisms, the reply, and the time
-/// from the last credential byte to the reply.
+/// from sending the last credential line to the reply.
 struct Attempt {
     offered: (bool, bool),
     answer: Answer,
@@ -141,8 +141,11 @@ async fn attempt(
         (Kind::Sieve, Mech::Plain) => format!("AUTHENTICATE \"PLAIN\" \"{}\"", plain(user, pass)),
         (Kind::Sieve, Mech::Login) => unreachable!("ManageSieve has no LOGIN"),
     };
-    c.send(&last).await;
+    // Started before the send: the proxy may read the line and start its
+    // delay before `send` returns here, and a later start would make the
+    // reply look earlier than the proxy's padding.
     let t0 = Instant::now();
+    c.send(&last).await;
     let reply = c.line().await;
     let took = t0.elapsed();
     Attempt {
@@ -819,23 +822,36 @@ async fn password_outages_are_padded_like_refusals() {
         // The account passes; the backend answers "temporarily unavailable".
         ("unavail-{p}@example.test", Answer::Unavailable),
     ];
+    // Each case is timed in several interleaved rounds and compared by its
+    // fastest reply. Every sample is the padding deadline plus the random
+    // jitter (up to 75 ms here) plus whatever the host adds: scheduling
+    // delays, or a path that overruns the deadline once (the first doveadm
+    // request opens its TLS connection). Those only ever add time, so one
+    // sample per case can make equal paddings look different under load,
+    // while the fastest of several shows the padding itself.
+    const ROUNDS: usize = 3;
     for kind in Kind::ALL {
-        let mut times = Vec::new();
-        for (user, answer) in cases {
-            let user = user.replace("{p}", kind.label());
-            let a = attempt(&h, kind, Src::Internal, Sni::None, Mech::Plain, &user, "pw").await;
-            assert_eq!(a.answer, answer, "{kind:?} {user}: {}", a.reply);
-            times.push(a.took);
+        let mut times = vec![Vec::new(); cases.len()];
+        for _ in 0..ROUNDS {
+            for ((user, answer), took) in cases.iter().zip(&mut times) {
+                let user = user.replace("{p}", kind.label());
+                let a = attempt(&h, kind, Src::Internal, Sni::None, Mech::Plain, &user, "pw").await;
+                assert_eq!(a.answer, *answer, "{kind:?} {user}: {}", a.reply);
+                // Never earlier than a refusal, in any sample.
+                assert!(
+                    a.took >= Duration::from_millis(DELAY_MS),
+                    "{kind:?} {user}: {:?}",
+                    a.took
+                );
+                took.push(a.took);
+            }
         }
-        let min = *times.iter().min().unwrap();
-        let max = *times.iter().max().unwrap();
-        assert!(
-            min >= Duration::from_millis(DELAY_MS),
-            "{kind:?}: {times:?}"
-        );
+        let fastest: Vec<Duration> = times.iter().map(|t| *t.iter().min().unwrap()).collect();
+        let min = *fastest.iter().min().unwrap();
+        let max = *fastest.iter().max().unwrap();
         assert!(
             max - min < Duration::from_millis(150),
-            "{kind:?}: {times:?}"
+            "{kind:?}: fastest {fastest:?} of {times:?}"
         );
     }
 }

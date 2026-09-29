@@ -43,6 +43,9 @@ The file is strict. Startup fails, and `--check-config` reports, when:
   (`net.ipv6.bindv6only = 0`), so `[::]:993` and `0.0.0.0:993` clash. Port 0 never
   clashes;
 - `server.hostname` is not a host name (see the key below);
+- a file path (`tls.cert`, `tls.key`, `*.backend.ca_file`, `legacy.domains_file`,
+  `legacy.doveadm_key_file`, `legacy.doveadm_ca_file`, `legacy.rules[].users_file`) is
+  empty or not absolute: a relative path would depend on the working directory;
 - a JWKS URL or `doveadm_url` is not `https://` (plain `http://` is allowed only for
   `localhost`, `127.0.0.1` and `::1`), or `doveadm_url` contains `user:password@`;
 - a legacy rule has no `networks`, an empty list, a duplicate or invalid name, or public
@@ -100,7 +103,7 @@ backend `.…` keys below, written inline (`backend = { address = "…" }`) or a
 | Key | Type | Default | Effect |
 |---|---|---|---|
 | `config_version` | integer | required | must be `2`, set at the top before the first `[section]`; a file without it fails with `config_version is missing: the file must set config_version = 2 …` |
-| `server.hostname` | string | `mail-auth-proxy` | name in the IMAP/SMTP/Sieve greetings, EHLO replies and the backend EHLO. A host name as SMTP defines it (RFC 5321 §4.1.2): labels of letters, digits and hyphens separated by dots, 1-63 characters each without a hyphen at either end, at most 253 in all, no trailing dot. IP addresses and address literals (`[192.0.2.1]`) are refused, because the EHLO reply takes a domain only |
+| `server.hostname` | string | `mail-auth-proxy` | name in the IMAP/SMTP/Sieve greetings, EHLO replies and the backend EHLO. A host name as SMTP defines it (RFC 5321 §4.1.2): labels of letters, digits and hyphens separated by dots, 1-63 characters each without a hyphen at either end, at most 253 in all, no trailing dot. IP addresses and address literals (`[192.0.2.1]`) are refused, because the EHLO reply takes a domain only. A single label, the default included, gives a warning: the backend EHLO takes the fully-qualified primary host name (RFC 5321 §4.1.4, §2.3.5) |
 | `tls.cert`, `tls.key` | path | required | PEM chain and key served for every SNI |
 | `imap.listen` | `ip:port` | required | implicit-TLS listener |
 | `imap.backend` | backend | required | implicit-TLS IMAP backend |
@@ -126,7 +129,7 @@ backend `.…` keys below, written inline (`backend = { address = "…" }`) or a
 | `oauth.issuers[].allowed_algorithms` | array | RS256/384/512, PS256/384/512, ES256, ES384 | keys are used only with these |
 | `oauth.issuers[].infer_key_algorithm` | bool | `true` | a JWKS key without `alg` is used with the one algorithm its type implies (ES256 for P-256, ES384 for P-384, RS256 for RSA); off: such keys are skipped |
 | `oauth.issuers[].allowed_clients` | array | empty (any) | accepted values of `client_claim` |
-| `oauth.issuers[].client_claim` | string | `azp` | claim naming the OAuth client |
+| `oauth.issuers[].client_claim` | string | `client_id` for `token_type = "rfc9068"` (RFC 9068 §2.2), otherwise `azp` | claim naming the OAuth client |
 | `oauth.issuers[].openid_configuration_url` | URL | unset | https only (also for `localhost`), no `user:password@`, no fragment. Sent as `openid-configuration` in the error result a client gets for a rejected token (RFC 7628 §3.2.2), so it can find the IdP. Warning when it is not `<issuer>/.well-known/openid-configuration` |
 | `oauth.issuers[].scope` | string | unset | sent as `scope` in the same error result: the scope a client must request for mail. RFC 6749 scope tokens separated by single spaces; several scopes give a warning (RFC 7628 recommends one) |
 | `scope.internal_networks` | array of CIDR | empty (default: the `[password_gate]` networks) | label `scope=internal` in logs and metrics; allows nothing |
@@ -150,7 +153,8 @@ backend `.…` keys below, written inline (`backend = { address = "…" }`) or a
 | `password_gate.sni` | array | required when enabled | the rule's `sni` |
 | `password_gate.internal_networks` | array of CIDR | required when enabled | the rule's `networks` (with `public = true` if one is public), and the scope label when `[scope]` is absent, even with the gate off; every public network gives the same warning as a rule with `public = true`; not combinable with `[[legacy.rules]]` |
 | `limits.max_connections` | integer | 2048 | global cap, at most half unauthenticated; ≥ 1 |
-| `limits.max_preauth_per_ip` | integer | 32 | unauthenticated connections per IP; ≥ 1. IPv4 (also IPv4-mapped) counts per address, IPv6 per /64 (one host usually holds a whole /64) |
+| `limits.max_preauth_per_ip` | integer | 32 | unauthenticated connections per IP; ≥ 1. IPv4 (also IPv4-mapped) counts per address, IPv6 per `limits.ipv6_source_prefix` (one host usually holds a whole /64) |
+| `limits.ipv6_source_prefix` | integer | 64 | prefix length by which IPv6 sources are grouped for `max_preauth_per_ip` and `[auth_ratelimit]`; 32-64. 48 makes a whole site (a typical /48 assignment) one source, so an attacker cannot rotate through its /64s |
 | `limits.max_preauth_commands` | integer | 8 | commands before authentication; ≥ 1 |
 | `timeouts.preauth_secs` | integer | 60 | accept to credential, in total; 1-3600 |
 | `timeouts.idle_secs` | integer | 30 | silence on any single read; 1-3600 |
@@ -158,7 +162,7 @@ backend `.…` keys below, written inline (`backend = { address = "…" }`) or a
 | `metrics.enabled` | bool | `false`; `true` if only `listen` is set | serve the Prometheus endpoint |
 | `metrics.listen` | `ip:port` | required when enabled | Prometheus endpoint, no authentication (warning if not loopback); must not clash with a mail listener |
 | `auth_ratelimit.enabled` | bool | `true` | block sources with too many failed logins ([architecture.md](architecture.md#failed-login-rate-limit)) |
-| `auth_ratelimit.failures` | integer | 20 | counted failures of one source (IPv4 address, IPv6 /64) that start a block; ≥ 1. A repeated identical credential counts once |
+| `auth_ratelimit.failures` | integer | 20 | counted failures of one source (IPv4 address, IPv6 network of `limits.ipv6_source_prefix`, by default /64) that start a block; ≥ 1. A repeated identical credential counts once |
 | `auth_ratelimit.window_secs` | integer | 600 | window in which the failures are counted, from the first one; 1-86400 |
 | `auth_ratelimit.block_secs` | integer | 900 | length of the first block; 1-86400 |
 | `auth_ratelimit.max_block_secs` | integer | 86400 | each further block of the same source doubles up to this; `block_secs` to 604800. Equal to `block_secs`: no escalation |

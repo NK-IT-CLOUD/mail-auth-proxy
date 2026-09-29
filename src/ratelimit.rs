@@ -4,7 +4,8 @@
 //! connection for every attempt; the per-account throttle covers passwords
 //! only, and only per account (not spraying over many accounts, not token
 //! guessing). This counts the refused credentials of each source (an IPv4
-//! address, an IPv6 /64: `limits::preauth_key`) and, after `failures` within
+//! address, an IPv6 network of `limits.ipv6_source_prefix`, by default /64:
+//! `limits::preauth_key`) and, after `failures` within
 //! `window`, closes the source's new connections at accept for `block`,
 //! doubled for every further block up to `max_block`.
 //!
@@ -118,6 +119,8 @@ pub struct AuthRateLimit {
     settings: Option<Settings>,
     /// Sources that are never counted.
     exempt: Vec<IpNet>,
+    /// Prefix length IPv6 sources are grouped by (`limits::preauth_key`).
+    v6_prefix: u8,
     sources: Mutex<HashMap<IpAddr, Source>>,
 }
 
@@ -137,16 +140,22 @@ fn counts(reason: Reason) -> bool {
     }
 }
 
+static FINGERPRINT_KEY: std::sync::OnceLock<aws_lc_rs::hmac::Key> = std::sync::OnceLock::new();
+
+/// Generate the failure fingerprint key now; see
+/// `authlog::init_fingerprint_key`.
+pub fn init_fingerprint_key() -> anyhow::Result<()> {
+    if FINGERPRINT_KEY.get().is_none() {
+        let _ = FINGERPRINT_KEY.set(crate::obs::authlog::generate_hmac_key()?);
+    }
+    Ok(())
+}
+
 /// Process-lifetime HMAC key for the failure fingerprints, never persisted.
 fn fingerprint_key() -> &'static aws_lc_rs::hmac::Key {
-    static KEY: std::sync::OnceLock<aws_lc_rs::hmac::Key> = std::sync::OnceLock::new();
-    KEY.get_or_init(|| {
-        aws_lc_rs::hmac::Key::generate(
-            aws_lc_rs::hmac::HMAC_SHA256,
-            &aws_lc_rs::rand::SystemRandom::new(),
-        )
-        .expect("system RNG unavailable for fingerprint key")
-    })
+    // Only reached without `init_fingerprint_key` in unit tests.
+    FINGERPRINT_KEY
+        .get_or_init(|| crate::obs::authlog::generate_hmac_key().expect("fingerprint key"))
 }
 
 /// 64-bit keyed fingerprint of a presented credential (user and secret), to
@@ -168,14 +177,19 @@ fn fingerprint(credential: &ClientAuthKind) -> u64 {
 }
 
 /// The network a source key stands for, for the log.
-fn source_net(key: IpAddr) -> IpNet {
-    let prefix = if key.is_ipv4() { 32 } else { 64 };
+fn source_net(key: IpAddr, v6_prefix: u8) -> IpNet {
+    let prefix = if key.is_ipv4() { 32 } else { v6_prefix };
     IpNet::new(key, prefix).expect("prefix fits the address family")
 }
 
 impl AuthRateLimit {
-    /// From a validated configuration; `internal` is `scope.internal_networks`.
-    pub fn new(cfg: &config::AuthRateLimit, internal: &[IpNet]) -> anyhow::Result<AuthRateLimit> {
+    /// From a validated configuration; `internal` is `scope.internal_networks`,
+    /// `v6_prefix` is `limits.ipv6_source_prefix`.
+    pub fn new(
+        cfg: &config::AuthRateLimit,
+        internal: &[IpNet],
+        v6_prefix: u8,
+    ) -> anyhow::Result<AuthRateLimit> {
         let mut exempt = crate::auth::policy::parse_internal_nets(&cfg.exempt_networks)?;
         if cfg.exempt_internal {
             exempt.extend_from_slice(internal);
@@ -188,6 +202,7 @@ impl AuthRateLimit {
                 max_block: Duration::from_secs(cfg.max_block_secs),
             }),
             exempt,
+            v6_prefix,
             sources: Mutex::new(HashMap::new()),
         })
     }
@@ -205,7 +220,7 @@ impl AuthRateLimit {
         if self.settings.is_none() {
             return false;
         }
-        let key = crate::limits::preauth_key(peer);
+        let key = crate::limits::preauth_key(peer, self.v6_prefix);
         self.sources
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -230,10 +245,10 @@ impl AuthRateLimit {
         if crate::auth::policy::is_internal(peer, &self.exempt) {
             return;
         }
-        let key = crate::limits::preauth_key(peer);
+        let key = crate::limits::preauth_key(peer, self.v6_prefix);
         if let Some(ban) = self.failure_at(key, fingerprint(credential), Instant::now()) {
             tracing::warn!(target: "authlog",
-                action = "block", proto = proto.label(), scope, peer = %peer, source = %source_net(key),
+                action = "block", proto = proto.label(), scope, peer = %peer, source = %source_net(key, self.v6_prefix),
                 failures = ban.failures, block_secs = ban.duration.as_secs(), strikes = ban.strikes, "ratelimit");
         }
     }
@@ -349,7 +364,15 @@ mod tests {
     }
 
     fn limit(c: &config::AuthRateLimit) -> AuthRateLimit {
-        AuthRateLimit::new(c, &["10.0.0.0/8".parse().unwrap()]).unwrap()
+        AuthRateLimit::new(c, &["10.0.0.0/8".parse().unwrap()], 64).unwrap()
+    }
+
+    /// The startup check generates the key that fingerprints then use.
+    #[test]
+    fn startup_generates_the_fingerprint_key() {
+        init_fingerprint_key().unwrap();
+        let key = FINGERPRINT_KEY.get().expect("key set at startup");
+        assert!(std::ptr::eq(key, fingerprint_key()));
     }
 
     fn ip(s: &str) -> IpAddr {
@@ -467,6 +490,21 @@ mod tests {
         assert!(!l.is_blocked(ip("192.0.2.8")), "IPv4 per address");
     }
 
+    /// `limits.ipv6_source_prefix = 48`: failures from anywhere in a /48
+    /// count together, and the block covers the /48.
+    #[test]
+    fn ipv6_sources_group_by_the_configured_prefix() {
+        let l = AuthRateLimit::new(&cfg(2, 60, 100, 100), &[], 48).unwrap();
+        fail(&l, "2001:db8:1:2::1", 1);
+        fail(&l, "2001:db8:1:ffff::9", 1);
+        assert!(l.is_blocked(ip("2001:db8:1:abcd::1")), "same /48");
+        assert!(!l.is_blocked(ip("2001:db8:2::1")), "neighbouring /48");
+        assert_eq!(
+            source_net(crate::limits::preauth_key(ip("2001:db8:1:2::1"), 48), 48).to_string(),
+            "2001:db8:1::/48"
+        );
+    }
+
     /// Each block in a row doubles, up to `max_block`; after a quiet
     /// `max_block` the next block starts short again.
     #[test]
@@ -575,6 +613,8 @@ mod tests {
 
     const V2: &str = r#"
 config_version = 2
+[server]
+hostname = "proxy.example.org"
 [tls]
 cert = "/c.pem"
 key = "/k.pem"

@@ -95,6 +95,8 @@ backend_addr = "192.0.2.10:10993"
 
     pub(super) const V2: &str = r#"
 config_version = 2
+[server]
+hostname = "proxy.example.org"
 [tls]
 cert = "/c.pem"
 key = "/k.pem"

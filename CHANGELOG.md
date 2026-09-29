@@ -6,6 +6,44 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `limits.ipv6_source_prefix` (default 64, 32-64): the prefix length by which IPv6
+  sources are grouped for `max_preauth_per_ip` and the auth rate limit; 48 treats a
+  whole site as one source.
+
+### Changed
+- A `server.hostname` that is a single label, the default `mail-auth-proxy` included,
+  gives a configuration warning: the backend EHLO takes a fully-qualified host name
+  (RFC 5321 §4.1.4).
+- `oauth.issuers[].client_claim` defaults to `client_id` for `token_type = "rfc9068"`
+  (RFC 9068 §2.2); `keycloak` and `any` keep `azp`. An RFC 9068 issuer with
+  `allowed_clients` that relied on `azp` must now set `client_claim = "azp"`.
+- Relative file paths in the configuration (`tls.cert`, `tls.key`, `ca_file`,
+  `domains_file`, `doveadm_key_file`, `doveadm_ca_file`, `users_file`) are a validation
+  error: they resolved against the working directory, so `--check-config` in a shell
+  could pass on files the service never reads. Use absolute paths.
+
+### Fixed
+- A token whose JWS header has a `crit` parameter is refused: the proxy understands no
+  JWS extension (RFC 7515 §4.1.11).
+- A token whose `iss` claim is an array is refused; `iss` is a string (RFC 7519 §4.1.1).
+- A JWK with missing or undecodable members is skipped with a warning instead of
+  discarding the issuer's whole JWKS (RFC 7517 §5).
+- The JWKS of all issuers are fetched concurrently at startup, on refresh and on an
+  unknown `kid`: with several unreachable IdPs a refresh, and every token waiting on
+  it, took one 10-second timeout per issuer.
+- The password and rate-limit fingerprint keys are generated at startup: without a
+  system RNG the proxy now refuses to start instead of panicking in every session that
+  logs a refused login.
+- A JWKS response is used only with a 2xx status; a redirect carrying a JWKS body was
+  accepted.
+- `mail_auth_proxy_tls_cert_expiry_timestamp_seconds` is 0 for a certificate whose
+  `notAfter` has an impossible hour, minute, second or day (such as 31 April) instead of
+  a date rolled over into the next day or month.
+- A full legacy throttle table drops the oldest 1024 accounts at once instead of one per
+  new failing account, so the table scan under the lock is no longer paid on every new
+  account; a failure of an account already tracked evicts nothing.
+
 ## [0.2.0] - 2026-09-29
 
 ### Added

@@ -12,7 +12,7 @@ use crate::proto::imap::Imap;
 use crate::proto::sieve::{CapsCache, Sieve};
 use crate::proto::smtp::Submission;
 use crate::wire::Tuning;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ipnet::IpNet;
 use rustls::pki_types::ServerName;
 use std::net::SocketAddr;
@@ -263,6 +263,10 @@ pub async fn run(cfg: config::Config) -> Result<()> {
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
     metrics::mark_process_start();
+    // The per-process fingerprint keys: without a system RNG the proxy must
+    // not start, rather than fail on the first refused login.
+    crate::obs::authlog::init_fingerprint_key().context("password fingerprint key")?;
+    crate::ratelimit::init_fingerprint_key().context("rate limit fingerprint key")?;
     let Local {
         acceptor,
         certs,
@@ -287,6 +291,7 @@ pub async fn run(cfg: config::Config) -> Result<()> {
     let ratelimit = Arc::new(crate::ratelimit::AuthRateLimit::new(
         &cfg.auth_ratelimit,
         &nets,
+        cfg.limits.ipv6_source_prefix,
     )?);
     if ratelimit.is_enabled() {
         let r = &cfg.auth_ratelimit;
@@ -310,6 +315,7 @@ pub async fn run(cfg: config::Config) -> Result<()> {
         limits: crate::limits::Limits::new(
             cfg.limits.max_connections,
             cfg.limits.max_preauth_per_ip,
+            cfg.limits.ipv6_source_prefix,
         ),
         ratelimit,
         tuning: Tuning {
