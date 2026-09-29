@@ -180,7 +180,8 @@ journalctl -u mail-auth-proxy -n 20                                     # expect
 
 Log in with a mail client and look for `authresult result="ok"` in the journal. After a
 configuration change or certificate renewal, `systemctl reload mail-auth-proxy` loads it
-without closing open connections; only listener and metrics addresses need a restart.
+without closing open connections; only a change of the listeners or the metrics endpoint
+needs a restart.
 
 <details>
 <summary>Build from source</summary>
@@ -261,7 +262,8 @@ The full index is [docs/README.md](docs/README.md).
 - ManageSieve `LOGIN` is not supported.
 - The SMTP `EHLO` list is the backend's as the proxy's own probe sees it, cached for
   `submission.capability_cache_secs`; extensions the proxy does not handle are left out.
-- Connections closed by a limit, a failed-login block or a timeout get no `421`/`BYE`.
+- Connections closed by a connection limit, a failed-login block or a timeout get no
+  `421`/`BYE`.
 - The failed-login block counts per source address (IPv6 per /64, set by
   `limits.ipv6_source_prefix`): users behind one NAT or webmail server share it unless
   that address is exempt.

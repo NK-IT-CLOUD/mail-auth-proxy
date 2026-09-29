@@ -37,7 +37,8 @@ A single crate with a library (`src/lib.rs`) and a thin binary (`src/main.rs`).
 | `src/config/` | configuration format 2: loading (`mod.rs`), schema and defaults (`schema.rs`), validation, warnings and normalisation (`validate.rs`), the comparison a reload makes (`reload.rs`) |
 | `src/server/` | startup, listeners and accept loop, configuration reload (`reload.rs`), TLS material, signals, systemd notification |
 | `src/limits.rs` | connection limits at accept |
-| `src/proto/imap/`, `smtp/`, `sieve/` | per protocol: pre-auth dialog (`preauth.rs`), session handler (`mod.rs`), backend login (`backend.rs`) |
+| `src/ratelimit.rs` | the failed-login rate limit (`[auth_ratelimit]`) |
+| `src/proto/imap/`, `smtp/`, `sieve/` | per protocol: pre-auth dialog (`preauth.rs`), session handler (`mod.rs`), backend login (`backend.rs`); SMTP EHLO extensions from the backend probe (`smtp/ehlo.rs`) |
 | `src/auth/token.rs` | JWKS fetching and refresh, local JWT validation |
 | `src/auth/legacy.rs`, `account.rs` | the legacy (password) gate, doveadm account check |
 | `src/auth/sasl.rs`, `policy.rs`, `mod.rs` | SASL parsing and rebuilding, network matching, the decision shared by all protocols |

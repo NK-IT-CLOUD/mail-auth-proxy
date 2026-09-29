@@ -60,7 +60,7 @@ sudo dnf install ./mail-auth-proxy-X.Y.Z-1.x86_64.rpm
 | `/etc/mail-auth-proxy/` | directory `root:mail-auth-proxy` `0750` |
 | `/usr/lib/systemd/system/mail-auth-proxy.service` | the unit |
 | `/usr/lib/sysusers.d/mail-auth-proxy.conf` | the system user and group `mail-auth-proxy` (created on install, no login; an existing group of that name is reused) |
-| `/usr/share/doc/mail-auth-proxy/` | README and changelog |
+| `/usr/share/doc/mail-auth-proxy/` | README, changelog and the third-party license notices (`THIRD-PARTY-NOTICES.html`) |
 | `/usr/share/doc/mail-auth-proxy/copyright` | the license (`.deb`) |
 | `/usr/share/licenses/mail-auth-proxy/LICENSE` | the license (`.rpm`) |
 | `/usr/share/doc/mail-auth-proxy/crowdsec/` | CrowdSec parser and scenarios as examples, not activated ([contrib/crowdsec](contrib/crowdsec/README.md)) |

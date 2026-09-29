@@ -56,8 +56,12 @@ The file is strict. Startup fails, and `--check-config` reports, when:
 - `[password_gate]` is enabled without `sni` or networks, or combined with
   `[[legacy.rules]]`;
 - a limit, timeout, `refresh_secs`, `capability_cache_secs` or throttle value is 0;
-  `leeway_secs` is above 300, `refresh_secs` above 86400, a timeout above 3600 or
-  `failure_delay_ms` above 10000;
+  `leeway_secs` is above 300, `refresh_secs` above 86400, a timeout above 3600,
+  `failure_delay_ms` above 10000, `max_auth_attempts` outside 1-10, `ipv6_source_prefix`
+  outside 32-64, or a `[session]` value outside its range ([Keys](#keys));
+- a network (`scope.internal_networks`, a rule's `networks`,
+  `password_gate.internal_networks`) is not a CIDR, or an `identity_domains`,
+  `allowed_domains` or `users` entry is not a domain or login;
 - `submission.backend.proxy_protocol` is set, or a `submission.ehlo_extensions` entry is
   not an EHLO line, repeats a keyword or is `AUTH` or `STARTTLS` (an entry the proxy never
   advertises, or one with parameters, is a warning);

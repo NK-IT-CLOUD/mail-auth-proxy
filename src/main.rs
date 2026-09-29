@@ -6,12 +6,14 @@ const DEFAULT_CONFIG: &str = "/etc/mail-auth-proxy/config.toml";
 
 const USAGE: &str = "usage: mail-auth-proxy [-t | --check-config | --print-config] [CONFIG]
        mail-auth-proxy --version
+       mail-auth-proxy -h | --help
 
   CONFIG           configuration file (default /etc/mail-auth-proxy/config.toml)
   -t, --check-config
                    validate CONFIG, load its certificates and CA files, then exit
   --print-config   print the effective configuration
-  --version        print the version";
+  --version        print the version
+  -h, --help       print this usage";
 
 enum Mode {
     Run,

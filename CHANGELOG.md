@@ -6,6 +6,9 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- The usage text (`-h`, `--help`, an unknown option) lists `-h` and `--help`.
+
 ## [0.3.0] - 2026-09-29
 
 ### Added

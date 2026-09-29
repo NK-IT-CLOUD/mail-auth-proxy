@@ -24,12 +24,12 @@ A line is split as `<tag> SP <command> [SP <rest>]`. Commands are case-insensiti
 | `t LOGIN <user> <pass>` (atom, quoted string with `\"` `\\` escapes, or literal) | goes to the credential phase | |
 | `t LOGIN … {n}` (synchronising literal, up to 16384 octets) | `+ Ready for literal data`, then the octets and the rest of the command on the next line | stays open |
 | `t LOGIN … {n+}` (non-synchronising literal) | the octets and the rest of the command follow at once | stays open |
-| `t LOGIN … {n}` on a connection that offers no LOGIN | `t NO password authentication not available on this endpoint`, no continuation | closed |
+| `t LOGIN … {n}` on a connection that offers no LOGIN | `t NO password authentication not available on this endpoint`, no continuation | stays open; an attempt |
 | `t LOGIN` with bad quoting, a malformed or larger literal, or a NUL | `t BAD LOGIN arguments` | closed |
-| `t LOGIN "" x` | `t NO LOGIN empty field` | closed |
+| `t LOGIN "" x` | `t NO LOGIN empty field` | stays open; an attempt |
 | `t AUTHENTICATE <mech> [<ir>]` with a supported mech | SASL exchange, [below](#imap-sasl-exchange) | |
-| `t AUTHENTICATE` (no mech) | `t BAD AUTHENTICATE needs a mechanism` | closed |
-| `t AUTHENTICATE CRAM-MD5` (any other mech) | `t NO unsupported SASL mechanism` | closed |
+| `t AUTHENTICATE` (no mech) | `t BAD AUTHENTICATE needs a mechanism` | stays open; an attempt |
+| `t AUTHENTICATE CRAM-MD5` (any other mech) | `t NO unsupported SASL mechanism` | stays open; an attempt |
 | any other command, including `STARTTLS`, `ENABLE`, `SELECT` | `t NO command not supported before authentication` | closed |
 | a line without tag or command, or an empty line | `* BAD expected: tag command` | closed |
 | an 8th non-final command | its reply, then `* BYE too many commands before authentication` | closed |
@@ -47,7 +47,7 @@ A client that reads the greeting and disconnects before its first command (a hea
 - A response that decodes but holds no valid credential gets `t NO [AUTHENTICATIONFAILED] Authentication failed`: a PLAIN message without two NULs, with a NUL in the password or an authzid other than the login, a NUL in a LOGIN field, an OAuth response without `auth=Bearer <token>`, a malformed OAUTHBEARER GS2 header (the flag must be `n` or `y`, `p=` is refused), a malformed `host`, or a SASL user over 255 bytes or with control characters. Such a response carries no usable credential: the `authresult` line is `protocol`.
 - An OAuth response with an empty `auth` value (`auth=`, or `Bearer` without a token) is a discovery request (RFC 7628 §4.3): it gets the [OAuth error result](#oauth-error-result) like a rejected token, and its `authresult` line is `protocol` with the mechanism and the SASL user. It is not a failed login and does not count in the rate limit.
 
-Each of these ends the connection.
+Each of these is an attempt: the connection stays open for another one, up to `limits.max_auth_attempts` ([below](#imap-decision-and-backend-login)). A response line that cannot be read (over 16384 bytes, the idle timeout, a close) ends the connection.
 
 ### IMAP: decision and backend login
 
@@ -104,13 +104,13 @@ sequenceDiagram
     C->>P: b AUTHENTICATE XOAUTH2 [ir]
     alt no IR
         P-->>C: "+ "
-        C->>P: base64 IR (or "*" → b BAD, close)
+        C->>P: base64 IR (or "*" → b BAD)
     end
     P->>I: validate JWT (kid → key, alg pinned, iss/aud/exp/nbf, email_verified, typ=Bearer)
     alt invalid
         P-->>C: + base64(error result)
         C->>P: AQ== (OAUTHBEARER) / empty line (XOAUTH2) / *
-        P-->>C: b NO [AUTHENTICATIONFAILED] Authentication failed (b BAD for *) (close)
+        P-->>C: b NO [AUTHENTICATIONFAILED] Authentication failed (b BAD for *) (close after the last attempt)
     else valid → email
         P->>B: TCP + [PROXY v2] + TLS (verify backend verify_name)
         B-->>P: * OK …
@@ -118,9 +118,9 @@ sequenceDiagram
         alt P1 OK
             B-->>P: P1 OK [CAPABILITY …] Logged in
             P-->>C: b OK [CAPABILITY …] Logged in
-            C-->>B: byte relay (copy_bidirectional, no timeout)
+            C-->>B: byte relay (copy_bidirectional, [session] limits off by default)
         else P1 NO / failure
-            P-->>C: b NO [AUTHENTICATIONFAILED] backend rejected token (close)
+            P-->>C: b NO [AUTHENTICATIONFAILED] backend rejected token (close after the last attempt)
         end
     end
 ```
@@ -215,13 +215,13 @@ sequenceDiagram
     P-->>C: 220 2.0.0 Ready to start TLS
     C->>P: TLS handshake (SNI)
     C->>P: EHLO
-    P-->>C: 250-… static list … 250 AUTH XOAUTH2 OAUTHBEARER (+PLAIN LOGIN)
+    P-->>C: 250-… backend's extensions (cached probe) … 250 AUTH XOAUTH2 OAUTHBEARER (+PLAIN LOGIN)
     C->>P: AUTH XOAUTH2 <ir>
     P->>P: validate JWT → email
     opt invalid
         P-->>C: 334 base64(error result)
         C->>P: empty line (XOAUTH2) / AQ== (OAUTHBEARER) / *
-        P-->>C: 535 5.7.8 Authentication credentials invalid (501 for *) + 421 (close)
+        P-->>C: 535 5.7.8 Authentication credentials invalid (501 for *), + 421 (close) after the last attempt
     end
     P->>B: TCP connect
     B-->>P: 220
@@ -237,7 +237,7 @@ sequenceDiagram
         P-->>C: 235 2.7.0 Authentication successful
         C-->>B: byte relay
     else other code
-        P-->>C: 535 5.7.8 … + 421 (close)
+        P-->>C: 535 5.7.8 …, + 421 (close) after the last attempt
     else backend unreachable / TLS failure
         P-->>C: 454 4.7.0 Temporary authentication failure + 421 (close)
     end
@@ -318,7 +318,7 @@ sequenceDiagram
     participant P as mail-auth-proxy
     participant B as Dovecot (ManageSieve)
     C->>P: TCP connect
-    P-->>C: static caps (SASL "XOAUTH2 OAUTHBEARER", STARTTLS) + OK "ready"
+    P-->>C: greeting (SASL "", backend's SIEVE, STARTTLS) + OK "ready"
     C->>P: STARTTLS
     P-->>C: OK "Begin TLS negotiation now"
     C->>P: TLS handshake (SNI)
@@ -333,7 +333,7 @@ sequenceDiagram
     opt invalid
         P-->>C: "base64(error result)"
         C->>P: "AQ==" (OAUTHBEARER) / "" (XOAUTH2) / "*"
-        P-->>C: NO "Authentication failed" (close)
+        P-->>C: NO "Authentication failed" (close after the last attempt)
     end
     P->>B: TCP + [PROXY v2] + greeting + STARTTLS + TLS + caps
     P->>B: AUTHENTICATE "XOAUTH2" "base64(user=email ^A auth=Bearer jwt ^A^A)"
@@ -342,7 +342,7 @@ sequenceDiagram
         P-->>C: OK "Logged in."
         C-->>B: byte relay
     else NO / failure
-        P-->>C: NO "Authentication failed" (close)
+        P-->>C: NO "Authentication failed" (close after the last attempt)
     end
 ```
 
@@ -392,7 +392,7 @@ the result is `{"status":"invalid_token"}`.
 
 ## Surprising and client-incompatible behaviour
 
-1. **A few authentication attempts per connection.** A connection takes `limits.max_auth_attempts` attempts (default 3), so a client can fall back from one mechanism to another (Python `smtplib.login()` from PLAIN to LOGIN after a 535). After the last one, after a retry-later reply and after an unknown pre-auth command the connection closes; SMTP announces the close with `421 4.7.0 <hostname> closing connection`. When the rate limit has blocked the source in the meantime, the next credential is not judged and the connection closes without an answer.
+1. **A few authentication attempts per connection.** A connection takes `limits.max_auth_attempts` attempts (default 3), so a client can fall back from one mechanism to another (Python `smtplib.login()` from PLAIN to LOGIN after a 535). After the last one, after a retry-later reply, after an IMAP command that is not valid before authentication and after a malformed command ([D-GEN-1](standards.md#d-gen-1-limited-authentication-attempts-per-connection)) the connection closes; SMTP announces the close with `421 4.7.0 <hostname> closing connection`. When the rate limit has blocked the source in the meantime, the next credential is not judged and the connection closes without an answer.
 2. **The client's SASL username must match the token for OAuth.** The backend login is always the token's `identity_claim` (default `email`). An XOAUTH2 `user=` (required by the mechanism) or OAUTHBEARER `a=` must be empty, the identity itself, or its local part without a domain (`alice` for `alice@example.org`), all ASCII case-insensitive; anything else, in particular another full address, fails the exchange. OAUTHBEARER is converted to XOAUTH2 for the backend.
 3. **A legacy rule with `sni` needs SNI.** Clients connecting by IP (no SNI) or with a different hostname or alias only get OAuth from such a rule, even from its networks.
 4. **IMAP:** only `IMAP4rev1` is advertised before authentication; after login the backend's real list is relayed, with `IMAP4rev2` if the backend offers it. `STARTTLS` on the implicit-TLS port closes the connection.

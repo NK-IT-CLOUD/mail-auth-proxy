@@ -59,7 +59,7 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 | Untagged BAD when the tag cannot be determined | | RFC 9051 §7.1.3 | Yes | |
 | Commands not valid in this state → BAD or NO | | RFC 3501 §3 | Yes (NO) | Then the connection closes |
 | Pre-authentication inactivity timeout may be short | | RFC 9051 §5.4 | Yes | Default 30 s idle, 60 s total. See D-GEN-2. |
-| Post-authentication autologout ≥ 30 min | MUST | RFC 9051 §5.4 | N/A | No proxy timer after login; the backend decides |
+| Post-authentication autologout ≥ 30 min | MUST | RFC 9051 §5.4 | Depends on configuration | No proxy timer after login by default; the backend decides. `session.idle_limit_secs` and `session.max_session_secs` below 1800 give a warning (section 7, D-GEN-3) |
 | STARTTLS on cleartext ports | MUST | RFC 9051 §6.1.1 | N/A | No cleartext IMAP port |
 | Pipelined commands after AUTHENTICATE reach the backend | | RFC 9051 §5.5 | Yes | |
 
