@@ -160,6 +160,7 @@ async fn preauth_budget_closes_silent_clients() {
         peer: peer.into(),
         reason: "protocol".into(),
         pwfp: String::new(),
+        backend: String::new(),
     };
     assert_eq!(
         ars,

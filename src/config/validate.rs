@@ -2,10 +2,18 @@
 //! the short forms into what the rest of the program reads.
 
 use super::{
-    AccountCheck, AuthRateLimit, Backend, BackendTls, ClientIp, Config, Legacy, Rule, Session,
-    TokenType, PASSWORD_GATE_RULE,
+    AccountCheck, AuthRateLimit, Backend, BackendRef, BackendTls, ClientIp, Config, Legacy,
+    Protocol, Route, Rule, Session, TokenType, PASSWORD_GATE_RULE,
 };
+use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
+
+/// Upper bound of `[backends]` entries: every backend is a metric and log
+/// label and a refusal-timing pool.
+const MAX_BACKENDS: usize = 64;
+
+/// Upper bound of `[[routes]]`: each credential walks them in order.
+const MAX_ROUTES: usize = 256;
 
 /// Upper bound of `oauth.leeway_secs`. The leeway is added to `exp` and
 /// subtracted from `nbf` of every token; RFC 7519 sections 4.1.4 and 4.1.5
@@ -62,13 +70,11 @@ impl Config {
         }
 
         let mut listens = vec![("imap.listen", &self.imap.listen)];
-        let mut backends = vec![("imap.backend", &self.imap.backend)];
         if let Some(s) = &self.submission {
             listens.push(("submission.listen", &s.listen));
             if let Some(l) = &s.implicit_tls_listen {
                 listens.push(("submission.implicit_tls_listen", l));
             }
-            backends.push(("submission.backend", &s.backend));
             use crate::proto::smtp::ehlo::{ehlo_keyword, RELAYED};
             let mut keywords: Vec<&str> = Vec::new();
             for x in s.ehlo_extensions.iter().flatten() {
@@ -96,7 +102,6 @@ impl Config {
         }
         if let Some(s) = &self.sieve {
             listens.push(("sieve.listen", &s.listen));
-            backends.push(("sieve.backend", &s.backend));
             if s.capability_cache_secs == 0 {
                 err("sieve.capability_cache_secs must be at least 1".into());
             }
@@ -125,33 +130,6 @@ impl Config {
                 None => {}
             }
         }
-        for (name, b) in &backends {
-            check_path(&format!("{name}.ca_file"), b.ca_file.as_deref(), &mut err);
-            let submission = *name == "submission.backend";
-            let xclient = submission && self.submission.as_ref().is_some_and(|s| s.xclient);
-            check_client_ip(name, b, submission, xclient, &mut err, warnings);
-            let address_ok = b
-                .address
-                .rsplit_once(':')
-                .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok());
-            if !address_ok {
-                err(format!(
-                    "{name}.address = {:?} must be host:port",
-                    b.address
-                ));
-            }
-            // Without verify_name the name comes from the address; a bad
-            // address is reported once, above.
-            let vname = match &b.verify_name {
-                Some(n) => n.clone(),
-                None if address_ok => crate::wire::connect::host_of(&b.address).to_string(),
-                None => continue,
-            };
-            if rustls::pki_types::ServerName::try_from(vname.clone()).is_err() {
-                err(format!("{name}: {vname:?} is not a valid certificate name"));
-            }
-        }
-
         if self.oauth.issuers.is_empty() {
             err("oauth.issuers: at least one issuer is required".into());
         }
@@ -254,6 +232,9 @@ impl Config {
                 ));
             }
         }
+
+        self.check_backends(&mut err, warnings);
+        self.check_routes(&mut err, warnings);
 
         if let Some(g) = &self.password_gate {
             if g.enabled {
@@ -382,22 +363,257 @@ impl Config {
             }
         }
         self.metrics.enabled = Some(self.metrics.is_enabled());
-        // The backend profile with its defaults spelled out; the short forms
-        // become `client_ip`.
-        let b = &mut self.imap.backend;
-        b.client_ip = Some(b.effective_client_ip(false));
-        b.proxy_protocol = false;
-        b.tls.get_or_insert(BackendTls::Implicit);
+        // Each backend profile with its defaults spelled out, by the
+        // protocol that uses it; the short forms become `client_ip`.
+        let xclient = self.submission.as_ref().is_some_and(|s| s.xclient);
+        for protocol in Protocol::ALL {
+            let names: Vec<String> = self
+                .backends_of(protocol)
+                .iter()
+                .filter(|u| !u.inline)
+                .map(|u| u.name.to_owned())
+                .collect();
+            let inline = match protocol {
+                Protocol::Imap => self.imap.backend.as_mut(),
+                Protocol::Submission => self.submission.as_mut().and_then(|s| s.backend.as_mut()),
+                Protocol::Sieve => self.sieve.as_mut().and_then(|s| s.backend.as_mut()),
+            };
+            let mut used: Vec<&mut Backend> = match inline {
+                Some(BackendRef::Inline(b)) => vec![b],
+                _ => Vec::new(),
+            };
+            used.extend(
+                self.backends
+                    .iter_mut()
+                    .filter(|(n, _)| names.contains(n))
+                    .map(|(_, b)| b),
+            );
+            let xclient = protocol == Protocol::Submission && xclient;
+            for b in used {
+                b.client_ip = Some(b.effective_client_ip(xclient));
+                b.proxy_protocol = false;
+                b.tls.get_or_insert(default_tls(protocol));
+            }
+        }
         if let Some(s) = &mut self.submission {
-            s.backend.client_ip = Some(s.backend.effective_client_ip(s.xclient));
-            (s.backend.proxy_protocol, s.xclient) = (false, false);
-            s.backend.tls.get_or_insert(BackendTls::Starttls);
+            s.xclient = false;
         }
-        if let Some(s) = &mut self.sieve {
-            s.backend.client_ip = Some(s.backend.effective_client_ip(false));
-            s.backend.proxy_protocol = false;
-            s.backend.tls.get_or_insert(BackendTls::Starttls);
+    }
+
+    /// The backends: each used one against its protocol, the named ones for
+    /// their names and use.
+    fn check_backends(&self, err: &mut impl FnMut(String), warnings: &mut Vec<String>) {
+        if self.backends.len() > MAX_BACKENDS {
+            err(format!("backends: at most {MAX_BACKENDS} backends"));
         }
+        for name in self.backends.keys() {
+            if !is_plain_name(name) {
+                err(format!(
+                    "backends.{name}: the name must be 1-64 of A-Z a-z 0-9 . _ -"
+                ));
+            } else if Protocol::ALL.iter().any(|p| p.section() == name) {
+                err(format!(
+                    "backends.{name}: the name is reserved for the backend written in [{name}]"
+                ));
+            }
+        }
+        let xclient = self.submission.as_ref().is_some_and(|s| s.xclient);
+        let mut users: BTreeMap<&str, Protocol> = BTreeMap::new();
+        for protocol in Protocol::ALL.into_iter().filter(|p| self.has_protocol(*p)) {
+            let section = protocol.section();
+            match self.listener_backend(protocol) {
+                Some(BackendRef::Name(name)) if !self.backends.contains_key(name) => {
+                    err(format!(
+                        "{section}.backend = {name:?} names no [backends] entry"
+                    ));
+                }
+                Some(_) if self.routes.iter().any(|r| r.backend(protocol).is_some()) => {
+                    err(format!(
+                        "{section}.backend and routes with {section} = … cannot be combined: the routes choose the backend"
+                    ));
+                }
+                Some(_) => {}
+                None if self.routes.iter().any(|r| r.backend(protocol).is_some()) => {}
+                None => err(format!(
+                    "{section}.backend is required (or routes with {section} = …)"
+                )),
+            }
+            let submission = protocol == Protocol::Submission;
+            for used in self.backends_of(protocol) {
+                if !used.inline {
+                    match users.insert(used.name, protocol) {
+                        Some(other) if other != protocol => err(format!(
+                            "backends.{}: used by {} and {section}; a backend serves one protocol",
+                            used.name,
+                            other.section()
+                        )),
+                        _ => {}
+                    }
+                }
+                let key = used.key();
+                check_client_ip(
+                    &key,
+                    used.backend,
+                    submission,
+                    submission && xclient,
+                    err,
+                    warnings,
+                );
+                check_backend_address(&key, used.backend, err);
+            }
+        }
+        for (name, b) in &self.backends {
+            if !users.contains_key(name.as_str()) {
+                warnings.push(format!(
+                    "backends.{name} is not used by any listener or route"
+                ));
+                check_backend_address(&format!("backends.{name}"), b, err);
+            }
+        }
+    }
+
+    /// The routes: names, conditions, the backends they name, and routes an
+    /// earlier one makes unreachable.
+    fn check_routes(&self, err: &mut impl FnMut(String), warnings: &mut Vec<String>) {
+        if self.routes.len() > MAX_ROUTES {
+            err(format!("routes: at most {MAX_ROUTES} routes"));
+        }
+        for (i, r) in self.routes.iter().enumerate() {
+            let at = format!("routes[{i}]");
+            if !is_plain_name(&r.name) {
+                err(format!(
+                    "{at}.name {:?} must be 1-64 of A-Z a-z 0-9 . _ -",
+                    r.name
+                ));
+            } else if self.routes[..i].iter().any(|o| o.name == r.name) {
+                err(format!("{at}.name {:?} is used twice", r.name));
+            }
+            if r.domains.is_empty() && r.issuers.is_empty() {
+                err(format!("{at}: set domains or issuers"));
+            }
+            for d in &r.domains {
+                if d == "*" {
+                    if r.domains.len() > 1 {
+                        err(format!(
+                            "{at}.domains: \"*\" matches every domain; list nothing else"
+                        ));
+                    }
+                    if i + 1 != self.routes.len() {
+                        err(format!(
+                            "{at}.domains: \"*\" only in the last route, the routes after it are never reached"
+                        ));
+                    }
+                } else if let Err(e) = check_domain_entry(d) {
+                    err(format!("{at}.domains: {d:?} {e}"));
+                }
+            }
+            for iss in &r.issuers {
+                if !self.oauth.issuers.iter().any(|o| o.issuer == *iss) {
+                    err(format!(
+                        "{at}.issuers: {iss:?} is not an oauth.issuers entry"
+                    ));
+                }
+            }
+            if r.sni.iter().chain(&r.audiences).any(String::is_empty) {
+                err(format!("{at}: sni and audiences entries must not be empty"));
+            }
+            let served: Vec<Protocol> = Protocol::ALL
+                .into_iter()
+                .filter(|p| r.backend(*p).is_some())
+                .collect();
+            if served.is_empty() {
+                err(format!(
+                    "{at}: name a backend for imap, submission or sieve"
+                ));
+            }
+            for p in &served {
+                let name = r.backend(*p).unwrap_or_default();
+                if !self.backends.contains_key(name) {
+                    err(format!(
+                        "{at}.{} = {name:?} names no [backends] entry",
+                        p.section()
+                    ));
+                }
+                if !self.has_protocol(*p) {
+                    err(format!("{at}.{0}: there is no [{0}] section", p.section()));
+                }
+            }
+            // An earlier route with the same conditions that serves every
+            // protocol of this one takes all its credentials.
+            let same = |o: &Route| {
+                let set = |v: &[String]| {
+                    let mut v: Vec<String> = v.iter().map(|x| x.to_ascii_lowercase()).collect();
+                    v.sort();
+                    v
+                };
+                set(&o.issuers) == set(&r.issuers)
+                    && set(&o.sni) == set(&r.sni)
+                    && set(&o.audiences) == set(&r.audiences)
+                    && served.iter().all(|p| o.backend(*p).is_some())
+            };
+            for d in &r.domains {
+                if let Some(o) = self.routes[..i]
+                    .iter()
+                    .find(|o| same(o) && o.domains.iter().any(|od| od.eq_ignore_ascii_case(d)))
+                {
+                    err(format!(
+                        "{at}: domain {d:?} is already taken by route {:?} with the same conditions",
+                        o.name
+                    ));
+                }
+            }
+            // Only when every issuer is bounded: otherwise any issuer may
+            // vouch for the domain.
+            let bounded = self
+                .oauth
+                .issuers
+                .iter()
+                .all(|i| !i.identity_domains.is_empty());
+            for d in r.domains.iter().filter(|d| *d != "*") {
+                let reachable = self.oauth.issuers.iter().any(|iss| {
+                    (r.issuers.is_empty() || r.issuers.contains(&iss.issuer))
+                        && iss
+                            .identity_domains
+                            .iter()
+                            .any(|x| x.eq_ignore_ascii_case(d))
+                });
+                if bounded && !reachable {
+                    warnings.push(format!(
+                        "{at}: no issuer that the route accepts has {d:?} in its identity_domains; only passwords can use it"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// The protocol's backend TLS when the profile does not say.
+fn default_tls(protocol: Protocol) -> BackendTls {
+    match protocol {
+        Protocol::Imap => BackendTls::Implicit,
+        Protocol::Submission | Protocol::Sieve => BackendTls::Starttls,
+    }
+}
+
+/// `address`, `verify_name` and `ca_file` of the backend at `key`.
+fn check_backend_address(key: &str, b: &Backend, err: &mut impl FnMut(String)) {
+    check_path(&format!("{key}.ca_file"), b.ca_file.as_deref(), err);
+    let address_ok = b
+        .address
+        .rsplit_once(':')
+        .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok());
+    if !address_ok {
+        err(format!("{key}.address = {:?} must be host:port", b.address));
+    }
+    // Without verify_name the name comes from the address; a bad address is
+    // reported once, above.
+    let vname = match &b.verify_name {
+        Some(n) => n.clone(),
+        None if address_ok => crate::wire::connect::host_of(&b.address).to_string(),
+        None => return,
+    };
+    if rustls::pki_types::ServerName::try_from(vname.clone()).is_err() {
+        err(format!("{key}: {vname:?} is not a valid certificate name"));
     }
 }
 
@@ -829,9 +1045,17 @@ impl AuthRateLimit {
 #[cfg(test)]
 mod tests {
     use crate::config::tests::{parse, V2};
-    use crate::config::{BackendTls, ClientIp, PASSWORD_GATE_RULE};
+    use crate::config::{Backend, BackendRef, BackendTls, ClientIp, Protocol, PASSWORD_GATE_RULE};
 
     /// Errors of `V2` plus `extra`, joined.
+    /// The inline backend of a listener.
+    fn inline(b: &Option<BackendRef>) -> &Backend {
+        match b {
+            Some(BackendRef::Inline(b)) => b,
+            other => panic!("not an inline backend: {other:?}"),
+        }
+    }
+
     fn errors_with(extra: &str) -> String {
         crate::config::parse(&format!("{V2}{extra}"))
             .map(|l| l.errors.join("\n"))
@@ -1720,9 +1944,9 @@ mod tests {
         assert!(l.errors.is_empty(), "{:?}", l.errors);
         let c = &l.config;
         let (imap, sub, sieve) = (
-            &c.imap.backend,
-            &c.submission.as_ref().unwrap().backend,
-            &c.sieve.as_ref().unwrap().backend,
+            inline(&c.imap.backend),
+            inline(&c.submission.as_ref().unwrap().backend),
+            inline(&c.sieve.as_ref().unwrap().backend),
         );
         assert_eq!(imap.client_ip, Some(ClientIp::None));
         assert_eq!(sub.client_ip, Some(ClientIp::Xclient));
@@ -1774,14 +1998,14 @@ mod tests {
         ))
         .unwrap();
         let c = &l.config;
-        assert_eq!(c.imap.backend.tls, Some(BackendTls::Starttls));
+        assert_eq!(inline(&c.imap.backend).tls, Some(BackendTls::Starttls));
         assert_eq!(
-            c.imap.backend.auth_forward,
+            inline(&c.imap.backend).auth_forward,
             crate::config::AuthForward::Oauthbearer
         );
         let s = c.submission.as_ref().unwrap();
-        assert_eq!(s.backend.client_ip, Some(ClientIp::ProxyV2));
-        assert_eq!(s.backend.tls, Some(BackendTls::Implicit));
+        assert_eq!(inline(&s.backend).client_ip, Some(ClientIp::ProxyV2));
+        assert_eq!(inline(&s.backend).tls, Some(BackendTls::Implicit));
         assert_eq!(s.implicit_tls_listen.as_deref(), Some("0.0.0.0:465"));
 
         for (extra, needle) in [
@@ -1820,5 +2044,124 @@ mod tests {
         ] {
             assert!(crate::config::parse(&bad).is_err(), "{bad}");
         }
+    }
+
+    /// IMAP without a backend of its own, then `extra`.
+    fn routed(extra: &str) -> String {
+        format!(
+            "{}{extra}",
+            V2.replace(
+                "backend = { address = \"192.0.2.10:993\", verify_name = \"mail.example.org\", client_ip = \"proxy_v2\" }\n",
+                ""
+            )
+        )
+    }
+
+    const TWO_BACKENDS: &str = "[backends.one]\naddress = \"192.0.2.1:993\"\nclient_ip = \"proxy_v2\"\n[backends.two]\naddress = \"192.0.2.2:993\"\nclient_ip = \"proxy_v2\"\n";
+
+    /// Named backends and routes: a valid file, its defaults by protocol,
+    /// and the printed form parses back to the same configuration.
+    #[test]
+    fn routes_and_named_backends() {
+        let text = routed(&format!(
+            "{TWO_BACKENDS}[[routes]]\nname = \"one\"\ndomains = [\"one.example\"]\nimap = \"one\"\n[[routes]]\nname = \"rest\"\ndomains = [\"*\"]\nimap = \"two\"\n"
+        ));
+        let l = parse(&text).unwrap();
+        assert!(l.warnings.is_empty(), "{:?}", l.warnings);
+        let c = &l.config;
+        let used: Vec<&str> = c
+            .backends_of(Protocol::Imap)
+            .iter()
+            .map(|u| u.name)
+            .collect();
+        assert_eq!(used, ["one", "two"]);
+        // IMAP's default TLS, filled in by use.
+        assert_eq!(c.backends["one"].tls, Some(BackendTls::Implicit));
+        let printed = toml::to_string(c).unwrap();
+        let again = parse(&printed).unwrap().config;
+        assert_eq!(again.routes, c.routes);
+        assert_eq!(again.backends, c.backends);
+        assert!(again.imap.backend.is_none());
+        // A section may name a backend instead.
+        let named = parse(&V2
+            .replace("backend = { address = \"192.0.2.10:993\", verify_name = \"mail.example.org\", client_ip = \"proxy_v2\" }", "backend = \"one\"")
+            .replace("[oauth]", &format!("{TWO_BACKENDS}[oauth]")))
+        .unwrap();
+        assert_eq!(
+            named.config.imap.backend,
+            Some(BackendRef::Name("one".into()))
+        );
+        assert!(
+            named
+                .warnings
+                .iter()
+                .any(|w| w.contains("backends.two is not used")),
+            "{:?}",
+            named.warnings
+        );
+    }
+
+    #[test]
+    fn routes_and_backends_are_validated() {
+        let r = |route: &str| routed(&format!("{TWO_BACKENDS}[[routes]]\n{route}\n"));
+        for (text, expect) in [
+            (routed(""), "imap.backend is required (or routes with imap = …)"),
+            (V2.replace("[oauth]", &format!("{TWO_BACKENDS}[[routes]]\nname = \"x\"\ndomains = [\"a.example\"]\nimap = \"one\"\n[oauth]")),
+                "imap.backend and routes with imap = … cannot be combined"),
+            (V2.replace("backend = { address = \"192.0.2.10:993\", verify_name = \"mail.example.org\", client_ip = \"proxy_v2\" }", "backend = \"nope\""),
+                "imap.backend = \"nope\" names no [backends] entry"),
+            (r("name = \"x\"\ndomains = [\"a.example\"]\nimap = \"nope\""), "routes[0].imap = \"nope\" names no [backends] entry"),
+            (r("name = \"x\"\nimap = \"one\""), "routes[0]: set domains or issuers"),
+            (r("name = \"x\"\ndomains = [\"a.example\"]"), "routes[0]: name a backend for imap, submission or sieve"),
+            (r("name = \"x y\"\ndomains = [\"a.example\"]\nimap = \"one\""), "routes[0].name \"x y\" must be 1-64"),
+            (r("name = \"x\"\ndomains = [\"*\", \"a.example\"]\nimap = \"one\""), "list nothing else"),
+            (r("name = \"x\"\ndomains = [\"*\"]\nimap = \"one\"\n[[routes]]\nname = \"y\"\ndomains = [\"a.example\"]\nimap = \"two\""), "only in the last route"),
+            (r("name = \"x\"\ndomains = [\"a.example\"]\nimap = \"one\"\n[[routes]]\nname = \"y\"\ndomains = [\"A.example\"]\nimap = \"two\""), "routes[1]: domain \"A.example\" is already taken by route \"x\""),
+            (r("name = \"x\"\ndomains = [\"a.example\"]\nimap = \"one\"\n[[routes]]\nname = \"x\"\ndomains = [\"b.example\"]\nimap = \"two\""), "routes[1].name \"x\" is used twice"),
+            (r("name = \"x\"\ndomains = [\"a.example\"]\nissuers = [\"https://other\"]\nimap = \"one\""), "routes[0].issuers: \"https://other\" is not an oauth.issuers entry"),
+            (r("name = \"x\"\ndomains = [\"a.example\"]\nsieve = \"one\""), "routes[0].sieve: there is no [sieve] section"),
+            (r("name = \"x\"\ndomains = [\"a.example\"]\nimap = \"one\"\nsni = [\"\"]"), "sni and audiences entries must not be empty"),
+            (routed("[backends.imap]\naddress = \"192.0.2.1:993\"\n[[routes]]\nname = \"x\"\ndomains = [\"a.example\"]\nimap = \"imap\"\n"), "backends.imap: the name is reserved"),
+            (routed("[backends.one]\naddress = \"nope\"\n[[routes]]\nname = \"x\"\ndomains = [\"a.example\"]\nimap = \"one\"\n"), "backends.one.address = \"nope\" must be host:port"),
+            (routed("[backends.one]\naddress = \"192.0.2.1:993\"\nclient_ip = \"xclient\"\n[[routes]]\nname = \"x\"\ndomains = [\"a.example\"]\nimap = \"one\"\n"), "backends.one.client_ip = \"xclient\" is an SMTP extension"),
+        ] {
+            let e = errors_of(&text);
+            assert!(e.contains(expect), "want {expect:?}, got:\n{e}\nfor:\n{text}");
+        }
+        // One backend for two protocols.
+        let shared = format!(
+            "{}[sieve]\nlisten = \"0.0.0.0:4190\"\n[[routes]]\nname = \"x\"\ndomains = [\"a.example\"]\nimap = \"one\"\nsieve = \"one\"\n",
+            routed(TWO_BACKENDS)
+        );
+        assert!(
+            errors_of(&shared).contains("backends.one: used by imap and sieve"),
+            "{}",
+            errors_of(&shared)
+        );
+        // Different conditions keep a domain reachable in a later route.
+        let narrowed = r("name = \"x\"\ndomains = [\"a.example\"]\nsni = [\"mail.example.org\"]\nimap = \"one\"\n[[routes]]\nname = \"y\"\ndomains = [\"a.example\"]\nimap = \"two\"");
+        assert_eq!(errors_of(&narrowed), "");
+    }
+
+    /// With every issuer bounded, a route domain no accepted issuer vouches
+    /// for can serve passwords only.
+    #[test]
+    fn route_domain_outside_identity_domains_warns() {
+        let text = routed(&format!(
+            "{TWO_BACKENDS}[[routes]]\nname = \"x\"\ndomains = [\"a.example\"]\nimap = \"one\"\n"
+        ))
+        .replace(
+            "token_type = \"keycloak\"",
+            "token_type = \"keycloak\"\nidentity_domains = [\"b.example\"]",
+        );
+        let l = crate::config::parse(&text).unwrap();
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        assert!(
+            l.warnings.iter().any(
+                |w| w.contains("routes[0]: no issuer that the route accepts has \"a.example\"")
+            ),
+            "{:?}",
+            l.warnings
+        );
     }
 }

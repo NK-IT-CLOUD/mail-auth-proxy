@@ -1,6 +1,6 @@
 //! ManageSieve backend sessions and the cached backend capabilities.
 
-use super::Sieve;
+use super::Upstream;
 use crate::auth::{BackendCredential, BackendError, BackendLogin};
 use crate::config::BackendTls;
 use crate::obs::authlog::sanitize;
@@ -36,17 +36,10 @@ pub struct CapsCache {
 const PROBE_RETRY: Duration = Duration::from_secs(5);
 
 impl CapsCache {
-    /// The backend's `"SIEVE"` capability line from the last successful probe,
-    /// whatever its age. The pre-TLS greeting must list SIEVE (RFC 5804 §1.7);
-    /// `sieve::handle` waits for a probe while there is none (right after
-    /// startup).
-    pub fn sieve_line(&self) -> Option<String> {
+    /// The capabilities of the last successful probe, whatever their age.
+    fn any_age(&self) -> Option<Arc<Vec<String>>> {
         let caps = self.caps.read().unwrap_or_else(|p| p.into_inner());
-        caps.as_ref()?
-            .1
-            .iter()
-            .find(|l| is_cap(l, "SIEVE"))
-            .cloned()
+        caps.as_ref().map(|(_, caps)| caps.clone())
     }
 
     /// The cached capabilities if they are younger than `ttl`.
@@ -82,17 +75,22 @@ pub(super) async fn backend_session(
     Ok((be, caps))
 }
 
-/// The backend's post-TLS capabilities, from the cache or a probe session.
+/// The backend's post-TLS capabilities, from the cache (younger than
+/// `ttl`) or a probe session.
 ///
 /// One probe at a time: a caller that waited for another's probe finds the
 /// cache filled, or its failure. A failed probe counts in `backend_errors`;
 /// for `PROBE_RETRY` after it, callers fail without contacting the backend.
-pub(super) async fn backend_caps(sieve: &Sieve, tuning: &Tuning) -> Result<Arc<Vec<String>>> {
-    if let Some(caps) = sieve.caps.fresh(sieve.caps_ttl) {
+pub(super) async fn backend_caps(
+    up: &Upstream,
+    ttl: Duration,
+    tuning: &Tuning,
+) -> Result<Arc<Vec<String>>> {
+    if let Some(caps) = up.caps.fresh(ttl) {
         return Ok(caps);
     }
-    let mut last_failure = sieve.caps.probe.lock().await;
-    if let Some(caps) = sieve.caps.fresh(sieve.caps_ttl) {
+    let mut last_failure = up.caps.probe.lock().await;
+    if let Some(caps) = up.caps.fresh(ttl) {
         return Ok(caps);
     }
     if let Some(at) = *last_failure {
@@ -103,7 +101,7 @@ pub(super) async fn backend_caps(sieve: &Sieve, tuning: &Tuning) -> Result<Arc<V
             ));
         }
     }
-    let (mut be, caps) = match backend_session(&sieve.backend, None, tuning).await {
+    let (mut be, caps) = match backend_session(&up.conn, None, tuning).await {
         Ok(v) => v,
         Err(e) => {
             *last_failure = Some(Instant::now());
@@ -119,14 +117,129 @@ pub(super) async fn backend_caps(sieve: &Sieve, tuning: &Tuning) -> Result<Arc<V
     })
     .await;
     let caps = Arc::new(caps);
-    *sieve.caps.caps.write().unwrap_or_else(|p| p.into_inner()) =
-        Some((Instant::now(), caps.clone()));
+    *up.caps.caps.write().unwrap_or_else(|p| p.into_inner()) = Some((Instant::now(), caps.clone()));
     Ok(caps)
+}
+
+/// The capabilities to show a client before it authenticates: those every
+/// backend its credential can be routed to has (`intersect`). They may
+/// differ from the chosen backend's after AUTHENTICATE (RFC 5804 §1.7), so
+/// the client can ask again. The backends are asked together. A backend
+/// whose probe fails counts with its last list, whatever its age; one that
+/// has never answered is left out, since an empty list would take the
+/// `SASL` line from every client (unlike SMTP, where the proxy writes AUTH
+/// itself). When every probe fails, so does this.
+pub(super) async fn caps_for_client(
+    backends: &[Arc<Upstream>],
+    ttl: Duration,
+    tuning: &Tuning,
+) -> Result<Vec<String>> {
+    let mut probes = tokio::task::JoinSet::new();
+    for (i, up) in backends.iter().enumerate() {
+        let (up, tuning) = (up.clone(), *tuning);
+        probes.spawn(async move {
+            let caps = backend_caps(&up, ttl, &tuning).await;
+            (i, caps.map_err(|e| (e, up.caps.any_age())))
+        });
+    }
+    let mut lists: Vec<Option<Arc<Vec<String>>>> = vec![None; backends.len()];
+    let mut failure = None;
+    let mut answered = false;
+    while let Some(done) = probes.join_next().await {
+        match done {
+            Ok((i, Ok(caps))) => {
+                answered = true;
+                lists[i] = Some(caps);
+            }
+            Ok((i, Err((e, stale)))) => {
+                lists[i] = stale;
+                failure = Some(e);
+            }
+            Err(e) => failure = Some(anyhow!("capability probe: {e}")),
+        }
+    }
+    match failure {
+        Some(e) if !answered => Err(e),
+        _ => Ok(intersect(&lists.into_iter().flatten().collect::<Vec<_>>())),
+    }
+}
+
+/// The `"SIEVE"` line of the capabilities every backend that has answered a
+/// probe has, whatever the age of its list; `None` while none has.
+pub(super) fn sieve_line(backends: &[Arc<Upstream>]) -> Option<String> {
+    let lists: Vec<_> = backends.iter().filter_map(|up| up.caps.any_age()).collect();
+    intersect(&lists).into_iter().find(|l| is_cap(l, "SIEVE"))
+}
+
+/// The capability lines every list has, by name, in the first list's order:
+/// the values of `SIEVE` and `NOTIFY` (space-separated extensions, RFC 5804
+/// §1.7) narrowed to those all lists have, `MAXREDIRECTS` the smallest,
+/// every other capability with the first list's value. No list: nothing.
+pub(super) fn intersect(lists: &[Arc<Vec<String>>]) -> Vec<String> {
+    let Some((first, rest)) = lists.split_first() else {
+        return Vec::new();
+    };
+    // One backend: its list as it is.
+    if rest.is_empty() {
+        return first.to_vec();
+    }
+    let parse = |line: &str| -> Option<(String, Option<String>)> {
+        let (name, rest) = super::preauth::unquote_string(line.trim())?;
+        let value = super::preauth::unquote_string(rest.trim()).map(|(v, _)| v);
+        Some((name, value))
+    };
+    let mut out = Vec::new();
+    for line in first.iter() {
+        let Some((name, value)) = parse(line) else {
+            continue;
+        };
+        let others: Option<Vec<Option<String>>> = rest
+            .iter()
+            .map(|l| {
+                l.iter()
+                    .filter_map(|x| parse(x))
+                    .find(|(n, _)| n.eq_ignore_ascii_case(&name))
+                    .map(|(_, v)| v)
+            })
+            .collect();
+        let Some(others) = others else {
+            continue;
+        };
+        let upper = name.to_ascii_uppercase();
+        let merged = match (upper.as_str(), &value) {
+            ("SIEVE" | "NOTIFY", Some(v)) => {
+                let common: Vec<&str> = v
+                    .split(' ')
+                    .filter(|x| !x.is_empty())
+                    .filter(|x| {
+                        others.iter().all(|o| {
+                            o.as_deref()
+                                .is_some_and(|o| o.split(' ').any(|y| y.eq_ignore_ascii_case(x)))
+                        })
+                    })
+                    .collect();
+                format!("\"{name}\" \"{}\"", common.join(" "))
+            }
+            ("MAXREDIRECTS", Some(v)) => {
+                let smallest = std::iter::once(v.as_str())
+                    .chain(others.iter().filter_map(|o| o.as_deref()))
+                    .filter_map(|n| n.parse::<u64>().ok())
+                    .min();
+                match smallest {
+                    Some(n) => format!("\"{name}\" \"{n}\""),
+                    None => line.clone(),
+                }
+            }
+            _ => line.clone(),
+        };
+        out.push(merged);
+    }
+    out
 }
 
 /// The ManageSieve backend login of one client session.
 pub(super) struct SieveLogin<'a> {
-    pub backend: &'a BackendConn,
+    pub backends: &'a [Arc<Upstream>],
     pub tuning: &'a Tuning,
     /// `(client, local)`: the client's address and the address it dialed.
     pub origin: (SocketAddr, SocketAddr),
@@ -136,8 +249,17 @@ impl BackendLogin for SieveLogin<'_> {
     /// The backend connection and its OK line, relayed to the client.
     type Conn = (TlsStream<TcpStream>, String);
 
-    async fn login(&self, credential: BackendCredential<'_>) -> Result<Self::Conn, BackendError> {
-        let fwd = credential.forward(self.backend);
+    fn name(&self, index: usize) -> &str {
+        &self.backends[index].conn.id
+    }
+
+    async fn login(
+        &self,
+        index: usize,
+        credential: BackendCredential<'_>,
+    ) -> Result<Self::Conn, BackendError> {
+        let backend = &self.backends[index].conn;
+        let fwd = credential.forward(backend);
         let (mech, response) = (fwd.mech, fwd.response.as_str());
         // A quoted string holds at most 1024 octets (RFC 5804 §4); a longer
         // response (any sizable token) goes as a literal `{n+}`. `concat`
@@ -159,7 +281,7 @@ impl BackendLogin for SieveLogin<'_> {
                 .concat(),
             )
         };
-        let (mut be, caps) = backend_session(self.backend, Some(self.origin), self.tuning).await?;
+        let (mut be, caps) = backend_session(backend, Some(self.origin), self.tuning).await?;
         // Checked before the credential is sent.
         if caps.iter().any(|l| is_cap(l, "UNAUTHENTICATE")) {
             return Err(anyhow!(crate::auth::UNAUTHENTICATE_OFFERED).into());
@@ -304,6 +426,114 @@ async fn read_caps_until_ok<S: tokio::io::AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn caps(l: &[&str]) -> Arc<Vec<String>> {
+        Arc::new(l.iter().map(|s| s.to_string()).collect())
+    }
+
+    /// A backend no one can reach (port 1 on loopback refuses).
+    fn unreachable(id: &str) -> BackendConn {
+        let cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        BackendConn {
+            id: id.into(),
+            address: "127.0.0.1:1".into(),
+            name: rustls::pki_types::ServerName::try_from("backend.test").unwrap(),
+            tls: tokio_rustls::TlsConnector::from(Arc::new(cfg)),
+            client_ip: crate::config::ClientIp::None,
+            tls_mode: BackendTls::Starttls,
+            auth_forward: crate::config::AuthForward::Xoauth2,
+            keepalive: Tuning::default().keepalive,
+        }
+    }
+
+    /// A backend that has never answered a probe is left out: an empty
+    /// list would take the SASL line (and every other one) from all
+    /// clients. One that answered once keeps counting with its last list.
+    /// Nobody answering is a failure.
+    #[tokio::test]
+    async fn a_backend_that_never_answered_is_left_out() {
+        let answered = Arc::new(Upstream {
+            conn: unreachable("one"),
+            caps: Arc::default(),
+        });
+        *answered.caps.caps.write().unwrap() = Some((
+            Instant::now(),
+            caps(&[
+                "\"SASL\" \"PLAIN\"",
+                "\"SIEVE\" \"fileinto\"",
+                "\"VERSION\" \"1.0\"",
+            ]),
+        ));
+        let silent = Arc::new(Upstream {
+            conn: unreachable("two"),
+            caps: Arc::default(),
+        });
+        let tuning = Tuning::default();
+        let both = [answered.clone(), silent.clone()];
+        let got = caps_for_client(&both, Duration::from_secs(600), &tuning)
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            [
+                "\"SASL\" \"PLAIN\"",
+                "\"SIEVE\" \"fileinto\"",
+                "\"VERSION\" \"1.0\""
+            ]
+        );
+        assert_eq!(sieve_line(&both).as_deref(), Some("\"SIEVE\" \"fileinto\""));
+        // Every probe failing is a failure, a stale list notwithstanding.
+        assert!(caps_for_client(&both, Duration::ZERO, &tuning)
+            .await
+            .is_err());
+        assert!(
+            caps_for_client(std::slice::from_ref(&silent), Duration::ZERO, &tuning)
+                .await
+                .is_err()
+        );
+        assert_eq!(sieve_line(&[silent]), None);
+    }
+
+    /// Several backends: SIEVE and NOTIFY narrowed to the extensions all
+    /// have, MAXREDIRECTS the smallest, a capability one lacks dropped, the
+    /// rest from the first; one backend: its list as it is.
+    #[test]
+    fn capabilities_of_several_backends() {
+        let dovecot = caps(&[
+            "\"IMPLEMENTATION\" \"Dovecot Pigeonhole\"",
+            "\"SIEVE\" \"fileinto reject envelope  vacation\"",
+            "\"NOTIFY\" \"mailto\"",
+            "\"MAXREDIRECTS\" \"4\"",
+            "\"SASL\" \"PLAIN XOAUTH2\"",
+            "\"VERSION\" \"1.0\"",
+        ]);
+        let stalwart = caps(&[
+            "\"IMPLEMENTATION\" \"Stalwart\"",
+            "\"SIEVE\" \"FILEINTO vacation imap4flags\"",
+            "\"MAXREDIRECTS\" \"2\"",
+            "\"SASL\" \"OAUTHBEARER\"",
+            "\"VERSION\" \"1.0\"",
+        ]);
+        assert_eq!(
+            intersect(&[dovecot.clone(), stalwart]),
+            [
+                "\"IMPLEMENTATION\" \"Dovecot Pigeonhole\"",
+                "\"SIEVE\" \"fileinto vacation\"",
+                "\"MAXREDIRECTS\" \"2\"",
+                "\"SASL\" \"PLAIN XOAUTH2\"",
+                "\"VERSION\" \"1.0\"",
+            ]
+        );
+        assert_eq!(intersect(std::slice::from_ref(&dovecot)), *dovecot);
+        assert_eq!(
+            intersect(&[dovecot, Arc::default()]),
+            Vec::<String>::new(),
+            "a backend without a list"
+        );
+        assert!(intersect(&[]).is_empty());
+    }
 
     /// read_caps_until_ok stops on the OK line and returns the capability lines.
     #[tokio::test]

@@ -39,17 +39,39 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   nothing changes and no protocol is selected.
 - Fuzz target `backend_auth`: the backend's OAUTHBEARER error result, the ManageSieve
   challenge string, the OAUTHBEARER build/parse roundtrip.
+- Named backends and routes: one endpoint in front of several mail systems.
+  `[backends.<name>]` holds a backend profile; a protocol section names it
+  (`backend = "<name>"`) or `[[routes]]` choose it per credential. A route takes the
+  domains of the validated identity (OAuth) or of the login (password), optionally
+  narrowed by the token's `issuers` and `audiences` and the client's `sni`; the first
+  matching route in file order wins, `domains = ["*"]` takes the rest. The SNI never
+  selects a backend on its own. A credential no route takes is refused as
+  `unknown_domain` without backend contact (a password with the wrong-password reply and
+  delay), with a `WARN … no route for the login's domain` line and
+  `mail_auth_proxy_route_misses_total{proto}`. Routes and backends are reloadable; a
+  backend that stays keeps its capability cache and refusal timing. The inline
+  `backend = { … }` keeps its meaning.
+- The `authresult` line gets a last field `backend`: the name of the backend the
+  credential was sent to (the section name for an inline backend), empty when none was.
+  Earlier fields are unchanged.
+- With several backends behind a protocol, the SMTP EHLO reply after TLS lists only the
+  extensions every submission backend offers, with the smallest `SIZE`, and the
+  ManageSieve capabilities before AUTHENTICATE are those all its backends have (`SIEVE`
+  and `NOTIFY` narrowed, `MAXREDIRECTS` the smallest). The backends are probed together.
 
 ### Changed
 - The refusal timing of the legacy gate learns the rejection latencies per backend
   instead of per protocol. A refusal by the account check or the throttle waits like a
   wrong password at the backend the login goes to; a refusal before it (size, rule,
-  domain) waits for the slowest backend of the protocol. With one backend per protocol
+  domain, no route) waits for the slowest backend of the protocol. With one backend per protocol
   the timing is the same as before; the change keeps refusals and wrong passwords alike
   once a protocol has several backends.
 - The `submission auth ok` and `sieve auth ok` log lines, and the IMAP lines `oauth
   validated; proxying to backend` and `password auth; forwarding to backend`, name the
   issuer of the token (`issuer=`, empty for a password).
+- The startup lines `imap listener up` and the others name every backend of the protocol
+  (`backends=[<name>=<address>, …]` instead of `backend=<address>`); the IMAP login lines
+  carry `backend=`.
 - `backend.proxy_protocol` and `submission.xclient` are short forms of `client_ip`;
   `--print-config` shows `client_ip`. `submission.backend.proxy_protocol = true` is now
   accepted (it was an error); combining a short form with `client_ip`, or both short

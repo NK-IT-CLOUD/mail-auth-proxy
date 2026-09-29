@@ -2,6 +2,7 @@
 //! `--print-config` leaves out.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 pub const CONFIG_VERSION: u32 = 2;
 
@@ -23,6 +24,14 @@ pub struct Config {
     pub submission: Option<Submission>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sieve: Option<Sieve>,
+    /// Named backends, referenced by a listener's `backend` or by routes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub backends: BTreeMap<String, Backend>,
+    /// Which backend a credential goes to, by the domain of the identity or
+    /// login; the first matching route wins. Without routes each protocol
+    /// has the one backend of its section.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<Route>,
     pub oauth: OAuth,
     /// Short form of one legacy rule (`sni` + `internal_networks`). Read only:
     /// after parsing it is translated into `legacy.rules` and `scope`, which
@@ -145,6 +154,155 @@ impl Backend {
     }
 }
 
+/// A listener's backend: a table of its own, or the name of a
+/// `[backends.<name>]` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum BackendRef {
+    Name(String),
+    Inline(Backend),
+}
+
+/// By the TOML type: a string is a name, a table the backend itself (with the
+/// table's own error messages, such as an unknown key).
+impl<'de> Deserialize<'de> for BackendRef {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        match toml::Value::deserialize(d)? {
+            toml::Value::String(name) => Ok(BackendRef::Name(name)),
+            table @ toml::Value::Table(_) => Backend::deserialize(table)
+                .map(BackendRef::Inline)
+                .map_err(serde::de::Error::custom),
+            other => Err(serde::de::Error::custom(format!(
+                "invalid type: {}, expected a backend table or the name of a [backends] entry",
+                other.type_str()
+            ))),
+        }
+    }
+}
+
+/// One route: where the credentials of some domains go. Every condition set
+/// must hold; an absent one matches everything.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Route {
+    /// Unique; in logs.
+    pub name: String,
+    /// Domains of the identity (OAuth) or the login (password), exact and
+    /// ASCII case-insensitive. `"*"` matches every domain and a login
+    /// without one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<String>,
+    /// OAuth only: the token's issuer is one of these `oauth.issuers`. A
+    /// password matches a route only through `domains`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issuers: Vec<String>,
+    /// The TLS server name the client asked for is one of these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sni: Vec<String>,
+    /// OAuth only: the token's `aud` contains one of these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audiences: Vec<String>,
+    /// The backend of each protocol the route serves (a `[backends]` name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imap: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sieve: Option<String>,
+}
+
+impl Route {
+    /// The backend of `protocol`, if the route serves it.
+    pub fn backend(&self, protocol: Protocol) -> Option<&str> {
+        match protocol {
+            Protocol::Imap => self.imap.as_deref(),
+            Protocol::Submission => self.submission.as_deref(),
+            Protocol::Sieve => self.sieve.as_deref(),
+        }
+    }
+}
+
+/// A backend as a protocol uses it.
+#[derive(Debug, Clone, Copy)]
+pub struct UsedBackend<'a> {
+    /// The `[backends]` name, or the protocol's section for an inline one.
+    pub name: &'a str,
+    /// Written as a table in the protocol's section.
+    pub inline: bool,
+    pub backend: &'a Backend,
+}
+
+impl UsedBackend<'_> {
+    /// Where it is configured: `imap.backend` or `backends.<name>`.
+    pub fn key(&self) -> String {
+        if self.inline {
+            format!("{}.backend", self.name)
+        } else {
+            format!("backends.{}", self.name)
+        }
+    }
+}
+
+impl Config {
+    /// The listener backend of `protocol`, if its section exists and has one.
+    pub fn listener_backend(&self, protocol: Protocol) -> Option<&BackendRef> {
+        match protocol {
+            Protocol::Imap => self.imap.backend.as_ref(),
+            Protocol::Submission => self.submission.as_ref()?.backend.as_ref(),
+            Protocol::Sieve => self.sieve.as_ref()?.backend.as_ref(),
+        }
+    }
+
+    /// Whether the section of `protocol` exists (IMAP always does).
+    pub fn has_protocol(&self, protocol: Protocol) -> bool {
+        match protocol {
+            Protocol::Imap => true,
+            Protocol::Submission => self.submission.is_some(),
+            Protocol::Sieve => self.sieve.is_some(),
+        }
+    }
+
+    /// Every backend `protocol` can send a credential to, each once: the
+    /// listener's, or else those of the routes that serve the protocol, in
+    /// file order. A name without a `[backends]` entry is left out
+    /// (validation reports it); so is a protocol without a section.
+    pub fn backends_of(&self, protocol: Protocol) -> Vec<UsedBackend<'_>> {
+        if !self.has_protocol(protocol) {
+            return Vec::new();
+        }
+        let named = |name: &str| {
+            self.backends
+                .get_key_value(name)
+                .map(|(name, backend)| UsedBackend {
+                    name,
+                    inline: false,
+                    backend,
+                })
+        };
+        match self.listener_backend(protocol) {
+            Some(BackendRef::Inline(backend)) => vec![UsedBackend {
+                name: protocol.section(),
+                inline: true,
+                backend,
+            }],
+            Some(BackendRef::Name(name)) => named(name).into_iter().collect(),
+            None => {
+                let mut out: Vec<UsedBackend<'_>> = Vec::new();
+                for used in self
+                    .routes
+                    .iter()
+                    .filter_map(|r| named(r.backend(protocol)?))
+                {
+                    if !out.iter().any(|u| u.name == used.name) {
+                        out.push(used);
+                    }
+                }
+                out
+            }
+        }
+    }
+}
+
 /// The SASL mechanism a validated token is forwarded to the backend with.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -185,7 +343,9 @@ pub enum BackendTls {
 pub struct Imap {
     /// Implicit-TLS listener, e.g. `0.0.0.0:993`.
     pub listen: String,
-    pub backend: Backend,
+    /// The backend of every login; unset when routes choose it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<BackendRef>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -196,8 +356,9 @@ pub struct Submission {
     /// Implicit-TLS listener (RFC 8314 §3.3), e.g. `0.0.0.0:465`; optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub implicit_tls_listen: Option<String>,
-    /// The backend (Postfix submission).
-    pub backend: Backend,
+    /// The backend (Postfix submission); unset when routes choose it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<BackendRef>,
     /// Short form of `backend.client_ip = "xclient"`. Read only:
     /// `--print-config` shows `client_ip`.
     #[serde(default, skip_serializing)]
@@ -217,8 +378,9 @@ pub struct Submission {
 pub struct Sieve {
     /// STARTTLS listener, e.g. `0.0.0.0:4190`.
     pub listen: String,
-    /// The backend (Pigeonhole ManageSieve).
-    pub backend: Backend,
+    /// The backend (Pigeonhole ManageSieve); unset when routes choose it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<BackendRef>,
     /// How long the backend's capability list is reused.
     #[serde(default = "default_caps_cache_secs")]
     pub capability_cache_secs: u64,
@@ -499,6 +661,19 @@ pub enum Protocol {
     Imap,
     Submission,
     Sieve,
+}
+
+impl Protocol {
+    pub const ALL: [Protocol; 3] = [Protocol::Imap, Protocol::Submission, Protocol::Sieve];
+
+    /// The configuration section, also the name of its inline backend.
+    pub fn section(self) -> &'static str {
+        match self {
+            Protocol::Imap => "imap",
+            Protocol::Submission => "submission",
+            Protocol::Sieve => "sieve",
+        }
+    }
 }
 
 /// A password mechanism. `LOGIN` also covers the IMAP LOGIN command.

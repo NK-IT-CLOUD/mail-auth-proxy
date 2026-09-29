@@ -17,7 +17,7 @@ use zeroize::Zeroizing;
 
 /// The SMTP backend login of one client session.
 pub(super) struct SmtpLogin<'a> {
-    pub backend: &'a BackendConn,
+    pub backends: &'a [std::sync::Arc<super::Upstream>],
     pub tuning: &'a Tuning,
     /// Our name in EHLO.
     pub name: &'a str,
@@ -60,9 +60,17 @@ impl ClientHelo {
 impl BackendLogin for SmtpLogin<'_> {
     type Conn = TlsStream<TcpStream>;
 
-    async fn login(&self, credential: BackendCredential<'_>) -> Result<Self::Conn, BackendError> {
+    fn name(&self, index: usize) -> &str {
+        &self.backends[index].conn.id
+    }
+
+    async fn login(
+        &self,
+        index: usize,
+        credential: BackendCredential<'_>,
+    ) -> Result<Self::Conn, BackendError> {
         let password = matches!(credential, BackendCredential::Password { .. });
-        let (be, code, error_result) = self.dialog(credential).await?;
+        let (be, code, error_result) = self.dialog(&self.backends[index].conn, credential).await?;
         match auth_verdict(code, password) {
             AuthVerdict::Ok => Ok(be),
             // The backend refused the credential (bad password, unknown user,
@@ -178,16 +186,17 @@ impl SmtpLogin<'_> {
     /// code and the OAUTHBEARER error result, if there was one.
     async fn dialog(
         &self,
+        backend: &BackendConn,
         credential: BackendCredential<'_>,
     ) -> Result<(TlsStream<TcpStream>, u16, Option<ErrorResult>)> {
         let (mut be, ehlo_lines) = connect_ehlo(
-            self.backend,
+            backend,
             Some((self.peer, self.local)),
             self.tuning,
             self.name,
         )
         .await?;
-        let xclient = self.backend.client_ip == crate::config::ClientIp::Xclient;
+        let xclient = backend.client_ip == crate::config::ClientIp::Xclient;
 
         // XCLIENT (optional): Postfix then logs and stamps the real client
         // address. Only when configured and advertised; a backend that does
@@ -238,7 +247,7 @@ impl SmtpLogin<'_> {
             }
         }
 
-        let fwd = credential.forward(self.backend);
+        let fwd = credential.forward(backend);
         let mech = fwd.mech;
         // The response goes after the `334` challenge, never on the AUTH line:
         // RFC 4954 §4 forbids an initial response that pushes the command past

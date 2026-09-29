@@ -56,6 +56,23 @@ listen = "0.0.0.0:4190"                    # STARTTLS
 backend = { address = "192.0.2.10:14190", verify_name = "imap.example.org", client_ip = "proxy_v2" }
 capability_cache_secs = 600
 
+# ── Several mail systems (optional) ──────────────────────────────────────────
+# Named backends, and routes that choose one per credential by the domain of the
+# validated identity (OAuth) or of the login (password); the first match wins. A
+# section with routes has no `backend` of its own. A credential no route takes is
+# refused as unknown_domain.
+#
+# [backends.partner-imap]
+# address = "192.0.2.20:993"
+# verify_name = "imap.partner.example"
+# client_ip = "proxy_v2"
+#
+# [[routes]]
+# name = "partner"
+# domains = ["partner.example"]
+# issuers = ["https://sso.partner.example/realms/mail"]   # optional: tokens of these issuers only
+# imap = "partner-imap"
+
 # ── OAuth2 ───────────────────────────────────────────────────────────────────
 # Tokens are validated locally against each issuer's JWKS, then the same token
 # is replayed to the backend (which must validate it too). Each key is only

@@ -28,23 +28,33 @@ pub struct Submission {
     /// TLS after STARTTLS and on the implicit-TLS listener; SMTP has no
     /// ALPN identifier.
     pub acceptor: crate::server::tls::Acceptor,
-    pub backend: BackendConn,
+    /// Every backend a credential can be routed to (`route::Pick::index`).
+    pub backends: Vec<Arc<Upstream>>,
     /// `submission.ehlo_extensions`: the keywords the EHLO reply may list
     /// at most; `None`: every one of `ehlo::RELAYED`.
     pub ehlo_only: Option<Vec<String>>,
-    /// The backend's post-TLS EHLO extensions; a reload that keeps the
-    /// backend keeps them.
-    pub ehlo: Arc<ehlo::EhloCache>,
-    /// How long they are reused.
+    /// How long the backends' EHLO extensions are reused.
     pub caps_ttl: std::time::Duration,
 }
 
-/// Probe the backend's EHLO extensions once at startup, so the first
+/// A submission backend and its post-TLS EHLO extensions; a reload that
+/// keeps the backend keeps them.
+pub struct Upstream {
+    pub conn: BackendConn,
+    pub ehlo: Arc<ehlo::EhloCache>,
+}
+
+/// Probe the backends' EHLO extensions once at startup, so the first
 /// clients need not wait for a probe. A failure is logged and counted like
 /// any failed probe and does not stop the start.
 pub async fn probe_at_startup(ctx: Arc<Ctx<Submission>>) {
-    if let Err(e) = ehlo::backend_extensions(&ctx.protocol, &ctx.tuning, ctx.hostname()).await {
-        tracing::warn!(target: crate::obs::target::SUBMISSION, error=%format!("{e:#}"), "submission backend EHLO extensions not available at startup");
+    let sub = &ctx.protocol;
+    for up in &sub.backends {
+        if let Err(e) =
+            ehlo::backend_extensions(up, sub.caps_ttl, &ctx.tuning, ctx.hostname()).await
+        {
+            tracing::warn!(target: crate::obs::target::SUBMISSION, backend=%up.conn.id, error=%format!("{e:#}"), "submission backend EHLO extensions not available at startup");
+        }
     }
 }
 
@@ -392,7 +402,7 @@ async fn serve(
             // Gate, token validation and backend login (connect, STARTTLS, AUTH with
             // the client's own credential).
             let login = SmtpLogin {
-                backend: &ctx.protocol.backend,
+                backends: &ctx.protocol.backends,
                 tuning,
                 name,
                 peer,

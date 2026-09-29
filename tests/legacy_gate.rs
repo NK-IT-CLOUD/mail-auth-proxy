@@ -723,9 +723,15 @@ users = ["*@example.test", "*@gone.test"]
                 .into_owned()
         })
         .collect();
+    // The backend only where the password reached it.
     let line = |user: &str, reason: &str, rule: &str| {
+        let backend = if reason == "backend_reject" {
+            "imap"
+        } else {
+            ""
+        };
         format!(
-            r#"WARN authlog: authresult result="fail" proto="imap" scope="external" mech=PLAIN user={user} peer=127.0.0.1 reason="{reason}" pwfp="<fp>" rule="{rule}" listener="imap""#
+            r#"WARN authlog: authresult result="fail" proto="imap" scope="external" mech=PLAIN user={user} peer=127.0.0.1 reason="{reason}" pwfp="<fp>" rule="{rule}" listener="imap" backend="{backend}""#
         )
     };
     assert_eq!(

@@ -132,6 +132,13 @@ async fn check_cell(h: &Harness, kind: Kind, cell: &Cell, before: &Before, clien
         peer: cell.src.ip().to_string(),
         reason: if ok { "ok" } else { "blocked_endpoint" }.into(),
         pwfp: ar.pwfp.clone(),
+        // An allowed password reached the protocol's (inline) backend.
+        backend: match (ok, cell.proto) {
+            (false, _) => "",
+            (true, "smtp") => "submission",
+            (true, proto) => proto,
+        }
+        .into(),
     };
     assert_eq!(ar, &expected, "{}", cell.id());
     if ok || cell.withheld() {

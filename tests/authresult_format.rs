@@ -93,11 +93,11 @@ async fn golden_authresult_lines() {
     assert_eq!(
         got,
         [
-            r#"INFO authlog: authresult result="ok" proto="imap" scope="external" mech=xoauth2 user=alice@example.test peer=127.0.0.2 reason="ok" pwfp="" rule="" listener="imap""#,
-            r#"WARN authlog: authresult result="fail" proto="smtp" scope="external" mech=XOAUTH2 user=evil??result??ok??user?root?peer?10.0.0.1?x peer=127.0.0.2 reason="bad_token" pwfp="" rule="" listener="submission""#,
-            r#"WARN authlog: authresult result="fail" proto="sieve" scope="external" mech=PLAIN user=bob@example.test peer=127.0.0.2 reason="blocked_endpoint" pwfp="<fp>" rule="" listener="sieve""#,
-            r#"WARN authlog: authresult result="fail" proto="imap" scope="internal" mech=PLAIN user=reject@example.test peer=127.0.0.1 reason="backend_reject" pwfp="<fp>" rule="password_gate" listener="imap""#,
-            r#"WARN authlog: authresult result="fail" proto="imap" scope="external" mech=other user= peer=127.0.0.2 reason="protocol" pwfp="" rule="" listener="imap""#,
+            r#"INFO authlog: authresult result="ok" proto="imap" scope="external" mech=xoauth2 user=alice@example.test peer=127.0.0.2 reason="ok" pwfp="" rule="" listener="imap" backend="imap""#,
+            r#"WARN authlog: authresult result="fail" proto="smtp" scope="external" mech=XOAUTH2 user=evil??result??ok??user?root?peer?10.0.0.1?x peer=127.0.0.2 reason="bad_token" pwfp="" rule="" listener="submission" backend="""#,
+            r#"WARN authlog: authresult result="fail" proto="sieve" scope="external" mech=PLAIN user=bob@example.test peer=127.0.0.2 reason="blocked_endpoint" pwfp="<fp>" rule="" listener="sieve" backend="""#,
+            r#"WARN authlog: authresult result="fail" proto="imap" scope="internal" mech=PLAIN user=reject@example.test peer=127.0.0.1 reason="backend_reject" pwfp="<fp>" rule="password_gate" listener="imap" backend="imap""#,
+            r#"WARN authlog: authresult result="fail" proto="imap" scope="external" mech=other user= peer=127.0.0.2 reason="protocol" pwfp="" rule="" listener="imap" backend="""#,
         ]
     );
 

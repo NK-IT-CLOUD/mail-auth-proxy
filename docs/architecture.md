@@ -22,14 +22,15 @@ client ──TLS──▶ mail-auth-proxy ────────────�
                     where a legacy rule matches source address, SNI and protocol
                  4. read AUTHENTICATE / AUTH / LOGIN (up to limits.max_auth_attempts)
                  5a. OAuth: validate the JWT locally ──────── JWKS (cached, refreshed) ◀── IdP
-                 5b. password: legacy gate (rule, domain, account check, throttle)
-                 6. connect to the backend (implicit TLS or STARTTLS), pass the client address
+                 5b. password: legacy gate (rule, domain, route, account check, throttle)
+                 6. choose the backend by the routes (domain of the identity or login),
+                    connect to it (implicit TLS or STARTTLS), pass the client address
                     (PROXY v2 / XCLIENT / none), log in with the same token (as XOAUTH2 or
                     OAUTHBEARER) or the same password (as PLAIN)
                  7. relay the backend's verdict; on success relay bytes until either side closes
 ```
 
-Each connection is one tokio task. It takes the configuration in use when it is accepted and keeps it to its end ([configuration reload](#configuration-reload)). Connections share only the JWKS key set, the server certificates, the ManageSieve capability and SMTP EHLO caches, the legacy gate's caches and counters, the connection limits, the failed-login counters and the metrics. Trust boundaries and the threat model are in [SECURITY.md](../SECURITY.md#trust-boundaries).
+Each connection is one tokio task. It takes the configuration in use when it is accepted and keeps it to its end ([configuration reload](#configuration-reload)). Connections share only the JWKS key set, the server certificates, the ManageSieve capability and SMTP EHLO caches of each backend, the legacy gate's caches and counters, the connection limits, the failed-login counters and the metrics. Trust boundaries and the threat model are in [SECURITY.md](../SECURITY.md#trust-boundaries).
 
 ## Startup
 
@@ -96,6 +97,7 @@ A password the client has sent is always parsed, even when its mechanism is not 
 | | the login is not empty, at most 255 bytes, has no control characters and at most one `@` | `unknown_account` |
 | 1 | a rule matches connection, mechanism and user (`users`, `users_file`: `user@domain` or `*@domain`; the local part is compared exactly, the domain ignoring ASCII case). The first matching rule in file order decides and is logged. | `blocked_endpoint` |
 | 2 | the login's domain is in `allowed_domains` ∪ `domains_file` (only if either is set; a login without `@domain` fails) | `unknown_domain` |
+| 2b | a route takes the login's domain ([configuration: routes](configuration.md#routes); without `[[routes]]` always) | `unknown_domain` |
 | 3 | the account exists (`account_check = "doveadm"`) | `unknown_account` |
 | 4 | the account is not throttled (`throttle`) | `throttled` |
 | | the backend checks the password; a protocol error in direct answer to the password (SMTP `500` to `509` after the response to `334`, IMAP tagged `BAD`) also counts as a rejection; a reply to the bare SMTP `AUTH` line, an IMAP `* BYE` or a ManageSieve `BYE` (other than `AUTH-TOO-WEAK`, `TRANSITION-NEEDED`) is an outage | `backend_reject` |
@@ -106,7 +108,7 @@ The size cap and the protocol-error rule close an enumeration oracle. A backend 
 
 The size check, steps 1 to 4 and a wrong password all give the client the protocol's wrong-password reply, and their timing is made alike:
 
-- A refusal by the gate is answered after the larger of `legacy.failure_delay_ms` (default 2000, Dovecot's default `auth_failure_delay`) and the median latency of the last 32 rejections of the backend the login goes to (capped at 10 s), counted from the credential. The latencies are learned per backend, so a refusal matches a wrong password at that backend; each protocol has one backend. A refusal in the steps before the account check (size, rule, domain) waits for the backend of the protocol with the largest median.
+- A refusal by the gate is answered after the larger of `legacy.failure_delay_ms` (default 2000, Dovecot's default `auth_failure_delay`) and the median latency of the last 32 rejections of the backend the login goes to (capped at 10 s), counted from the credential. The latencies are learned per backend, so a refusal matches a wrong password at the backend the routes chose. A refusal in the steps before the account check (size, rule, domain, no route) waits for the backend of the protocol with the largest median: with one pool for several backends, a refusal at a slow backend would come as early as the mixed median, sooner than a wrong password there.
 - A backend rejection is answered no earlier than `failure_delay_ms` after the credential.
 - Both get the same random jitter: up to a quarter of that time, at least 50 ms, at most 1 s.
 - An outage on the password path (account check or backend unavailable) is answered with retry-later no earlier than a refusal, with the same jitter. Outages only reach accounts that passed the earlier steps, so an instant answer would identify them.

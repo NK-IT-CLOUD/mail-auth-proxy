@@ -22,7 +22,8 @@ use tokio::net::TcpStream;
 pub struct Imap {
     /// TLS with ALPN `imap`.
     pub acceptor: crate::server::tls::Acceptor,
-    pub backend: BackendConn,
+    /// Every backend a credential can be routed to (`route::Pick::index`).
+    pub backends: Vec<BackendConn>,
 }
 
 pub async fn handle(
@@ -87,7 +88,7 @@ pub async fn handle(
                         return Err(auth::blocked_source());
                     }
                     let login = backend::ImapLogin {
-                        backend: &ctx.protocol.backend,
+                        backends: &ctx.protocol.backends,
                         tuning,
                         peer,
                         local,

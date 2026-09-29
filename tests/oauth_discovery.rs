@@ -65,6 +65,7 @@ async fn expect_bad_token(h: &Harness, kind: Kind, mech: &str, n: usize) {
             peer: "127.0.0.2".into(),
             reason: "bad_token".into(),
             pwfp: String::new(),
+            backend: String::new(),
         },
         "{kind:?} {mech}"
     );

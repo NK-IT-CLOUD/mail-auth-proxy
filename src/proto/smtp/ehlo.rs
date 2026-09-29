@@ -1,7 +1,8 @@
 //! The extensions advertised in the EHLO reply after STARTTLS: the backend's
 //! own, as far as the proxy handles them, from a cached probe of the backend.
 
-use super::Submission;
+use super::{Submission, Upstream};
+use crate::server::BackendConn;
 use crate::wire::Tuning;
 use anyhow::{anyhow, Result};
 use std::sync::{Arc, RwLock};
@@ -105,9 +106,8 @@ impl EhloCache {
 
 /// Connect to the backend as the proxy itself, read its post-TLS EHLO reply
 /// and end with QUIT. Returns the extension lines (without the name line).
-async fn probe(sub: &Submission, tuning: &Tuning, name: &str) -> Result<Vec<String>> {
-    let (mut be, mut lines) =
-        super::backend::connect_ehlo(&sub.backend, None, tuning, name).await?;
+async fn probe(backend: &BackendConn, tuning: &Tuning, name: &str) -> Result<Vec<String>> {
+    let (mut be, mut lines) = super::backend::connect_ehlo(backend, None, tuning, name).await?;
     // End the probe politely; it carries no credential.
     let _ = tokio::time::timeout(Duration::from_secs(2), async {
         be.write_all(b"QUIT\r\n").await?;
@@ -121,21 +121,23 @@ async fn probe(sub: &Submission, tuning: &Tuning, name: &str) -> Result<Vec<Stri
     Ok(lines)
 }
 
-/// The backend's post-TLS EHLO extension lines, from the cache or a probe.
+/// The backend's post-TLS EHLO extension lines, from the cache (younger
+/// than `ttl`) or a probe.
 ///
 /// One probe at a time: a caller that waited for another's probe finds the
 /// cache filled, or its failure. A failed probe counts in `backend_errors`;
 /// for `PROBE_RETRY` after it, callers do not contact the backend.
 pub(super) async fn backend_extensions(
-    sub: &Submission,
+    up: &Upstream,
+    ttl: Duration,
     tuning: &Tuning,
     name: &str,
 ) -> Result<Arc<Vec<String>>> {
-    if let Some(lines) = sub.ehlo.cached(Some(sub.caps_ttl)) {
+    if let Some(lines) = up.ehlo.cached(Some(ttl)) {
         return Ok(lines);
     }
-    let mut last_failure = sub.ehlo.probe.lock().await;
-    if let Some(lines) = sub.ehlo.cached(Some(sub.caps_ttl)) {
+    let mut last_failure = up.ehlo.probe.lock().await;
+    if let Some(lines) = up.ehlo.cached(Some(ttl)) {
         return Ok(lines);
     }
     if let Some(at) = *last_failure {
@@ -146,7 +148,7 @@ pub(super) async fn backend_extensions(
             ));
         }
     }
-    let lines = match probe(sub, tuning, name).await {
+    let lines = match probe(&up.conn, tuning, name).await {
         Ok(l) => Arc::new(l),
         Err(e) => {
             *last_failure = Some(Instant::now());
@@ -155,24 +157,95 @@ pub(super) async fn backend_extensions(
         }
     };
     *last_failure = None;
-    *sub.ehlo.lines.write().unwrap_or_else(|p| p.into_inner()) =
+    *up.ehlo.lines.write().unwrap_or_else(|p| p.into_inner()) =
         Some((Instant::now(), lines.clone()));
     Ok(lines)
 }
 
-/// The extension lines to advertise to a client (`advertised`), from
-/// `backend_extensions`. When no probe succeeds, those of the last
-/// successful one, whatever their age; when none has, no extension: fewer
-/// extensions are always safe, the client then uses none of them (D-SMTP-3).
-pub(super) async fn for_client(sub: &Submission, tuning: &Tuning, name: &str) -> Vec<String> {
-    let lines = match backend_extensions(sub, tuning, name).await {
+/// The extension lines of one backend for a client: `backend_extensions`,
+/// or when no probe succeeds those of the last successful one, whatever
+/// their age; when none has, none.
+async fn lines_for(up: &Upstream, ttl: Duration, tuning: &Tuning, name: &str) -> Arc<Vec<String>> {
+    match backend_extensions(up, ttl, tuning, name).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::warn!(target: crate::obs::target::SUBMISSION, error=%format!("{e:#}"), "submission backend EHLO extensions not available, advertising the last known ones");
-            sub.ehlo.cached(None).unwrap_or_default()
+            tracing::warn!(target: crate::obs::target::SUBMISSION, backend=%up.conn.id, error=%format!("{e:#}"), "submission backend EHLO extensions not available, advertising the last known ones");
+            up.ehlo.cached(None).unwrap_or_default()
         }
+    }
+}
+
+/// The extension lines to advertise to a client (`advertised`): those every
+/// backend the client's credential can be routed to offers (`intersect`),
+/// because a client does not send EHLO again after AUTH and uses the list
+/// against whichever backend it ends up on. A backend without a list (no
+/// probe has succeeded) offers none: fewer extensions are always safe, the
+/// client then uses none of them (D-SMTP-3). The backends are asked
+/// together, so one that is down delays the reply by one probe at most.
+pub(super) async fn for_client(sub: &Submission, tuning: &Tuning, name: &str) -> Vec<String> {
+    let mut probes = tokio::task::JoinSet::new();
+    for (i, up) in sub.backends.iter().enumerate() {
+        let (up, ttl, tuning, name) = (up.clone(), sub.caps_ttl, *tuning, name.to_owned());
+        probes.spawn(async move { (i, lines_for(&up, ttl, &tuning, &name).await) });
+    }
+    let mut lists = vec![Arc::default(); sub.backends.len()];
+    while let Some(done) = probes.join_next().await {
+        if let Ok((i, lines)) = done {
+            lists[i] = lines;
+        }
+    }
+    advertised(&intersect(&lists), sub.ehlo_only.as_deref())
+}
+
+/// The EHLO lines every list has, by keyword, in the first list's order and
+/// with its parameters, except SIZE (RFC 1870): the smallest limit, where no
+/// parameter or 0 means no limit. No list: nothing.
+pub fn intersect(lists: &[Arc<Vec<String>>]) -> Vec<String> {
+    let Some((first, rest)) = lists.split_first() else {
+        return Vec::new();
     };
-    advertised(&lines, sub.ehlo_only.as_deref())
+    // One backend: its list as it is.
+    if rest.is_empty() {
+        return first.to_vec();
+    }
+    let find = |list: &Arc<Vec<String>>, keyword: &str| {
+        list.iter()
+            .find(|l| ehlo_keyword(l).is_some_and(|k| k.eq_ignore_ascii_case(keyword)))
+            .cloned()
+    };
+    let mut out = Vec::new();
+    for line in first.iter() {
+        let Some(keyword) = ehlo_keyword(line) else {
+            continue;
+        };
+        let Some(others) = rest
+            .iter()
+            .map(|l| find(l, keyword))
+            .collect::<Option<Vec<_>>>()
+        else {
+            continue;
+        };
+        if keyword.eq_ignore_ascii_case("SIZE") {
+            // RFC 1870 §4: no parameter, or 0, is no fixed limit.
+            let limit = |l: &str| {
+                l.split(' ')
+                    .nth(1)
+                    .and_then(|p| p.parse::<u64>().ok())
+                    .filter(|n| *n > 0)
+            };
+            let smallest = std::iter::once(line.as_str())
+                .chain(others.iter().map(String::as_str))
+                .filter_map(limit)
+                .min();
+            out.push(match smallest {
+                Some(n) => format!("{keyword} {n}"),
+                None => keyword.to_string(),
+            });
+        } else {
+            out.push(line.clone());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -181,6 +254,37 @@ mod tests {
 
     fn lines(l: &[&str]) -> Vec<String> {
         l.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Several backends: the keywords all have, in the first's order with
+    /// its parameters, SIZE the smallest limit (none or 0: no limit); one
+    /// backend: its list as it is; one without a list: nothing.
+    #[test]
+    fn extensions_of_several_backends() {
+        let postfix = Arc::new(lines(&[
+            "PIPELINING",
+            "SIZE 10240000",
+            "DSN",
+            "CHUNKING",
+            "8BITMIME",
+        ]));
+        let other = Arc::new(lines(&["8BITMIME", "size 0", "PIPELINING", "CHUNKING"]));
+        let small = Arc::new(lines(&["SIZE 1000", "PIPELINING", "8BITMIME", "CHUNKING"]));
+        assert_eq!(
+            intersect(&[postfix.clone(), other.clone()]),
+            lines(&["PIPELINING", "SIZE 10240000", "CHUNKING", "8BITMIME"])
+        );
+        assert_eq!(
+            intersect(&[postfix.clone(), other.clone(), small]),
+            lines(&["PIPELINING", "SIZE 1000", "CHUNKING", "8BITMIME"])
+        );
+        let unlimited = Arc::new(lines(&["SIZE", "PIPELINING"]));
+        assert_eq!(
+            intersect(&[unlimited, other]),
+            lines(&["SIZE", "PIPELINING"])
+        );
+        assert_eq!(intersect(std::slice::from_ref(&postfix)), *postfix);
+        assert!(intersect(&[postfix, Arc::default()]).is_empty());
     }
 
     /// Postfix's default list after TLS for an authorised proxy: only the

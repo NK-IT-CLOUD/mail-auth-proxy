@@ -7,7 +7,7 @@ pub(crate) mod tls;
 
 pub(crate) use listener::ACCEPT_BACKOFF;
 
-use crate::config;
+use crate::config::{self, Protocol};
 use crate::obs::metrics;
 use crate::proto::imap::Imap;
 use crate::proto::sieve::Sieve;
@@ -28,6 +28,9 @@ use tokio_rustls::TlsConnector;
 /// tokens, so an unverified backend would let a MITM harvest secrets. There is
 /// no option to turn verification off.
 pub struct BackendConn {
+    /// The backend's name: its `[backends]` entry, or the protocol's section
+    /// for an inline one. In logs, metrics and the refusal timing.
+    pub id: String,
     pub address: String,
     pub name: ServerName<'static>,
     pub tls: TlsConnector,
@@ -45,6 +48,7 @@ impl BackendConn {
     /// `xclient` is `submission.xclient`, `default_tls` the protocol's
     /// default of `tls` (both already applied by `config::parse`).
     fn new(
+        id: &str,
         b: &config::Backend,
         xclient: bool,
         default_tls: config::BackendTls,
@@ -57,6 +61,7 @@ impl BackendConn {
         let name = ServerName::try_from(name)
             .map_err(|e| anyhow::anyhow!("{}: bad certificate name: {e}", b.address))?;
         Ok(BackendConn {
+            id: id.to_owned(),
             address: b.address.clone(),
             name,
             tls: tls::backend_connector(b.ca_file.as_deref())?,
@@ -92,6 +97,8 @@ pub struct Shared {
     pub nets: Vec<IpNet>,
     /// The legacy (password) gate.
     pub legacy: crate::auth::legacy::Gate,
+    /// Which backend a credential goes to.
+    pub router: crate::route::Router,
     /// Name used in greetings and EHLO.
     pub hostname: String,
     pub limits: Arc<crate::limits::Limits>,
@@ -167,45 +174,63 @@ impl Generation {
             &cfg.legacy,
             std::time::Duration::from_secs(cfg.timeouts.connect_secs),
         )?
-        .with_backends(
-            [
-                Some(metrics::Proto::Imap),
-                cfg.submission.as_ref().map(|_| metrics::Proto::Smtp),
-                cfg.sieve.as_ref().map(|_| metrics::Proto::Sieve),
-            ]
-            .into_iter()
-            .flatten()
-            .map(|p| (p, crate::auth::backend_name(p))),
-        );
+        .with_backends(Protocol::ALL.into_iter().flat_map(|p| {
+            let proto = proto_of(p);
+            cfg.backends_of(p).into_iter().map(move |u| (proto, u.name))
+        }));
         let keepalive = keepalive(&cfg.session);
+        let conns = |p: Protocol| -> Result<Vec<(config::UsedBackend<'_>, BackendConn)>> {
+            let xclient =
+                p == Protocol::Submission && cfg.submission.as_ref().is_some_and(|s| s.xclient);
+            let default_tls = match p {
+                Protocol::Imap => config::BackendTls::Implicit,
+                Protocol::Submission | Protocol::Sieve => config::BackendTls::Starttls,
+            };
+            cfg.backends_of(p)
+                .into_iter()
+                .map(|u| {
+                    let conn = BackendConn::new(u.name, u.backend, xclient, default_tls, keepalive)
+                        .with_context(|| u.key())?;
+                    Ok((u, conn))
+                })
+                .collect()
+        };
+        // A backend that stays with the same settings keeps its capability
+        // cache: the one at its position in the previous generation.
+        let kept = |p: Protocol, u: &config::UsedBackend<'_>| {
+            prev.and_then(|g| {
+                g.config
+                    .backends_of(p)
+                    .iter()
+                    .position(|o| o.name == u.name && o.backend == u.backend)
+            })
+        };
         let imap = Imap {
             acceptor: tls::acceptor(&certs, Some(b"imap")),
-            backend: BackendConn::new(
-                &cfg.imap.backend,
-                false,
-                config::BackendTls::Implicit,
-                keepalive,
-            )?,
+            backends: conns(Protocol::Imap)?.into_iter().map(|(_, c)| c).collect(),
         };
-        // The capability caches stay with a backend that stays.
         let submission = cfg
             .submission
             .as_ref()
             .map(|s| -> Result<Submission> {
-                let kept = prev
-                    .and_then(|p| p.submission.as_ref().zip(p.config.submission.as_ref()))
-                    .filter(|(_, old)| old.backend == s.backend)
-                    .map(|(ctx, _)| ctx.protocol.ehlo.clone());
+                let backends = conns(Protocol::Submission)?
+                    .into_iter()
+                    .map(|(u, conn)| {
+                        Arc::new(crate::proto::smtp::Upstream {
+                            ehlo: kept(Protocol::Submission, &u)
+                                .and_then(|i| {
+                                    let ctx = prev?.submission.as_ref()?;
+                                    Some(ctx.protocol.backends.get(i)?.ehlo.clone())
+                                })
+                                .unwrap_or_default(),
+                            conn,
+                        })
+                    })
+                    .collect();
                 Ok(Submission {
                     acceptor: tls::acceptor(&certs, None),
-                    backend: BackendConn::new(
-                        &s.backend,
-                        s.xclient,
-                        config::BackendTls::Starttls,
-                        keepalive,
-                    )?,
+                    backends,
                     ehlo_only: s.ehlo_extensions.clone(),
-                    ehlo: kept.unwrap_or_default(),
                     caps_ttl: std::time::Duration::from_secs(s.capability_cache_secs),
                 })
             })
@@ -214,19 +239,23 @@ impl Generation {
             .sieve
             .as_ref()
             .map(|s| -> Result<Sieve> {
-                let kept = prev
-                    .and_then(|p| p.sieve.as_ref().zip(p.config.sieve.as_ref()))
-                    .filter(|(_, old)| old.backend == s.backend)
-                    .map(|(ctx, _)| ctx.protocol.caps.clone());
+                let backends = conns(Protocol::Sieve)?
+                    .into_iter()
+                    .map(|(u, conn)| {
+                        Arc::new(crate::proto::sieve::Upstream {
+                            caps: kept(Protocol::Sieve, &u)
+                                .and_then(|i| {
+                                    let ctx = prev?.sieve.as_ref()?;
+                                    Some(ctx.protocol.backends.get(i)?.caps.clone())
+                                })
+                                .unwrap_or_default(),
+                            conn,
+                        })
+                    })
+                    .collect();
                 Ok(Sieve {
                     acceptor: tls::acceptor(&certs, Some(b"managesieve")),
-                    backend: BackendConn::new(
-                        &s.backend,
-                        false,
-                        config::BackendTls::Starttls,
-                        keepalive,
-                    )?,
-                    caps: kept.unwrap_or_default(),
+                    backends,
                     caps_ttl: std::time::Duration::from_secs(s.capability_cache_secs),
                 })
             })
@@ -274,6 +303,7 @@ impl Generation {
             error_challenge: crate::auth::discovery::ErrorChallenge::from_config(&cfg.oauth),
             nets,
             legacy,
+            router: crate::route::Router::new(&cfg),
             hostname: cfg.server.hostname.clone(),
             limits,
             ratelimit: Arc::new(ratelimit),
@@ -360,6 +390,23 @@ impl Generation {
     }
 }
 
+/// The metrics protocol of a configuration protocol.
+fn proto_of(p: Protocol) -> metrics::Proto {
+    match p {
+        Protocol::Imap => metrics::Proto::Imap,
+        Protocol::Submission => metrics::Proto::Smtp,
+        Protocol::Sieve => metrics::Proto::Sieve,
+    }
+}
+
+/// `name=address` of each backend of `protocol`, for the startup log.
+fn backend_names(cfg: &config::Config, protocol: Protocol) -> Vec<String> {
+    cfg.backends_of(protocol)
+        .iter()
+        .map(|u| format!("{}={}", u.name, u.backend.address))
+        .collect()
+}
+
 /// `[session]` keepalive, for client and backend connections alike.
 fn keepalive(s: &config::Session) -> crate::wire::Keepalive {
     crate::wire::Keepalive {
@@ -392,17 +439,21 @@ pub fn file_problems(cfg: &config::Config) -> Vec<String> {
             }
         }
     }
-    let mut backends = vec![("imap.backend", &cfg.imap.backend)];
-    if let Some(s) = &cfg.submission {
-        backends.push(("submission.backend", &s.backend));
-    }
-    if let Some(s) = &cfg.sieve {
-        backends.push(("sieve.backend", &s.backend));
-    }
-    for (name, b) in backends {
+    // The inline backends, then every named one (used or not).
+    let backends = Protocol::ALL
+        .into_iter()
+        .flat_map(|p| cfg.backends_of(p))
+        .filter(|u| u.inline)
+        .map(|u| (u.key(), u.backend))
+        .chain(
+            cfg.backends
+                .iter()
+                .map(|(name, b)| (format!("backends.{name}"), b)),
+        );
+    for (key, b) in backends {
         if let Some(ca) = b.ca_file.as_deref().filter(|p| !p.is_empty()) {
             if let Err(e) = tls::backend_connector(Some(ca)) {
-                out.push(format!("{name}.ca_file: {e:#}"));
+                out.push(format!("{key}.ca_file: {e:#}"));
             }
         }
     }
@@ -553,7 +604,7 @@ pub async fn run(path: String, cfg: config::Config) -> Result<()> {
 
     let cfg = &generation.config;
     let listener = TcpListener::bind(&cfg.imap.listen).await?;
-    tracing::info!(target: crate::obs::target::MAIN, listen=%cfg.imap.listen, backend=%cfg.imap.backend.address, "imap listener up");
+    tracing::info!(target: crate::obs::target::MAIN, listen=%cfg.imap.listen, backends=?backend_names(cfg, Protocol::Imap), "imap listener up");
     listener::spawn_listener(
         listener,
         metrics::Proto::Imap,
@@ -566,7 +617,7 @@ pub async fn run(path: String, cfg: config::Config) -> Result<()> {
 
     if let Some(sub) = &cfg.submission {
         let sub_listener = TcpListener::bind(&sub.listen).await?;
-        tracing::info!(target: crate::obs::target::MAIN, listen=%sub.listen, backend=%sub.backend.address, "submission listener up");
+        tracing::info!(target: crate::obs::target::MAIN, listen=%sub.listen, backends=?backend_names(cfg, Protocol::Submission), "submission listener up");
         listener::spawn_listener(
             sub_listener,
             metrics::Proto::Smtp,
@@ -578,7 +629,7 @@ pub async fn run(path: String, cfg: config::Config) -> Result<()> {
         );
         if let Some(addr) = &sub.implicit_tls_listen {
             let implicit = TcpListener::bind(addr).await?;
-            tracing::info!(target: crate::obs::target::MAIN, listen=%addr, backend=%sub.backend.address, "submission implicit-TLS listener up");
+            tracing::info!(target: crate::obs::target::MAIN, listen=%addr, backends=?backend_names(cfg, Protocol::Submission), "submission implicit-TLS listener up");
             listener::spawn_listener(
                 implicit,
                 metrics::Proto::Smtp,
@@ -593,7 +644,7 @@ pub async fn run(path: String, cfg: config::Config) -> Result<()> {
 
     if let Some(sv) = &cfg.sieve {
         let sieve_listener = TcpListener::bind(&sv.listen).await?;
-        tracing::info!(target: crate::obs::target::MAIN, listen=%sv.listen, backend=%sv.backend.address, "sieve listener up");
+        tracing::info!(target: crate::obs::target::MAIN, listen=%sv.listen, backends=?backend_names(cfg, Protocol::Sieve), "sieve listener up");
         listener::spawn_listener(
             sieve_listener,
             metrics::Proto::Sieve,

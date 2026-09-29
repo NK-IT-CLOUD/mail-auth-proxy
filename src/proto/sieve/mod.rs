@@ -17,7 +17,7 @@ use crate::server::{BackendConn, Ctx};
 use crate::wire::deadline_at;
 use crate::wire::line::{read_client_line, verb_is};
 use anyhow::{anyhow, Context as _, Result};
-use backend::{backend_caps, SieveLogin};
+use backend::{backend_caps, caps_for_client, sieve_line, SieveLogin};
 use preauth::{
     parse_authenticate_line, read_continuation, read_sasl_string, read_string_arg, sieve_string,
 };
@@ -97,12 +97,17 @@ fn rewrite_caps(be_caps: &[String], plain: bool) -> String {
 pub struct Sieve {
     /// TLS after STARTTLS with ALPN `managesieve`.
     pub acceptor: crate::server::tls::Acceptor,
-    pub backend: BackendConn,
-    /// The backend's capabilities; a reload that keeps the backend keeps
-    /// them.
-    pub caps: Arc<CapsCache>,
+    /// Every backend a credential can be routed to (`route::Pick::index`).
+    pub backends: Vec<Arc<Upstream>>,
     /// How long cached backend capabilities are relayed.
     pub caps_ttl: std::time::Duration,
+}
+
+/// A ManageSieve backend and its capabilities; a reload that keeps the
+/// backend keeps them.
+pub struct Upstream {
+    pub conn: BackendConn,
+    pub caps: Arc<CapsCache>,
 }
 
 /// Probe the backend's capabilities once at startup, so the first
@@ -110,8 +115,11 @@ pub struct Sieve {
 /// like any failed probe and does not stop the start; the next greeting
 /// after the retry spacing probes again (D-SIEVE-1).
 pub async fn probe_at_startup(ctx: Arc<Ctx<Sieve>>) {
-    if let Err(e) = backend_caps(&ctx.protocol, &ctx.tuning).await {
-        tracing::warn!(target: crate::obs::target::SIEVE, error=%format!("{e:#}"), "sieve backend capabilities not available at startup");
+    let sieve = &ctx.protocol;
+    for up in &sieve.backends {
+        if let Err(e) = backend_caps(up, sieve.caps_ttl, &ctx.tuning).await {
+            tracing::warn!(target: crate::obs::target::SIEVE, backend=%up.conn.id, error=%format!("{e:#}"), "sieve backend capabilities not available at startup");
+        }
     }
 }
 
@@ -139,9 +147,10 @@ pub async fn handle(
         // The greeting must list SIEVE (RFC 5804 §1.7). Right after startup
         // no probe has run yet: the first clients wait for one (a single
         // probe for all of them).
-        let mut sieve = ctx.protocol.caps.sieve_line();
-        if sieve.is_none() && backend_caps(&ctx.protocol, tuning).await.is_ok() {
-            sieve = ctx.protocol.caps.sieve_line();
+        let (backends, ttl) = (&ctx.protocol.backends, ctx.protocol.caps_ttl);
+        let mut sieve = sieve_line(backends);
+        if sieve.is_none() && caps_for_client(backends, ttl, tuning).await.is_ok() {
+            sieve = sieve_line(backends);
         }
         let greeting = caps_plain(ctx.hostname(), sieve.as_deref());
         tcp.write_all(greeting.as_bytes()).await?;
@@ -233,7 +242,7 @@ pub async fn handle(
                 preauth_until,
                 tuning.preauth,
                 "sieve backend capabilities",
-                backend_caps(&ctx.protocol, tuning),
+                caps_for_client(&ctx.protocol.backends, ctx.protocol.caps_ttl, tuning),
             )
             .await
             {
@@ -391,7 +400,7 @@ pub async fn handle(
                         return Err(auth::blocked_source());
                     }
                     let login = SieveLogin {
-                        backend: &ctx.protocol.backend,
+                        backends: &ctx.protocol.backends,
                         tuning,
                         origin: (peer, local),
                     };

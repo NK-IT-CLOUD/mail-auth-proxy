@@ -67,6 +67,17 @@ The file is strict. Startup fails, and `--check-config` reports, when:
   short forms, or `client_ip = "xclient"` is set on the IMAP or ManageSieve backend
   (XCLIENT is an SMTP extension); a backend whose `client_ip` is `none`, set or by default,
   is a warning;
+- a protocol section has neither a `backend` nor a route that serves it, or both; a
+  `backend` name or a route's `imap`/`submission`/`sieve` names no `[backends]` entry; a
+  `[backends]` entry is used by two protocols, is named `imap`, `submission` or `sieve`
+  (the names of the inline backends), or has an invalid name; more than 64 backends or
+  256 routes; a route without `domains` and `issuers`, without a backend, with a
+  duplicate or invalid name, an invalid domain, `"*"` next to another domain or in a route
+  that is not the last, an issuer that is not an `oauth.issuers` entry, an empty `sni` or
+  `audiences` entry, a backend for a protocol without its section, or a domain an earlier
+  route with the same conditions already takes. A `[backends]` entry that nothing uses,
+  and a route domain that no accepted issuer has in its `identity_domains` while every
+  issuer sets them, are warnings ([Routes](#routes));
 - a `submission.ehlo_extensions` entry is not an EHLO line, repeats a keyword or is `AUTH`
   or `STARTTLS` (an entry the proxy never advertises, or one with parameters, is a
   warning);
@@ -109,7 +120,8 @@ checked any more, and `[session]` limits apply as they were at its accept.
 What runs across configurations is kept: open connections count against the new limits,
 failed-login counts and blocks go on under the new `[auth_ratelimit]` settings (a source
 the new settings exempt is free at once), the legacy throttle keeps its counts, a backend
-that stays keeps its cached capabilities, and an issuer that stays (same `issuer` and
+that stays (same name and settings) keeps its cached capabilities and its learned
+refusal timing, and an issuer that stays (same `issuer` and
 `jwks_url`) keeps its keys, read under its new rules. The JWKS of a new issuer is fetched
 by the reload.
 
@@ -127,6 +139,8 @@ by that group and by nobody else, for example `root:mail-auth-proxy` mode `0640`
 | `[server]` | the name used in greetings and EHLO |
 | `[tls]`, `[[tls.certificates]]` | the default certificate and key, and more certificates chosen by SNI |
 | `[imap]`, `[submission]`, `[sieve]` | listener(s) and backend with its profile (`tls`, `client_ip`, `auth_forward`) per protocol; `[imap]` is required, omit `[submission]` or `[sieve]` to disable them (a restart, not a reload) |
+| `[backends.<name>]` | named backends, for a section's `backend = "<name>"` or for routes |
+| `[[routes]]` | which backend a credential goes to, by the domain of its identity or login ([Routes](#routes)) |
 | `[oauth]`, `[[oauth.issuers]]` | JWKS refresh and clock skew; one entry per issuer with its token rules |
 | `[[legacy.rules]]` | legacy passwords: which source networks, names, protocols, mechanisms and users may use them |
 | `[legacy]` | settings of the legacy gate: allowed domains, account check, throttle, failure delay |
@@ -139,9 +153,9 @@ by that group and by nobody else, for example `root:mail-auth-proxy` mode `0640`
 
 ## Keys
 
-A backend (`imap.backend`, `submission.backend`, `sieve.backend`) is a table with the
-backend `.…` keys below, written inline (`backend = { address = "…" }`) or as
-`[imap.backend]`. The column Reload says whether `systemctl reload` takes a change of the
+A backend is a table with the backend `.…` keys below: a section's own, written inline
+(`backend = { address = "…" }`) or as `[imap.backend]`, or a named one,
+`[backends.<name>]`, which the section names (`backend = "<name>"`) or routes choose. The column Reload says whether `systemctl reload` takes a change of the
 key over (`yes`) or it needs a restart ([Reload](#reload)).
 
 | Key | Type | Default | Reload | Effect |
@@ -151,17 +165,23 @@ key over (`yes`) or it needs a restart ([Reload](#reload)).
 | `tls.cert`, `tls.key` | path | required | yes | PEM chain and key of the default certificate: served to clients without SNI and to those that ask for one of its DNS names |
 | `tls.certificates[].cert`, `.key` | path | none | yes | more certificates (`[[tls.certificates]]`, one table each), each served to clients that ask for one of its DNS names. Each must carry at least one DNS name ([TLS server names](#tls-server-names)) |
 | `imap.listen` | `ip:port` | required | restart | implicit-TLS listener |
-| `imap.backend` | backend | required | yes | IMAP backend (`tls` default `implicit`) |
+| `imap.backend` | backend or name | required without routes | yes | IMAP backend (`tls` default `implicit`): a table, or the name of a `[backends]` entry. Not with routes that serve IMAP |
 | `submission.listen` | `ip:port` | section optional | restart | STARTTLS listener; omit the section to disable SMTP |
 | `submission.implicit_tls_listen` | `ip:port` | unset | restart | a second submission listener with implicit TLS (port 465, RFC 8314 §3.3): TLS from the first byte, then the greeting and the same dialog, gate and backend as the STARTTLS listener. Logs and metrics tell the two apart (`listener`) |
-| `submission.backend` | backend | required in section | yes | submission backend (`tls` default `starttls`) |
-| `submission.xclient` | bool | `false` | yes | short form of `submission.backend.client_ip = "xclient"`; `--print-config` shows `client_ip` |
-| `submission.ehlo_extensions` | array | unset | yes | the most the EHLO reply after STARTTLS may list, by keyword. The reply lists the extensions of the backend's own EHLO reply that the proxy handles (`PIPELINING`, `SIZE`, `8BITMIME`, `SMTPUTF8`, `DSN`, `ENHANCEDSTATUSCODES`, `CHUNKING`), with the backend's parameters; this list narrows them further. Each entry is an EHLO line (RFC 5321 §4.1.1.1): a keyword of letters, digits and hyphens that does not start with a hyphen, then optional parameters of printable ASCII, all separated by single spaces; each keyword once (case-insensitive); not `AUTH` or `STARTTLS`. Parameters are ignored (warning), as is a keyword the proxy never passes on (warning). |
-| `submission.ehlo_extensions` | array | unset | yes | the most the EHLO reply after STARTTLS may list, by keyword. The reply lists the extensions of the backend's own EHLO reply that the proxy handles (`PIPELINING`, `SIZE`, `8BITMIME`, `SMTPUTF8`, `DSN`, `ENHANCEDSTATUSCODES`, `CHUNKING`), with the backend's parameters; this list narrows them further. Each entry is an EHLO line (RFC 5321 §4.1.1.1): a keyword of letters, digits and hyphens that does not start with a hyphen, then optional parameters of printable ASCII, all separated by single spaces; each keyword once (case-insensitive); not `AUTH` or `STARTTLS`. Parameters are ignored (warning), as is a keyword the proxy never passes on (warning). |
-| `submission.capability_cache_secs` | integer | 600 | yes | reuse of the backend's EHLO extensions, read by a probe connection; ≥ 1 |
+| `submission.backend` | backend or name | required in section without routes | yes | submission backend (`tls` default `starttls`), as for `imap.backend` |
+| `submission.xclient` | bool | `false` | yes | short form of `client_ip = "xclient"` on every submission backend; `--print-config` shows `client_ip` |
+| `submission.ehlo_extensions` | array | unset | yes | the most the EHLO reply after STARTTLS may list, by keyword. The reply lists the extensions the proxy handles (`PIPELINING`, `SIZE`, `8BITMIME`, `SMTPUTF8`, `DSN`, `ENHANCEDSTATUSCODES`, `CHUNKING`) that every submission backend offers in its own EHLO reply, with the first backend's parameters and the smallest `SIZE` ([routes](#routes)); this list narrows them further. Each entry is an EHLO line (RFC 5321 §4.1.1.1): a keyword of letters, digits and hyphens that does not start with a hyphen, then optional parameters of printable ASCII, all separated by single spaces; each keyword once (case-insensitive); not `AUTH` or `STARTTLS`. Parameters are ignored (warning), as is a keyword the proxy never passes on (warning). |
+| `submission.capability_cache_secs` | integer | 600 | yes | reuse of each backend's EHLO extensions, read by a probe connection; ≥ 1 |
 | `sieve.listen` | `ip:port` | section optional | restart | STARTTLS listener; omit the section to disable ManageSieve |
-| `sieve.backend` | backend | required in section | yes | ManageSieve backend (`tls` default `starttls`) |
-| `sieve.capability_cache_secs` | integer | 600 | yes | reuse of the backend capability list; ≥ 1 |
+| `sieve.backend` | backend or name | required in section without routes | yes | ManageSieve backend (`tls` default `starttls`), as for `imap.backend` |
+| `sieve.capability_cache_secs` | integer | 600 | yes | reuse of each backend's capability list; ≥ 1 |
+| `backends.<name>` | backend | none | yes | a named backend; the name (1-64 of `A-Z a-z 0-9 . _ -`, not `imap`, `submission` or `sieve`) is logged as `backend=` and used for the refusal timing. Serves the one protocol that names it; its `tls` default is that protocol's |
+| `routes[].name` | string | required | yes | unique, 1-64 of `A-Z a-z 0-9 . _ -` |
+| `routes[].domains` | array | none | yes | domains of the identity (OAuth) or login (password), exact and ASCII case-insensitive, no subdomains; `"*"` alone, in the last route only, takes every domain and a login without one |
+| `routes[].issuers` | array | any | yes | OAuth: the issuer of the token is one of these `oauth.issuers[].issuer`. A route with `issuers` and without `domains` takes tokens of those issuers whatever the identity, and no password |
+| `routes[].sni` | array | any | yes | the name the client asked for (SNI) is one of these; without SNI the route does not match |
+| `routes[].audiences` | array | any | yes | OAuth: the token's `aud` contains one of these, binding a token to the backend it was issued for |
+| `routes[].imap`, `.submission`, `.sieve` | name | none | yes | the `[backends]` entry of each protocol the route serves |
 | backend `.address` | `host:port` | required | yes | where to connect |
 | backend `.verify_name` | string | host of `address` | yes | name verified on the backend certificate |
 | backend `.ca_file` | path | system store | yes | PEM CAs the backend certificate must chain to; replaces the system store for this backend |
@@ -226,6 +246,65 @@ key over (`yes`) or it needs a restart ([Reload](#reload)).
 | `session.keepalive_count` | integer | 5 | yes | unanswered probes before the kernel drops the connection; 2-127 (RFC 9293 §3.8.4: one lost probe must not end a connection). With the defaults a dead peer is dropped after at most 15 minutes of silence |
 | `session.idle_limit_secs` | integer | off | yes | after login: close the session after this long without a byte in either direction; 1-2592000. Below 1800 gives a warning: IMAP and ManageSieve clients may rely on at least 30 minutes (RFC 9051 §5.4, RFC 5804 §1.2), and IDLE clients re-issue IDLE only every 29 minutes (RFC 9051 §6.3.13) |
 | `session.max_session_secs` | integer | off | yes | after login: close the session this long after the login, busy or not; 1-2592000; below 1800 gives the same warning |
+
+## Routes
+
+Without `[[routes]]` each protocol has the one backend of its section. With routes, a
+protocol whose section has no `backend` sends each credential to the backend of the first
+route, in file order, that serves the protocol and whose conditions all hold:
+
+- the domain of the validated identity (OAuth) or of the login (password) is in
+  `domains`, or `domains` is `["*"]`, or the route has no `domains` and the credential is
+  a token of one of its `issuers`;
+- a token's issuer is in `issuers` and its `aud` contains one of `audiences`, where set
+  (a password is routed by its domain alone);
+- the client's SNI is in `sni`, where set.
+
+The SNI only narrows a route, never picks one: it is chosen by the client, and a token
+sent to another tenant's backend could open an account there. `identity_domains` stays
+the issuers' trust boundary; routes only decide where an identity lives.
+
+A credential that no route takes is refused like an unknown domain: the `authresult`
+reason is `unknown_domain`, the reply that of a wrong password (for passwords with the
+same delay) or of a token the backend rejected, and the backend is not contacted. A
+`WARN … no route for the login's domain` line names the domain, and
+`mail_auth_proxy_route_misses_total` counts it. For passwords the route is looked up after
+the domain gate and before the account check.
+
+Before the credential the client sees capabilities that must hold for whichever backend it
+is routed to: the SMTP EHLO reply lists the extensions that every submission backend
+offers, with the smallest `SIZE`; the ManageSieve capabilities are those all ManageSieve
+backends have, `SIEVE` and `NOTIFY` narrowed to their common extensions and
+`MAXREDIRECTS` the smallest. For SMTP a backend that has never answered a probe offers
+nothing; for ManageSieve it is left out until it answers (after AUTHENTICATE the client
+gets its own backend's list, RFC 5804 §1.7), since an empty list would drop the `SASL`
+line for everyone. IMAP
+shows the proxy's own list before login and the backend's after it.
+
+```toml
+[imap]
+listen = "0.0.0.0:993"
+
+[backends.dovecot]
+address = "192.0.2.10:993"
+client_ip = "proxy_v2"
+
+[backends.stalwart]
+address = "192.0.2.20:993"
+auth_forward = "oauthbearer"
+client_ip = "proxy_v2"
+
+[[routes]]
+name = "example"
+domains = ["example.org", "example.net"]
+imap = "dovecot"
+
+[[routes]]
+name = "partner"
+domains = ["partner.example"]
+issuers = ["https://sso.partner.example/realms/mail"]
+imap = "stalwart"
+```
 
 ## TLS server names
 

@@ -11,6 +11,7 @@ pub mod token;
 
 use crate::obs::authlog::{self, AuthEvent, Reason};
 use crate::obs::metrics::{self, Proto};
+use crate::route;
 use crate::server::Shared;
 use crate::wire::line::LineError;
 use sasl::ClientAuthKind;
@@ -191,15 +192,20 @@ pub fn rejected_after(reply: String, result: Option<&sasl::ErrorResult>) -> Back
     }
 }
 
-/// A protocol's backend login with the client's own credential (never a
-/// master credential).
+/// A protocol's backend logins with the client's own credential (never a
+/// master credential), to any of the protocol's backends: `index` is the
+/// position a route picked (`route::Pick`).
 pub trait BackendLogin {
     /// The logged-in backend connection, plus whatever the protocol relays
     /// from the backend's reply.
     type Conn;
 
+    /// The name of backend `index` (`BackendConn::id`).
+    fn name(&self, index: usize) -> &str;
+
     fn login(
         &self,
+        index: usize,
         credential: BackendCredential<'_>,
     ) -> impl Future<Output = Result<Self::Conn, BackendError>> + Send;
 }
@@ -216,17 +222,6 @@ pub const MAX_PASSWORD: usize = 1024;
 
 /// Largest bearer token the proxy validates; a longer one is a `bad_token`.
 pub const MAX_TOKEN: usize = 16384;
-
-/// The backend a protocol's credentials go to, by name: each protocol has
-/// one, named after the section that configures it. Keys the refusal timing
-/// of the legacy gate (`legacy::Gate::with_backends`).
-pub fn backend_name(proto: Proto) -> &'static str {
-    match proto {
-        Proto::Imap => "imap",
-        Proto::Smtp => "submission",
-        Proto::Sieve => "sieve",
-    }
-}
 
 /// The facts about a connection that decide and label an auth attempt.
 pub struct Session<'a> {
@@ -285,6 +280,7 @@ fn record(
     reason: Reason,
     pwfp: &str,
     rule: &str,
+    backend: &str,
 ) {
     AuthEvent {
         proto: s.proto,
@@ -296,6 +292,7 @@ fn record(
         pwfp,
         rule,
         listener: s.listener,
+        backend,
     }
     .record();
     metrics::record_auth(s.proto, s.listener, s.internal, mech, reason == Reason::Ok);
@@ -343,6 +340,7 @@ pub fn withheld(ctx: &Shared, s: &Session<'_>, w: &Withheld) -> anyhow::Error {
         Reason::BlockedEndpoint,
         "",
         "",
+        "",
     );
     refused(format!(
         "password auth blocked on OAuth-only endpoint (scope={})",
@@ -367,6 +365,7 @@ pub fn discovery(s: &Session<'_>, d: &sasl::Discovery) {
         pwfp: "",
         rule: "",
         listener: s.listener,
+        backend: "",
     }
     .record();
 }
@@ -483,6 +482,7 @@ fn no_credential(s: &Session<'_>) {
         pwfp: "",
         rule: "",
         listener: s.listener,
+        backend: "",
     }
     .record();
 }
@@ -545,8 +545,11 @@ pub enum Outcome<C> {
 /// (an unknown `kid` is an outage instead when the last on-demand JWKS
 /// refresh failed);
 /// a client SASL user (authzid) that names another identity than the
-/// token's is `authzid_mismatch`, also without backend contact; otherwise the
-/// backend's verdict under the token's identity claim.
+/// token's is `authzid_mismatch`, also without backend contact; a token
+/// that no route takes (`route::Router::pick` by the identity's domain,
+/// issuer, audience and SNI) is `unknown_domain`, answered like a token the
+/// backend rejected; otherwise the chosen backend's verdict under the
+/// token's identity claim.
 ///
 /// Legacy (PLAIN/LOGIN, no SSO): the backend checks the password; the proxy
 /// only forwards it through the legacy gate:
@@ -554,11 +557,13 @@ pub enum Outcome<C> {
 /// - a mechanism the connection does not offer: `blocked_endpoint`, answered
 ///   as "not available here";
 /// - refused by the gate (`blocked_endpoint` for a user no rule allows,
-///   `unknown_domain`, `unknown_account`, `throttled`) or by the backend
+///   `unknown_domain` also for a domain no route takes, `unknown_account`,
+///   `throttled`) or by the backend
 ///   (`backend_reject`): the same answer to the client. A refusal is
 ///   answered as late as a typical backend rejection (the larger of
 ///   `legacy.failure_delay_ms` and the median of the recent rejection
-///   latencies of the protocol), a rejection no earlier than
+///   latencies of the chosen backend, or of the slowest backend of the
+///   protocol for a refusal before the route), a rejection no earlier than
 ///   `failure_delay_ms`; both get the same random jitter, so neither text nor
 ///   timing tells the cases apart;
 /// - the backend's `ok`, logged with the rule that let the password through.
@@ -577,10 +582,10 @@ pub async fn authorize<B: BackendLogin>(
     mech: &str,
     credential: &ClientAuthKind,
     host: Option<&str>,
-    backend: &B,
+    backends: &B,
 ) -> Outcome<B::Conn> {
-    let event = |user: &str, reason: Reason, pwfp: &str, rule: &str| {
-        record(ctx, s, mech, credential, user, reason, pwfp, rule)
+    let event = |user: &str, reason: Reason, pwfp: &str, rule: &str, backend: &str| {
+        record(ctx, s, mech, credential, user, reason, pwfp, rule, backend)
     };
     match credential {
         ClientAuthKind::OAuth { user, token } => {
@@ -624,7 +629,11 @@ pub async fn authorize<B: BackendLogin>(
                     }
                 }
             };
-            let token::Validated { identity, issuer } = match validated {
+            let token::Validated {
+                identity,
+                issuer,
+                audiences,
+            } = match validated {
                 Ok(validated) => {
                     metrics::record_token_validate(true);
                     validated
@@ -637,26 +646,38 @@ pub async fn authorize<B: BackendLogin>(
                 }
                 Err(e) => {
                     metrics::record_token_validate(false);
-                    event(user, Reason::BadToken, "", "");
+                    event(user, Reason::BadToken, "", "", "");
                     return Outcome::BadToken(e);
                 }
             };
             if !sasl::authzid_allowed(user, &identity) {
                 // RFC 4422 §3.6: not authorised to act as the requested
                 // authzid. Logged with the identity the client asked for.
-                event(user, Reason::AuthzidMismatch, "", "");
+                event(user, Reason::AuthzidMismatch, "", "", "");
                 return Outcome::WrongAuthzid;
             }
+            let key = route::Key {
+                domain: route::domain_of(&identity),
+                token: Some((&issuer, &audiences)),
+                sni: s.sni,
+            };
+            let Some(pick) = ctx.router.pick(s.proto, &key) else {
+                no_route(s, key.domain, Some(&issuer));
+                event(&identity, Reason::UnknownDomain, "", "", "");
+                return Outcome::Rejected("no route for the identity's domain".into());
+            };
+            let backend = backends.name(pick.index);
+            tracing::debug!(target: crate::obs::target::MAIN, route = pick.route, backend, "routed");
             let login = BackendCredential::Token {
                 identity: &identity,
                 token,
                 issuer: &issuer,
             };
             let login_started = tokio::time::Instant::now();
-            match within_budget(ctx, s, backend.login(login)).await {
+            match within_budget(ctx, s, backends.login(pick.index, login)).await {
                 Ok(conn) => {
                     metrics::record_backend_login(s.proto, login_started.elapsed());
-                    event(&identity, Reason::Ok, "", "");
+                    event(&identity, Reason::Ok, "", "", backend);
                     metrics::record_upstream_forward(s.proto);
                     Outcome::Ok {
                         conn,
@@ -665,7 +686,7 @@ pub async fn authorize<B: BackendLogin>(
                     }
                 }
                 Err(BackendError::Rejected(reply)) => {
-                    event(&identity, Reason::BackendReject, "", "");
+                    event(&identity, Reason::BackendReject, "", "", backend);
                     Outcome::Rejected(reply)
                 }
                 Err(BackendError::Unavailable(e)) => {
@@ -676,39 +697,60 @@ pub async fn authorize<B: BackendLogin>(
         }
         ClientAuthKind::Password { user, pass } => {
             let started = tokio::time::Instant::now();
-            let backend_name = backend_name(s.proto);
             // The credential of a refused password was parsed only to log the
             // attempt (who, from where, which password fingerprint) for CrowdSec.
             let pwfp = authlog::pw_fingerprint(Some(pass));
             if !s.pw_mechs.allows(mech) {
-                event(user, Reason::BlockedEndpoint, &pwfp, "");
+                event(user, Reason::BlockedEndpoint, &pwfp, "", "");
                 return Outcome::Blocked;
             }
             let gate = &ctx.legacy;
             if pass.len() > MAX_PASSWORD {
                 // Before the gate, so the answer does not depend on the
                 // account; answered like any refusal.
-                event(user, Reason::Oversize, &pwfp, "");
+                event(user, Reason::Oversize, &pwfp, "", "");
                 tokio::time::sleep_until(gate.refusal_deadline(s.proto, None, started)).await;
                 return Outcome::Denied;
             }
+            // The route by the login's domain, before the gate's account
+            // check: that belongs to the backend, and a domain no route
+            // takes is refused like an unknown domain.
+            let key = route::Key {
+                domain: route::domain_of(user),
+                token: None,
+                sni: s.sni,
+            };
+            let routed = ctx.router.pick(s.proto, &key).map(|p| {
+                let backend = backends.name(p.index);
+                tracing::debug!(target: crate::obs::target::MAIN, route = p.route, backend, "routed");
+                (p.index, backend)
+            });
+            let backend_name = routed.map(|(_, name)| name);
             let check = tokio::time::timeout_at(
                 s.preauth_until,
-                gate.check(s.proto, s.peer.ip(), s.sni, mech, user),
+                gate.check_routed(s.proto, s.peer.ip(), s.sni, mech, user, routed),
             )
             .await
             .unwrap_or_else(|_| {
                 legacy::Verdict::Unavailable(budget_used_up(ctx, "the legacy account check"))
             });
-            let (rule, turn) = match check {
-                legacy::Verdict::Pass { rule, turn } => (rule, turn),
+            let (rule, turn, (index, backend_name)) = match check {
+                legacy::Verdict::Pass {
+                    rule,
+                    turn,
+                    backend,
+                } => (rule, turn, backend),
                 legacy::Verdict::Deny {
                     reason,
                     rule,
                     for_backend,
+                    no_route: missed,
                 } => {
-                    event(user, reason, &pwfp, rule);
-                    let backend = for_backend.then_some(backend_name);
+                    if missed {
+                        no_route(s, key.domain, None);
+                    }
+                    event(user, reason, &pwfp, rule, "");
+                    let backend = backend_name.filter(|_| for_backend);
                     tokio::time::sleep_until(gate.refusal_deadline(s.proto, backend, started))
                         .await;
                     return Outcome::Denied;
@@ -718,12 +760,8 @@ pub async fn authorize<B: BackendLogin>(
                     // Padded like a refusal: an instant retry-later would
                     // tell accounts that reach the check from those the
                     // gate refuses earlier.
-                    tokio::time::sleep_until(gate.refusal_deadline(
-                        s.proto,
-                        Some(backend_name),
-                        started,
-                    ))
-                    .await;
+                    tokio::time::sleep_until(gate.refusal_deadline(s.proto, backend_name, started))
+                        .await;
                     return Outcome::Unavailable(e.context("legacy account check"));
                 }
             };
@@ -731,7 +769,7 @@ pub async fn authorize<B: BackendLogin>(
             match within_budget(
                 ctx,
                 s,
-                backend.login(BackendCredential::Password { user, pass }),
+                backends.login(index, BackendCredential::Password { user, pass }),
             )
             .await
             {
@@ -739,7 +777,7 @@ pub async fn authorize<B: BackendLogin>(
                     metrics::record_backend_login(s.proto, login_started.elapsed());
                     gate.backend_accepted(user);
                     drop(turn);
-                    event(user, Reason::Ok, "", rule);
+                    event(user, Reason::Ok, "", rule, backend_name);
                     metrics::record_upstream_forward(s.proto);
                     Outcome::Ok {
                         conn,
@@ -751,7 +789,7 @@ pub async fn authorize<B: BackendLogin>(
                     let answer_at = gate.rejected_deadline(s.proto, backend_name, started);
                     gate.backend_rejected(user);
                     drop(turn);
-                    event(user, Reason::BackendReject, &pwfp, rule);
+                    event(user, Reason::BackendReject, &pwfp, rule, backend_name);
                     tokio::time::sleep_until(answer_at).await;
                     Outcome::Rejected(reply)
                 }
@@ -771,6 +809,15 @@ pub async fn authorize<B: BackendLogin>(
             }
         }
     }
+}
+
+/// The log line and metric of a credential no route takes: an unknown
+/// tenant, or a route table that misses a domain. The domain of a password
+/// login is client input and is sanitised.
+fn no_route(s: &Session<'_>, domain: Option<&str>, issuer: Option<&str>) {
+    metrics::record_route_miss(s.proto);
+    tracing::warn!(target: crate::obs::target::MAIN, proto = s.proto.label(), domain = %authlog::sanitize(domain.unwrap_or("")),
+        issuer = issuer.unwrap_or(""), peer = %s.peer.ip(), "no route for the login's domain");
 }
 
 #[cfg(test)]

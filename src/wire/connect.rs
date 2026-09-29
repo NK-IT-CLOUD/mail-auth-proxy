@@ -108,6 +108,7 @@ mod tests {
             .with_root_certificates(rustls::RootCertStore::empty())
             .with_no_client_auth();
         let backend = BackendConn {
+            id: "sieve".into(),
             address,
             name: rustls::pki_types::ServerName::try_from("backend.test").unwrap(),
             tls: tokio_rustls::TlsConnector::from(Arc::new(cfg)),
@@ -140,6 +141,7 @@ mod tests {
             .with_root_certificates(rustls::RootCertStore::empty())
             .with_no_client_auth();
         let backend = BackendConn {
+            id: "imap".into(),
             address: listener.local_addr().unwrap().to_string(),
             name: rustls::pki_types::ServerName::try_from("backend.test").unwrap(),
             tls: tokio_rustls::TlsConnector::from(Arc::new(cfg)),

@@ -475,18 +475,25 @@ impl Latencies {
 
 /// The gate's verdict on one password attempt.
 pub enum Verdict<'a> {
-    /// Forward the password; `rule` let it through. Keep `turn` until the
-    /// backend verdict is reported with `backend_accepted`/`backend_rejected`.
-    Pass { rule: &'a str, turn: Turn<'a> },
+    /// Forward the password to `backend` (the routed one, as given to
+    /// `check_routed`); `rule` let it through. Keep `turn` until the backend
+    /// verdict is reported with `backend_accepted`/`backend_rejected`.
+    Pass {
+        rule: &'a str,
+        turn: Turn<'a>,
+        backend: (usize, &'a str),
+    },
     /// Refused before the backend. `rule` is the matching rule, or empty
     /// when no rule allows this user. `for_backend`: refused by a step that
     /// runs for the backend the login goes to (the account check, the
     /// throttle), so the refusal is padded like that backend's rejections;
     /// the earlier steps (login, rule, domain) do not depend on it.
+    /// `no_route`: refused because no route takes the login's domain.
     Deny {
         reason: Reason,
         rule: &'a str,
         for_backend: bool,
+        no_route: bool,
     },
     /// The account check could not answer: an outage, not a refusal.
     Unavailable(anyhow::Error),
@@ -737,7 +744,8 @@ impl Gate {
     }
 
     /// Stages 1-4 for a password attempt whose mechanism the connection
-    /// offers (`advertised`). Nothing here contacts the mail backend.
+    /// offers (`advertised`), with one backend.
+    #[cfg(test)]
     pub async fn check(
         &self,
         proto: Proto,
@@ -746,6 +754,25 @@ impl Gate {
         mech: &str,
         user: &str,
     ) -> Verdict<'_> {
+        self.check_routed(proto, peer, sni, mech, user, Some((0, "test")))
+            .await
+    }
+
+    /// Stages 1-4 for a password attempt whose mechanism the connection
+    /// offers (`advertised`). `backend` is the backend the routes chose for
+    /// the login's domain (its index and name); without one the login is
+    /// refused as an unknown domain after the domain gate (stage 2b), before
+    /// the account check, which belongs to a backend. Nothing here contacts
+    /// the mail backend.
+    pub async fn check_routed<'a>(
+        &'a self,
+        proto: Proto,
+        peer: IpAddr,
+        sni: Option<&str>,
+        mech: &str,
+        user: &str,
+        backend: Option<(usize, &'a str)>,
+    ) -> Verdict<'a> {
         let proto = protocol(proto);
         // Logins the proxy never looks up or counts: empty, too long for a
         // mailbox name, with control characters, or with more than one `@`
@@ -760,6 +787,7 @@ impl Gate {
                 reason: Reason::UnknownAccount,
                 rule: "",
                 for_backend: false,
+                no_route: false,
             };
         }
         let Some(m) = mechanism(mech) else {
@@ -767,6 +795,7 @@ impl Gate {
                 reason: Reason::BlockedEndpoint,
                 rule: "",
                 for_backend: false,
+                no_route: false,
             };
         };
         // 1. The first rule (in configuration order) that allows this login.
@@ -779,6 +808,7 @@ impl Gate {
                 reason: Reason::BlockedEndpoint,
                 rule: "",
                 for_backend: false,
+                no_route: false,
             };
         };
         let rule = rule.name.as_str();
@@ -786,11 +816,13 @@ impl Gate {
             reason,
             rule,
             for_backend: false,
+            no_route: false,
         };
         let deny_for_backend = |reason| Verdict::Deny {
             reason,
             rule,
             for_backend: true,
+            no_route: false,
         };
         // 2. Domain.
         if let Some((inline, file)) = &self.domains {
@@ -807,6 +839,15 @@ impl Gate {
                 return deny(Reason::UnknownDomain);
             }
         }
+        // 2b. Route.
+        let Some(backend) = backend else {
+            return Verdict::Deny {
+                reason: Reason::UnknownDomain,
+                rule,
+                for_backend: false,
+                no_route: true,
+            };
+        };
         // 3. Account.
         if let Some(a) = &self.account {
             match a.exists(user).await {
@@ -826,7 +867,11 @@ impl Gate {
             }
             None => Turn::none(),
         };
-        Verdict::Pass { rule, turn }
+        Verdict::Pass {
+            rule,
+            turn,
+            backend,
+        }
     }
 
     /// The backend rejected the password of `user`.
@@ -1578,6 +1623,24 @@ mod tests {
             for_backend(check("a@example.org").await),
             Some(true),
             "throttle"
+        );
+        // No route: refused after the domain gate, and only then marked so.
+        let no_route = |v: Verdict<'_>| match v {
+            Verdict::Deny {
+                reason, no_route, ..
+            } => Some((reason, no_route)),
+            _ => None,
+        };
+        let unrouted =
+            |user: &'static str| g.check_routed(Proto::Imap, peer, None, "PLAIN", user, None);
+        assert_eq!(
+            no_route(unrouted("b@example.org").await),
+            Some((Reason::UnknownDomain, true))
+        );
+        assert_eq!(
+            no_route(unrouted("b@other.org").await),
+            Some((Reason::UnknownDomain, false)),
+            "the domain gate refused first"
         );
     }
 

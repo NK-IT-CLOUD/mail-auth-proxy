@@ -215,6 +215,7 @@ Metric names follow the Prometheus naming guidelines: an application prefix (`ma
 | `mail_auth_proxy_ratelimit_evictions_total` | counter |
 | `mail_auth_proxy_active_connections{proto}` | gauge |
 | `mail_auth_proxy_upstream_forward_total{proto}` | counter |
+| `mail_auth_proxy_route_misses_total{proto}` | counter |
 | `mail_auth_proxy_sessions_ended_total{proto,reason}` | counter |
 | `mail_auth_proxy_tls_cert_expiry_timestamp_seconds{cert}` | gauge |
 | `mail_auth_proxy_jwks_last_success_timestamp_seconds{issuer}` | gauge |
@@ -278,8 +279,8 @@ The LOGIN mechanism is server-first, so RFC 4954 §4 and RFC 4959 §3 require th
 
 ### D-SMTP-3: EHLO list from a probe of the backend
 
-- Behaviour: the extensions advertised after STARTTLS are those of the backend's own post-TLS EHLO reply that the proxy handles: PIPELINING, SIZE (with the backend's limit), 8BITMIME, SMTPUTF8, DSN, ENHANCEDSTATUSCODES and CHUNKING, narrowed further by `submission.ehlo_extensions` if set. The proxy reads the reply with a probe connection of its own (at startup, then at most once per `submission.capability_cache_secs`, one at a time); a client's EHLO reply is built at its first EHLO and kept for the connection.
-- What the specification says: only extensions that work may be advertised (RFC 5321 §4.2.4). Clients do not send EHLO again after AUTH, so the list the proxy shows is what they use against the backend.
+- Behaviour: the extensions advertised after STARTTLS are those of the backend's own post-TLS EHLO reply that the proxy handles: PIPELINING, SIZE (with the backend's limit), 8BITMIME, SMTPUTF8, DSN, ENHANCEDSTATUSCODES and CHUNKING, narrowed further by `submission.ehlo_extensions` if set. With several submission backends (routes), only the extensions every one of them offers, with the smallest SIZE. The proxy reads each reply with a probe connection of its own (at startup, then at most once per `submission.capability_cache_secs`, one at a time per backend); a client's EHLO reply is built at its first EHLO and kept for the connection.
+- What the specification says: only extensions that work may be advertised (RFC 5321 §4.2.4). Clients do not send EHLO again after AUTH, so the list the proxy shows is what they use against the backend; before AUTH the proxy does not know which backend that is.
 - Limits: the probe is the proxy's own session. Postfix settings that change the list by client address after XCLIENT (`smtpd_discard_ehlo_keyword_address_maps`) are not seen, and a change on the backend shows only after the cache time. While no probe succeeds, the list of the last successful one is used, whatever its age; before the first, no extension is advertised. Fewer extensions than the backend has are always safe: the client uses none of the others.
 - Left out, whatever the backend offers: AUTH and STARTTLS (the proxy's own), XCLIENT and XFORWARD (the proxy's authorisation at the backend), VRFY, EXPN and ETRN, and every extension the proxy has not been checked against (BINARYMIME, REQUIRETLS, …).
 
@@ -289,7 +290,7 @@ The configured server name is used in greetings and in the backend EHLO. It must
 
 ### D-SIEVE-1: SIEVE missing from the pre-TLS greeting while the backend is down
 
-- Behaviour: the plaintext greeting takes the backend's `"SIEVE"` line from the last successful capability probe. The first probe runs at startup. While no probe has succeeded, the greeting waits for one; if that probe fails, the greeting goes out without the line. After a failed probe the next attempt waits 5 s, and greetings in that time also lack it. Once a probe has succeeded, its line is used whatever its age.
+- Behaviour: the plaintext greeting takes the backend's `"SIEVE"` line from the last successful capability probe (with several ManageSieve backends, the extensions all of those have that have answered a probe; missing while none has). The first probe runs at startup. While no probe has succeeded, the greeting waits for one; if that probe fails, the greeting goes out without the line. After a failed probe the next attempt waits 5 s, and greetings in that time also lack it. Once a probe has succeeded, its line is used whatever its age.
 - What the specification says: SIEVE MUST be returned in every capability response (RFC 5804 §1.7).
 - Rationale: the line only goes missing while the backend cannot be reached, and then a login fails anyway with `NO (TRYLATER)`. Inventing a SIEVE list would show the client extensions the backend may not have; holding the greeting until the backend returns would tie up pre-auth slots for the whole outage.
 

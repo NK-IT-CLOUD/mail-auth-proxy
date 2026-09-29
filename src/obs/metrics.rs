@@ -127,6 +127,8 @@ static AUTH_REFUSALS: [[AtomicU64; REFUSAL_REASONS.len()]; N_PROTO] =
 static TOKEN_VALIDATE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static CONNECTIONS_TOTAL: [AtomicU64; N_PROTO] = [const { AtomicU64::new(0) }; N_PROTO];
 static UPSTREAM_FORWARD: [AtomicU64; N_PROTO] = [const { AtomicU64::new(0) }; N_PROTO];
+// route_misses[proto]: credentials no route takes.
+static ROUTE_MISSES: [AtomicU64; N_PROTO] = [const { AtomicU64::new(0) }; N_PROTO];
 static ACTIVE_CONNECTIONS: [AtomicI64; N_PROTO] = [const { AtomicI64::new(0) }; N_PROTO];
 // backend_errors[proto]: backend unreachable or broken while a client waited
 // for its auth verdict (outage, not a failed login).
@@ -245,6 +247,12 @@ pub fn record_token_validate(ok: bool) {
 #[inline]
 pub fn record_upstream_forward(proto: Proto) {
     UPSTREAM_FORWARD[proto.idx()].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a credential that no route takes (an unknown tenant).
+#[inline]
+pub fn record_route_miss(proto: Proto) {
+    ROUTE_MISSES[proto.idx()].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Why a logged-in session ended: the `reason` label of
@@ -748,6 +756,15 @@ fn render() -> String {
         let v = UPSTREAM_FORWARD[p].load(Ordering::Relaxed);
         o.push_str(&format!(
             "mail_auth_proxy_upstream_forward_total{{proto=\"{plabel}\"}} {v}\n"
+        ));
+    }
+
+    o.push_str("# HELP mail_auth_proxy_route_misses_total Credentials that no route takes (refused as unknown_domain).\n");
+    o.push_str("# TYPE mail_auth_proxy_route_misses_total counter\n");
+    for (p, plabel) in PROTO_LABELS.iter().enumerate() {
+        let v = ROUTE_MISSES[p].load(Ordering::Relaxed);
+        o.push_str(&format!(
+            "mail_auth_proxy_route_misses_total{{proto=\"{plabel}\"}} {v}\n"
         ));
     }
 
@@ -1261,6 +1278,7 @@ mod tests {
         );
         record_token_validate(true);
         record_upstream_forward(Proto::Sieve);
+        record_route_miss(Proto::Smtp);
         let g = ConnGuard::open(Proto::Imap);
 
         let out = render();
@@ -1271,6 +1289,7 @@ mod tests {
         assert!(out.contains("mail_auth_proxy_auth_attempts_total{proto=\"imap\",scope=\"internal\",mechanism=\"xoauth2\",result=\"ok\"} 1"));
         assert!(out.contains("mail_auth_proxy_auth_attempts_total{proto=\"smtp\",scope=\"external\",mechanism=\"oauthbearer\",result=\"fail\"} 1"));
         assert!(out.contains("mail_auth_proxy_upstream_forward_total{proto=\"sieve\"} 1"));
+        assert!(out.contains("mail_auth_proxy_route_misses_total{proto=\"smtp\"} 1"));
         assert!(out.contains("mail_auth_proxy_active_connections{proto=\"imap\"} 1"));
         assert!(out.contains("mail_auth_proxy_build_info{version="));
 

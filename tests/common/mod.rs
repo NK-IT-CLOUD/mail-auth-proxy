@@ -1454,6 +1454,23 @@ pub struct Opts {
     pub profiles: [Profile; 3],
     /// `submission.implicit_tls_listen` on `SMTPS_IP` (`Proxy::smtps`).
     pub submissions: bool,
+    /// More mock backends, as `[backends]` entries by name: protocol and
+    /// profile (`Harness::named`).
+    pub named: Vec<(&'static str, Kind, Profile)>,
+    /// The `backend` of the IMAP, submission and ManageSieve sections:
+    /// `None` the section's own mock as an inline table, `Some("")` no
+    /// `backend` key (routes choose), `Some(name)` a `[backends]` name.
+    pub listener_backends: [Option<&'static str>; 3],
+    /// `[[routes]]` tables.
+    pub routes: String,
+}
+
+/// The mock backends a configuration names: those of the three protocol
+/// sections, and the named ones of `Opts::named`.
+#[derive(Clone, Copy)]
+pub struct Mocks<'a> {
+    pub sections: [&'a MockBackend; 3],
+    pub named: &'a [(&'static str, MockBackend)],
 }
 
 /// The profile keys of one backend; `None`: left out of the config. The
@@ -1516,6 +1533,9 @@ impl Default for Opts {
             hostname: HOSTNAME,
             profiles: [Profile::default(); 3],
             submissions: false,
+            named: Vec::new(),
+            listener_backends: [None; 3],
+            routes: String::new(),
         }
     }
 }
@@ -1539,6 +1559,8 @@ pub struct AuthResult {
     pub peer: String,
     pub reason: String,
     pub pwfp: String,
+    /// The backend the credential was sent to, empty if none.
+    pub backend: String,
 }
 
 /// The grok pattern of the shipped CrowdSec parser
@@ -1567,10 +1589,11 @@ pub fn grok_regex() -> regex::Regex {
 }
 
 /// Strict parser for the full line as the binary writes it. Group 10
-/// is the `rule` field, appended after `pwfp`, group 11 `listener`.
+/// is the `rule` field, appended after `pwfp`, group 11 `listener`, group
+/// 12 `backend`.
 fn line_regex() -> regex::Regex {
     regex::Regex::new(
-        r#"^\S+Z +(INFO|WARN) authlog: authresult result="([^"]*)" proto="([^"]*)" scope="([^"]*)" mech=(\S*) user=(\S*) peer=(\S+) reason="([^"]*)" pwfp="([^"]*)" rule="([^"]*)" listener="(imap|submission|submissions|sieve)"$"#,
+        r#"^\S+Z +(INFO|WARN) authlog: authresult result="([^"]*)" proto="([^"]*)" scope="([^"]*)" mech=(\S*) user=(\S*) peer=(\S+) reason="([^"]*)" pwfp="([^"]*)" rule="([^"]*)" listener="(imap|submission|submissions|sieve)" backend="([A-Za-z0-9._-]*)"$"#,
     )
     .unwrap()
 }
@@ -1589,7 +1612,7 @@ pub struct Proxy {
 
 impl Proxy {
     /// Write the config, start the binary and wait until all listeners are up.
-    pub async fn start(pki: &Pki, idp: &Idp, backends: [&MockBackend; 3], opts: &Opts) -> Proxy {
+    pub async fn start(pki: &Pki, idp: &Idp, backends: Mocks<'_>, opts: &Opts) -> Proxy {
         let config = Self::config_text(pki, idp, backends, opts);
         let path = pki.dir.path().join("config.toml");
         std::fs::write(&path, config).unwrap();
@@ -1597,10 +1620,10 @@ impl Proxy {
     }
 
     /// The harness configuration for `opts`.
-    pub fn config_text(pki: &Pki, idp: &Idp, backends: [&MockBackend; 3], opts: &Opts) -> String {
-        let [imap, smtp, sieve] = backends;
+    pub fn config_text(pki: &Pki, idp: &Idp, backends: Mocks<'_>, opts: &Opts) -> String {
+        let [imap, smtp, sieve] = backends.sections;
         let ca = pki.ca_file.display();
-        let backend = |b: &MockBackend, p: &Profile, pp: bool| {
+        let table = |b: &MockBackend, p: &Profile, pp: bool| {
             format!(
                 "{{ address = \"{}\", verify_name = \"{BACKEND_NAME}\", ca_file = \"{ca}\"{} }}",
                 b.addr,
@@ -1608,6 +1631,30 @@ impl Proxy {
             )
         };
         let [imap_p, smtp_p, sieve_p] = &opts.profiles;
+        // The `backend` line of a section.
+        let backend =
+            |i: usize, b: &MockBackend, p: &Profile, pp: bool| match opts.listener_backends[i] {
+                None => format!("backend = {}\n", table(b, p, pp)),
+                Some("") => String::new(),
+                Some(name) => format!("backend = \"{name}\"\n"),
+            };
+        let named: String = opts
+            .named
+            .iter()
+            .map(|(name, kind, profile)| {
+                let (_, mock) = backends
+                    .named
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .expect("a mock for every named backend");
+                format!("{name} = {}\n", table(mock, profile, *kind != Kind::Smtp))
+            })
+            .collect();
+        let named = if named.is_empty() {
+            named
+        } else {
+            format!("[backends]\n{named}")
+        };
         format!(
             r#"config_version = 2
 
@@ -1620,17 +1667,17 @@ key = "{key}"
 {tls_certificates}
 [imap]
 listen = "{IMAP_IP}:0"
-backend = {imap_be}
-
+{imap_be}
 [submission]
 listen = "{SMTP_IP}:0"
-{submissions}backend = {smtp_be}
-xclient = {xclient}
+{submissions}{smtp_be}xclient = {xclient}
 {submission_extra}
 
 [sieve]
 listen = "{SIEVE_IP}:0"
-backend = {sieve_be}
+{sieve_be}
+{named}
+{routes}
 
 [oauth]
 [[oauth.issuers]]
@@ -1667,8 +1714,8 @@ connect_secs = 3
                     k.display()
                 ))
                 .collect::<String>(),
-            imap_be = backend(imap, imap_p, true),
-            smtp_be = backend(smtp, smtp_p, false),
+            imap_be = backend(0, imap, imap_p, true),
+            smtp_be = backend(1, smtp, smtp_p, false),
             xclient = opts.smtp_xclient && smtp_p.client_ip.is_none(),
             submissions = if opts.submissions {
                 format!("implicit_tls_listen = \"{SMTPS_IP}:0\"\n")
@@ -1676,7 +1723,8 @@ connect_secs = 3
                 String::new()
             },
             submission_extra = opts.submission_extra,
-            sieve_be = backend(sieve, sieve_p, true),
+            sieve_be = backend(2, sieve, sieve_p, true),
+            routes = opts.routes,
             jwks = idp.jwks_url(),
             issuer_extra = opts.issuer_extra,
             per_ip = opts.max_preauth_per_ip,
@@ -1864,6 +1912,7 @@ connect_secs = 3
                     peer: g(7),
                     reason: g(8),
                     pwfp: g(9),
+                    backend: g(12),
                 }
             })
             .collect()
@@ -1996,6 +2045,8 @@ pub struct Harness {
     pub imap_be: MockBackend,
     pub smtp_be: MockBackend,
     pub sieve_be: MockBackend,
+    /// The mocks of `Opts::named`, by name.
+    pub named: Vec<(&'static str, MockBackend)>,
     pub proxy: Proxy,
 }
 
@@ -2023,13 +2074,24 @@ impl Harness {
         if opts.smtp_down {
             smtp_be.shutdown().await;
         }
-        let proxy = Proxy::start(&pki, &idp, [&imap_be, &smtp_be, &sieve_be], &opts).await;
+        let mut named = Vec::new();
+        for (name, kind, profile) in &opts.named {
+            let mock =
+                MockBackend::start_mode(*kind, pki.backend.clone(), profile.mode(*kind)).await;
+            named.push((*name, mock));
+        }
+        let mocks = Mocks {
+            sections: [&imap_be, &smtp_be, &sieve_be],
+            named: &named,
+        };
+        let proxy = Proxy::start(&pki, &idp, mocks, &opts).await;
         Harness {
             pki,
             idp,
             imap_be,
             smtp_be,
             sieve_be,
+            named,
             proxy,
         }
     }
@@ -2037,12 +2099,21 @@ impl Harness {
     /// The harness configuration for `opts`, with this harness's PKI, IdP
     /// and backends.
     pub fn config(&self, opts: &Opts) -> String {
-        Proxy::config_text(
-            &self.pki,
-            &self.idp,
-            [&self.imap_be, &self.smtp_be, &self.sieve_be],
-            opts,
-        )
+        let mocks = Mocks {
+            sections: [&self.imap_be, &self.smtp_be, &self.sieve_be],
+            named: &self.named,
+        };
+        Proxy::config_text(&self.pki, &self.idp, mocks, opts)
+    }
+
+    /// The mock of the `[backends]` entry `name` (`Opts::named`).
+    pub fn named(&self, name: &str) -> &MockBackend {
+        &self
+            .named
+            .iter()
+            .find(|(n, _)| *n == name)
+            .unwrap_or_else(|| panic!("no named mock {name}"))
+            .1
     }
 
     pub fn backend(&self, kind: Kind) -> &MockBackend {

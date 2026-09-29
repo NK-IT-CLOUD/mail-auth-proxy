@@ -11,6 +11,7 @@ mod limits;
 mod obs;
 mod proto;
 mod ratelimit;
+mod route;
 pub mod server;
 mod wire;
 

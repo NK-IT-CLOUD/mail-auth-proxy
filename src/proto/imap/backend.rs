@@ -245,7 +245,7 @@ async fn await_auth_ok(
 
 /// The IMAP backend login of one client session.
 pub struct ImapLogin<'a> {
-    pub backend: &'a BackendConn,
+    pub backends: &'a [BackendConn],
     pub tuning: &'a Tuning,
     /// The client's address.
     pub peer: SocketAddr,
@@ -259,24 +259,33 @@ impl BackendLogin for ImapLogin<'_> {
     /// The backend connection and its tagged OK without the tag.
     type Conn = (TlsStream<TcpStream>, String);
 
-    async fn login(&self, credential: BackendCredential<'_>) -> Result<Self::Conn, BackendError> {
+    fn name(&self, index: usize) -> &str {
+        &self.backends[index].id
+    }
+
+    async fn login(
+        &self,
+        index: usize,
+        credential: BackendCredential<'_>,
+    ) -> Result<Self::Conn, BackendError> {
+        let backend = &self.backends[index];
         match credential {
             // The same token the client presented, for its verified identity.
             BackendCredential::Token {
                 identity, issuer, ..
             } => {
-                tracing::info!(target: crate::obs::target::MAIN, peer = %self.peer, user = %sanitize(identity), mech = %self.mech, issuer = %issuer, "oauth validated; proxying to backend");
+                tracing::info!(target: crate::obs::target::MAIN, peer = %self.peer, user = %sanitize(identity), mech = %self.mech, backend = %backend.id, issuer = %issuer, "oauth validated; proxying to backend");
             }
             // The client's own password; the backend validates it (the proxy
             // never holds a master credential). Never log the password.
             BackendCredential::Password { user, .. } => {
-                tracing::info!(target: crate::obs::target::MAIN, peer = %self.peer, user = %sanitize(user), mech = %self.mech, issuer = %"", "password auth; forwarding to backend");
+                tracing::info!(target: crate::obs::target::MAIN, peer = %self.peer, user = %sanitize(user), mech = %self.mech, backend = %backend.id, issuer = %"", "password auth; forwarding to backend");
             }
         }
-        let fwd = credential.forward(self.backend);
+        let fwd = credential.forward(backend);
         let (mech, response) = (fwd.mech, &fwd.response);
         let (mut stream, sasl_ir) =
-            connect_tls(self.backend, self.peer, self.local, self.tuning).await?;
+            connect_tls(backend, self.peer, self.local, self.tuning).await?;
         if sasl_ir {
             // `concat` sizes the line once; it is zeroized on drop like the
             // response.

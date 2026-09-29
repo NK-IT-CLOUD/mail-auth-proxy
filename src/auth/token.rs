@@ -97,6 +97,8 @@ pub struct Validated {
     /// The configured issuer whose key verified the token: the token's `iss`,
     /// since each key is accepted only with the issuer that published it.
     pub issuer: String,
+    /// The token's `aud` values (a string or an array of strings).
+    pub audiences: Vec<String>,
 }
 
 /// The token rules of one issuer (compiled from `config::Issuer`).
@@ -735,6 +737,7 @@ impl Validator {
                         Validated {
                             identity,
                             issuer: e.policy.issuer.clone(),
+                            audiences: audiences(&data.claims),
                         }
                     })
                 }
@@ -745,6 +748,20 @@ impl Validator {
             Some(e) => invalid!("{}", error_kind(e.kind())),
             None => invalid!("no usable key for kid"),
         })
+    }
+}
+
+/// The `aud` claim as a list: a string, or the strings of an array (RFC
+/// 7519 §4.1.3). jsonwebtoken has checked that one is accepted.
+fn audiences(claims: &Map<String, Value>) -> Vec<String> {
+    match claims.get("aud") {
+        Some(Value::String(a)) => vec![a.clone()],
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -1037,7 +1054,8 @@ mod tests {
                 v.verify(tok).unwrap(),
                 Validated {
                     identity: identity.into(),
-                    issuer: issuer.into()
+                    issuer: issuer.into(),
+                    audiences: vec!["dovecot".into()],
                 }
             );
         }

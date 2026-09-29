@@ -6,8 +6,9 @@
 //! parser can anchor reliably. Fields: result, proto, scope
 //! (internal/external), mech, user, peer (source IP), reason, pwfp, rule (the
 //! legacy rule that decided, empty otherwise), listener (`imap`,
-//! `submission`, `submissions`, `sieve`). New fields are only ever appended
-//! at the end.
+//! `submission`, `submissions`, `sieve`), backend (the backend the
+//! credential was sent to, empty otherwise). New fields are only ever
+//! appended at the end.
 //!
 //! - The attempted password is never logged. Only a truncated HMAC-SHA256
 //!   fingerprint (`pwfp`, keyed per process) is, to correlate password
@@ -163,6 +164,9 @@ pub struct AuthEvent<'a> {
     pub rule: &'a str,
     /// The listener the client connected to.
     pub listener: Listener,
+    /// The backend the credential was sent to (its name), or empty when it
+    /// was not sent.
+    pub backend: &'a str,
 }
 
 impl AuthEvent<'_> {
@@ -182,12 +186,14 @@ impl AuthEvent<'_> {
         // parsed.
         let rule = sanitize(self.rule);
         let listener = self.listener.label();
+        // A configured name; sanitised anyway, the field is parsed.
+        let backend = sanitize(self.backend);
         if self.reason == Reason::Ok {
             tracing::info!(target: "authlog",
-                result = "ok", proto, scope, mech = %mech, user = %user, peer = %peer, reason, pwfp, rule = rule.as_str(), listener, "authresult");
+                result = "ok", proto, scope, mech = %mech, user = %user, peer = %peer, reason, pwfp, rule = rule.as_str(), listener, backend = backend.as_str(), "authresult");
         } else {
             tracing::warn!(target: "authlog",
-                result = "fail", proto, scope, mech = %mech, user = %user, peer = %peer, reason, pwfp, rule = rule.as_str(), listener, "authresult");
+                result = "fail", proto, scope, mech = %mech, user = %user, peer = %peer, reason, pwfp, rule = rule.as_str(), listener, backend = backend.as_str(), "authresult");
         }
     }
 }
@@ -280,6 +286,7 @@ mod tests {
                 pwfp: "",
                 rule: "",
                 listener: Listener::Imap,
+                backend: "",
             }
             .record();
         });
