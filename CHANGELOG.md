@@ -23,6 +23,10 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `mail_auth_proxy_backend_failovers_total{backend}` and
   `mail_auth_proxy_backend_sessions_total{proto,backend}`; label values come from the
   configuration only.
+- The account check per backend: `account_check = "none" | "doveadm"` with the backend's
+  own `doveadm_url`, `doveadm_key_file` and `doveadm_ca_file`. A password routed to the
+  backend is checked that way; a backend without its own uses `[legacy]`'s. A protocol with
+  several backends where one inherits `legacy.account_check = "doveadm"` gives a warning.
 
 ## [0.4.0] - 2026-09-29
 

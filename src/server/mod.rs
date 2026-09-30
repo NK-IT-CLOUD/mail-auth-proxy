@@ -225,7 +225,30 @@ impl Generation {
         .with_backends(Protocol::ALL.into_iter().flat_map(|p| {
             let proto = proto_of(p);
             cfg.backends_of(p).into_iter().map(move |u| (proto, u.name))
-        }));
+        }))
+        .with_account_checks({
+            let mut checks = Vec::new();
+            for p in Protocol::ALL {
+                for u in cfg.backends_of(p) {
+                    let key = u.key();
+                    let Some(a) = u.backend.account_check_at(&key) else {
+                        continue;
+                    };
+                    let check = match a.check {
+                        config::AccountCheck::None => None,
+                        config::AccountCheck::Doveadm => Some(
+                            crate::auth::account::Doveadm::new(
+                                a,
+                                std::time::Duration::from_secs(cfg.timeouts.connect_secs),
+                            )
+                            .with_context(|| key.clone())?,
+                        ),
+                    };
+                    checks.push((proto_of(p), u.name, check));
+                }
+            }
+            checks
+        });
         let keepalive = keepalive(&cfg.session);
         // Each backend a pool of its addresses. A backend that stays (same
         // name) keeps its counters, and each address it keeps its health.
@@ -558,6 +581,21 @@ fn spawn_checks<F, Fut>(
     });
 }
 
+/// Every backend table with its key: the inline ones, then every named one.
+fn backend_tables(cfg: &config::Config) -> Vec<(String, &config::Backend)> {
+    Protocol::ALL
+        .into_iter()
+        .flat_map(|p| cfg.backends_of(p))
+        .filter(|u| u.inline)
+        .map(|u| (u.key(), u.backend))
+        .chain(
+            cfg.backends
+                .iter()
+                .map(|(name, b)| (format!("backends.{name}"), b)),
+        )
+        .collect()
+}
+
 /// The metrics protocol of a configuration protocol.
 fn proto_of(p: Protocol) -> metrics::Proto {
     match p {
@@ -607,18 +645,7 @@ pub fn file_problems(cfg: &config::Config) -> Vec<String> {
             }
         }
     }
-    // The inline backends, then every named one (used or not).
-    let backends = Protocol::ALL
-        .into_iter()
-        .flat_map(|p| cfg.backends_of(p))
-        .filter(|u| u.inline)
-        .map(|u| (u.key(), u.backend))
-        .chain(
-            cfg.backends
-                .iter()
-                .map(|(name, b)| (format!("backends.{name}"), b)),
-        );
-    for (key, b) in backends {
+    for (key, b) in backend_tables(cfg) {
         if let Some(ca) = b.ca_file.as_deref().filter(|p| !p.is_empty()) {
             if let Err(e) = tls::backend_connector(Some(ca)) {
                 out.push(format!("{key}.ca_file: {e:#}"));
@@ -656,7 +683,15 @@ pub fn file_problems(cfg: &config::Config) -> Vec<String> {
             out.push(format!("{name}: {path}: {e:#}"));
         }
     }
-    out.extend(crate::auth::account::file_problems(&cfg.legacy));
+    out.extend(crate::auth::account::file_problems(
+        cfg.legacy.account_check_ref(),
+    ));
+    // The account checks of the backends, each once.
+    for (key, b) in backend_tables(cfg) {
+        if let Some(a) = b.account_check_at(&key) {
+            out.extend(crate::auth::account::file_problems(a));
+        }
+    }
     out
 }
 

@@ -2,8 +2,8 @@
 //! the short forms into what the rest of the program reads.
 
 use super::{
-    AccountCheck, AuthRateLimit, Backend, BackendRef, BackendTls, ClientIp, Config, Legacy,
-    Protocol, Route, Rule, Session, TokenType, PASSWORD_GATE_RULE,
+    AccountCheck, AccountCheckRef, AuthRateLimit, Backend, BackendRef, BackendTls, ClientIp,
+    Config, Legacy, Protocol, Route, Rule, Session, TokenType, PASSWORD_GATE_RULE,
 };
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -443,7 +443,19 @@ impl Config {
                 )),
             }
             let submission = protocol == Protocol::Submission;
-            for used in self.backends_of(protocol) {
+            // One doveadm for several backends checks every account against
+            // one mail system: another's accounts would all be unknown.
+            let used = self.backends_of(protocol);
+            if used.len() > 1 && self.legacy.account_check == AccountCheck::Doveadm {
+                for u in used.iter().filter(|u| u.backend.account_check.is_none()) {
+                    warnings.push(format!(
+                        "{}: uses legacy.account_check = \"doveadm\" although [{section}] has {} backends; set account_check on each backend",
+                        u.key(),
+                        used.len()
+                    ));
+                }
+            }
+            for used in used {
                 if !used.inline {
                     match users.insert(used.name, protocol) {
                         Some(other) if other != protocol => err(format!(
@@ -591,6 +603,40 @@ impl Config {
     }
 }
 
+/// An account check: `doveadm` needs its URL and key file, `none` none of
+/// the `doveadm_*` keys.
+fn check_account(a: AccountCheckRef<'_>, err: &mut impl FnMut(String)) {
+    let at = a.at;
+    match a.check {
+        AccountCheck::Doveadm => {
+            match a.url {
+                None => err(format!(
+                    "{at}.doveadm_url is required with account_check = \"doveadm\""
+                )),
+                Some(u) => {
+                    if let Err(e) = check_service_url(u) {
+                        err(format!("{at}.doveadm_url: {e}"));
+                    }
+                }
+            }
+            match a.key_file {
+                None => err(format!(
+                    "{at}.doveadm_key_file is required with account_check = \"doveadm\""
+                )),
+                key => check_path(&format!("{at}.doveadm_key_file"), key, err),
+            }
+            check_path(&format!("{at}.doveadm_ca_file"), a.ca_file, err);
+        }
+        AccountCheck::None => {
+            if a.url.is_some() || a.key_file.is_some() || a.ca_file.is_some() {
+                err(format!(
+                    "{at}.doveadm_* is set but account_check is not \"doveadm\""
+                ));
+            }
+        }
+    }
+}
+
 /// The protocol's backend TLS when the profile does not say.
 fn default_tls(protocol: Protocol) -> BackendTls {
     match protocol {
@@ -599,9 +645,17 @@ fn default_tls(protocol: Protocol) -> BackendTls {
     }
 }
 
-/// `address`, `verify_name` and `ca_file` of the backend at `key`.
+/// `address`, `verify_name`, `ca_file` and the account check of the backend
+/// at `key`.
 fn check_backend_address(key: &str, b: &Backend, err: &mut impl FnMut(String)) {
     check_path(&format!("{key}.ca_file"), b.ca_file.as_deref(), err);
+    match b.account_check_at(key) {
+        Some(a) => check_account(a, err),
+        None if b.has_doveadm_keys() => err(format!(
+            "{key}.doveadm_* is set but account_check is not \"doveadm\""
+        )),
+        None => {}
+    }
     let list: Vec<(String, &str)> = match (b.address.is_empty(), b.addresses.is_empty()) {
         (false, true) => vec![(format!("{key}.address"), b.address.as_str())],
         (true, false) => b
@@ -784,40 +838,7 @@ impl Legacy {
             }
         }
         check_path("legacy.domains_file", self.domains_file.as_deref(), err);
-        match self.account_check {
-            AccountCheck::Doveadm => {
-                match self.doveadm_url.as_deref() {
-                    None => err(
-                        "legacy.doveadm_url is required with account_check = \"doveadm\"".into(),
-                    ),
-                    Some(u) => {
-                        if let Err(e) = check_service_url(u) {
-                            err(format!("legacy.doveadm_url: {e}"));
-                        }
-                    }
-                }
-                match self.doveadm_key_file.as_deref() {
-                    None => err(
-                        "legacy.doveadm_key_file is required with account_check = \"doveadm\""
-                            .into(),
-                    ),
-                    key => check_path("legacy.doveadm_key_file", key, err),
-                }
-                check_path(
-                    "legacy.doveadm_ca_file",
-                    self.doveadm_ca_file.as_deref(),
-                    err,
-                );
-            }
-            AccountCheck::None => {
-                if self.doveadm_url.is_some()
-                    || self.doveadm_key_file.is_some()
-                    || self.doveadm_ca_file.is_some()
-                {
-                    err("legacy.doveadm_* is set but account_check is not \"doveadm\"".into());
-                }
-            }
-        }
+        check_account(self.account_check_ref(), err);
         if let Some(t) = &self.throttle {
             if t.failures == 0 || t.window_secs == 0 {
                 err("legacy.throttle: failures and window_secs must be at least 1".into());
@@ -2263,5 +2284,39 @@ mod tests {
         }
         let bad = pool("addresses = [\"192.0.2.10:993\"], strategy = \"random\"");
         assert!(crate::config::parse(&bad).is_err(), "unknown strategy");
+    }
+
+    /// A backend's own account check: `doveadm` needs its URL and key file,
+    /// `none` no `doveadm_*`, and `doveadm_*` without `account_check` is an
+    /// error; the printed form keeps it.
+    #[test]
+    fn backend_account_check() {
+        let with = |keys: &str| {
+            V2.replace(
+                "client_ip = \"proxy_v2\" }",
+                &format!("client_ip = \"proxy_v2\"{keys} }}"),
+            )
+        };
+        let good = with(", account_check = \"doveadm\", doveadm_url = \"https://127.0.0.1/doveadm/v1\", doveadm_key_file = \"/k\"");
+        let l = parse(&good).unwrap();
+        let again = parse(&toml::to_string(&l.config).unwrap()).unwrap();
+        assert_eq!(again.config.imap.backend, l.config.imap.backend);
+        assert!(parse(&with(", account_check = \"none\"")).is_ok());
+        // One check for all the addresses of a pool.
+        let pool = good.replace(
+            "address = \"192.0.2.10:993\"",
+            "addresses = [\"192.0.2.10:993\", \"192.0.2.11:993\"]",
+        );
+        assert!(parse(&pool).is_ok());
+        for (keys, expect) in [
+            (", account_check = \"doveadm\"", "imap.backend.doveadm_url is required with account_check = \"doveadm\""),
+            (", account_check = \"doveadm\", doveadm_url = \"http://mail.example.org/v1\", doveadm_key_file = \"/k\"", "imap.backend.doveadm_url:"),
+            (", account_check = \"doveadm\", doveadm_url = \"https://127.0.0.1/v1\", doveadm_key_file = \"k\"", "imap.backend.doveadm_key_file"),
+            (", account_check = \"none\", doveadm_url = \"https://127.0.0.1/v1\"", "imap.backend.doveadm_* is set but account_check is not \"doveadm\""),
+            (", doveadm_key_file = \"/k\"", "imap.backend.doveadm_* is set but account_check is not \"doveadm\""),
+        ] {
+            let e = errors_of(&with(keys));
+            assert!(e.contains(expect), "want {expect:?}, got {e}");
+        }
     }
 }

@@ -1496,6 +1496,8 @@ pub struct Profile {
     pub client_ip: Option<&'static str>,
     pub tls: Option<&'static str>,
     pub auth_forward: Option<&'static str>,
+    /// More keys of the backend's table, e.g. `account_check = "none"`.
+    pub extra: &'static str,
 }
 
 impl Profile {
@@ -1520,6 +1522,10 @@ impl Profile {
             if let Some(v) = v {
                 k.push_str(&format!(", {key} = \"{v}\""));
             }
+        }
+        if !self.extra.is_empty() {
+            k.push_str(", ");
+            k.push_str(self.extra);
         }
         k
     }

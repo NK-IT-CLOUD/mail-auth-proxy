@@ -98,7 +98,7 @@ A password the client has sent is always parsed, even when its mechanism is not 
 | 1 | a rule matches connection, mechanism and user (`users`, `users_file`: `user@domain` or `*@domain`; the local part is compared exactly, the domain ignoring ASCII case). The first matching rule in file order decides and is logged. | `blocked_endpoint` |
 | 2 | the login's domain is in `allowed_domains` ∪ `domains_file` (only if either is set; a login without `@domain` fails) | `unknown_domain` |
 | 2b | a route takes the login's domain ([configuration: routes](configuration.md#routes); without `[[routes]]` always) | `unknown_domain` |
-| 3 | the account exists (`account_check = "doveadm"`) | `unknown_account` |
+| 3 | the account exists (`account_check = "doveadm"` of the backend the route chose, else of `[legacy]`) | `unknown_account` |
 | 4 | the account is not throttled (`throttle`) | `throttled` |
 | | the backend checks the password; a protocol error in direct answer to the password (SMTP `500` to `509` after the response to `334`, IMAP tagged `BAD`) also counts as a rejection; a reply to the bare SMTP `AUTH` line, an IMAP `* BYE` or a ManageSieve `BYE` (other than `AUTH-TOO-WEAK`, `TRANSITION-NEEDED`) is an outage | `backend_reject` |
 
@@ -118,6 +118,8 @@ The log still keeps the cases apart (`reason`, `rule`).
 Keep the backend's own failure delay enabled behind the proxy (Dovecot `auth_failure_delay`): it slows down guessing at the backend, and the proxy pads its refusals to it. After a start, until the proxy has seen backend rejections of a protocol, refusals use `failure_delay_ms` alone, so set it close to the backend's delay.
 
 ### Account check
+
+Each backend may set its own `account_check` (and `doveadm_*`); a password routed to it is checked that way, `none` meaning no check. A backend without one uses `[legacy]`'s. One doveadm for several mail systems would refuse the accounts of all but its own.
 
 A userdb lookup over the Dovecot doveadm HTTP API (Dovecot 2.4): `POST <doveadm_url>` with `Authorization: X-Dovecot-API <base64 of the API key>` and `[["user", {"userMask": "<login>", "userdbOnly": true}, "u"]]`. `doveadmResponse` means the user exists; `error` with `exitCode` 67 (EX_NOUSER) means it does not.
 

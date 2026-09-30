@@ -153,6 +153,29 @@ pub struct Backend {
     /// shows `client_ip`.
     #[serde(default, skip_serializing)]
     pub proxy_protocol: bool,
+    /// The legacy gate's account check for logins routed to this backend:
+    /// `none`, or `doveadm` with this backend's `doveadm_*`. Unset: that of
+    /// `[legacy]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_check: Option<AccountCheck>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doveadm_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doveadm_key_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doveadm_ca_file: Option<String>,
+}
+
+/// An account check as configured: in `[legacy]` or on a backend.
+#[derive(Debug, Clone, Copy)]
+pub struct AccountCheckRef<'a> {
+    /// Where it is configured, the prefix of its keys: `legacy`,
+    /// `backends.<name>`, `imap.backend`.
+    pub at: &'a str,
+    pub check: AccountCheck,
+    pub url: Option<&'a str>,
+    pub key_file: Option<&'a str>,
+    pub ca_file: Option<&'a str>,
 }
 
 impl Backend {
@@ -163,6 +186,24 @@ impl Backend {
         } else {
             self.addresses.iter().map(String::as_str).collect()
         }
+    }
+
+    /// Its own account check at `at` (its key), if it sets one.
+    pub fn account_check_at<'a>(&'a self, at: &'a str) -> Option<AccountCheckRef<'a>> {
+        self.account_check.map(|check| AccountCheckRef {
+            at,
+            check,
+            url: self.doveadm_url.as_deref(),
+            key_file: self.doveadm_key_file.as_deref(),
+            ca_file: self.doveadm_ca_file.as_deref(),
+        })
+    }
+
+    /// Whether any `doveadm_*` key is set.
+    pub fn has_doveadm_keys(&self) -> bool {
+        self.doveadm_url.is_some()
+            || self.doveadm_key_file.is_some()
+            || self.doveadm_ca_file.is_some()
     }
 
     /// `client_ip` with its default applied; `xclient` is
@@ -670,6 +711,17 @@ impl Legacy {
             || self.doveadm_ca_file.is_some()
             || self.throttle.is_some()
             || self.failure_delay_ms != default_failure_delay_ms()
+    }
+
+    /// Its account check.
+    pub fn account_check_ref(&self) -> AccountCheckRef<'_> {
+        AccountCheckRef {
+            at: "legacy",
+            check: self.account_check,
+            url: self.doveadm_url.as_deref(),
+            key_file: self.doveadm_key_file.as_deref(),
+            ca_file: self.doveadm_ca_file.as_deref(),
+        }
     }
 
     /// A domain gate is configured.

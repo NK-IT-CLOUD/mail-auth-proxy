@@ -509,7 +509,11 @@ pub struct Gate {
     /// Recent rejection latencies of each backend, for refusal timing
     /// (`with_backends`).
     reject_latency: Vec<Latencies>,
-    account: Option<Doveadm>,
+    /// The account check of `[legacy]`, for backends without their own.
+    account: Option<Arc<Doveadm>>,
+    /// Backends with an account check of their own (`with_account_checks`):
+    /// protocol index, backend name, the check (`None`: none).
+    accounts: Vec<(usize, String, Option<Arc<Doveadm>>)>,
     throttle: Option<Throttle>,
     /// Minimum time from the credential to the reply of a failed legacy login.
     pub failure_delay: Duration,
@@ -558,7 +562,10 @@ impl Gate {
         };
         let account = match cfg.account_check {
             config::AccountCheck::None => None,
-            config::AccountCheck::Doveadm => Some(Doveadm::new(cfg, connect_timeout)?),
+            config::AccountCheck::Doveadm => Some(Arc::new(Doveadm::new(
+                cfg.account_check_ref(),
+                connect_timeout,
+            )?)),
         };
         let files = rules
             .iter()
@@ -571,6 +578,7 @@ impl Gate {
             files,
             reject_latency: Vec::new(),
             account,
+            accounts: Vec::new(),
             throttle: cfg.throttle.as_ref().map(|t| Throttle {
                 failures: t.failures,
                 window: Duration::from_secs(t.window_secs),
@@ -596,6 +604,33 @@ impl Gate {
             })
             .collect();
         self
+    }
+
+    /// The backends with an account check of their own, by protocol and
+    /// name: their check (`None`: none) replaces `[legacy]`'s for logins
+    /// routed to them.
+    pub fn with_account_checks<'n>(
+        mut self,
+        checks: impl IntoIterator<Item = (Proto, &'n str, Option<Doveadm>)>,
+    ) -> Gate {
+        self.accounts = checks
+            .into_iter()
+            .map(|(p, b, c)| (proto_index(p), b.to_owned(), c.map(Arc::new)))
+            .collect();
+        self
+    }
+
+    /// The account check of logins routed to `backend` of protocol `proto`
+    /// (`proto_index`): its own, else `[legacy]`'s.
+    fn account_check(&self, proto: usize, backend: &str) -> Option<&Doveadm> {
+        match self
+            .accounts
+            .iter()
+            .find(|(p, b, _)| *p == proto && b == backend)
+        {
+            Some((.., own)) => own.as_deref(),
+            None => self.account.as_deref(),
+        }
     }
 
     /// Take over the running state of the gate `old` (a configuration
@@ -773,6 +808,7 @@ impl Gate {
         user: &str,
         backend: Option<(usize, &'a str)>,
     ) -> Verdict<'a> {
+        let slot = proto_index(proto);
         let proto = protocol(proto);
         // Logins the proxy never looks up or counts: empty, too long for a
         // mailbox name, with control characters, or with more than one `@`
@@ -848,8 +884,8 @@ impl Gate {
                 no_route: true,
             };
         };
-        // 3. Account.
-        if let Some(a) = &self.account {
+        // 3. Account, as the backend the login goes to checks it.
+        if let Some(a) = self.account_check(slot, backend.1) {
             match a.exists(user).await {
                 Ok(true) => {}
                 Ok(false) => return deny_for_backend(Reason::UnknownAccount),

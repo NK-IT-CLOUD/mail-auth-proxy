@@ -49,22 +49,23 @@ pub struct Doveadm {
 }
 
 impl Doveadm {
-    pub fn new(cfg: &config::Legacy, timeout: Duration) -> Result<Doveadm> {
-        let url = cfg
-            .doveadm_url
-            .clone()
-            .ok_or_else(|| anyhow!("legacy.doveadm_url is missing"))?;
-        config::check_service_url(&url).map_err(|e| anyhow!("legacy.doveadm_url: {e}"))?;
-        let key_file = cfg
-            .doveadm_key_file
-            .as_deref()
-            .ok_or_else(|| anyhow!("legacy.doveadm_key_file is missing"))?;
+    /// The doveadm check configured at `a` (`[legacy]` or a backend).
+    pub fn new(a: config::AccountCheckRef<'_>, timeout: Duration) -> Result<Doveadm> {
+        let at = a.at;
+        let url = a
+            .url
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("{at}.doveadm_url is missing"))?;
+        config::check_service_url(&url).map_err(|e| anyhow!("{at}.doveadm_url: {e}"))?;
+        let key_file = a
+            .key_file
+            .ok_or_else(|| anyhow!("{at}.doveadm_key_file is missing"))?;
         let key = read_key(key_file)?;
         // No redirects: the key must reach exactly the configured endpoint.
         let mut builder = reqwest::Client::builder()
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none());
-        if let Some(ca) = &cfg.doveadm_ca_file {
+        if let Some(ca) = a.ca_file {
             builder = builder.tls_certs_only(read_ca(ca)?);
         }
         Ok(Doveadm {
@@ -189,22 +190,23 @@ fn read_ca(path: &str) -> Result<Vec<reqwest::Certificate>> {
     Ok(certs)
 }
 
-/// File problems of the account check (key and CA file), for
+/// File problems of an account check (key and CA file), for
 /// `--check-config`. An empty path is a configuration error, reported by
 /// validation, and skipped here.
-pub fn file_problems(cfg: &config::Legacy) -> Vec<String> {
+pub fn file_problems(a: config::AccountCheckRef<'_>) -> Vec<String> {
     let mut out = Vec::new();
-    if cfg.account_check != config::AccountCheck::Doveadm {
+    if a.check != config::AccountCheck::Doveadm {
         return out;
     }
-    if let Some(k) = cfg.doveadm_key_file.as_deref().filter(|p| !p.is_empty()) {
+    let at = a.at;
+    if let Some(k) = a.key_file.filter(|p| !p.is_empty()) {
         if let Err(e) = read_key(k) {
-            out.push(format!("legacy.doveadm_key_file: {e:#}"));
+            out.push(format!("{at}.doveadm_key_file: {e:#}"));
         }
     }
-    if let Some(ca) = cfg.doveadm_ca_file.as_deref().filter(|p| !p.is_empty()) {
+    if let Some(ca) = a.ca_file.filter(|p| !p.is_empty()) {
         if let Err(e) = read_ca(ca) {
-            out.push(format!("legacy.doveadm_ca_file: {e:#}"));
+            out.push(format!("{at}.doveadm_ca_file: {e:#}"));
         }
     }
     out

@@ -192,6 +192,8 @@ key over (`yes`) or it needs a restart ([Reload](#reload)).
 | backend `.auth_forward` | `xoauth2` \| `oauthbearer` | `xoauth2` | yes | the SASL mechanism a validated token is forwarded with, whatever the client used. `oauthbearer` (RFC 7628): the verified identity as GS2 authzid, the backend's `verify_name` (or host of `address`) as `host` and its port as `port`. Passwords always go as PLAIN |
 | backend `.client_ip` | `proxy_v2` \| `xclient` \| `none` | from the short forms, else `none` | yes | how the backend learns the client address: a PROXY protocol v2 header before anything else (the backend listener must require it; the proxy's own probe connections send a LOCAL header), the SMTP XCLIENT command (submission only, sent when the backend advertises it), or nothing. With `none` the backend sees the proxy's address for every client: its per-address rate limits, bans and logs treat all clients as one, and a ban there locks everyone out; warning. A submission backend that advertises XCLIENT to the proxy while `client_ip` is not `xclient` is a misconfiguration: every login is an outage (454) until it is set or the proxy is removed from `smtpd_authorized_xclient_hosts`, because the client could otherwise send its own XCLIENT after login |
 | backend `.proxy_protocol` | bool | `false` | yes | short form of `client_ip = "proxy_v2"`; `--print-config` shows `client_ip` |
+| backend `.account_check` | `none` \| `doveadm` | that of `[legacy]` | yes | the legacy gate's account check for passwords routed to this backend: none, or a doveadm userdb lookup with this backend's `doveadm_url`, `doveadm_key_file` and `doveadm_ca_file` (the same rules as the `legacy.doveadm_*` keys), one for all the backend's `addresses`. With several backends behind a protocol, one that inherits `legacy.account_check = "doveadm"` gives a warning: that doveadm would judge the other mail systems' accounts too |
+| backend `.doveadm_url`, `.doveadm_key_file`, `.doveadm_ca_file` | | none | yes | as `legacy.doveadm_*`, for the backend's own `account_check = "doveadm"` |
 | `oauth.refresh_secs` | integer | 300 | yes | periodic JWKS refresh; 1-86400. Unknown key ids trigger a refresh sooner, but a key removed from the JWKS is dropped only by this one |
 | `oauth.leeway_secs` | integer | 60 | yes | clock skew on `exp`/`nbf`; 0-300 (RFC 7519 §4.1.4 allows a small leeway, "usually no more than a few minutes") |
 | `oauth.issuers[].issuer` | string | required | yes | exact `iss`; keys from this issuer's JWKS are accepted only with it |
@@ -218,7 +220,7 @@ key over (`yes`) or it needs a restart ([Reload](#reload)).
 | `legacy.rules[].public` | bool | `false` | yes | required when `networks` contain a public range (anything but RFC 1918, loopback, link-local, ULA; `0.0.0.0/0` and `::/0` included) and the rule has no `users`/`users_file`; gives a warning |
 | `legacy.allowed_domains` | array | none | yes | domains whose logins may use passwords |
 | `legacy.domains_file` | path | none | yes | more allowed domains, one per line, `#` comments; re-read on change |
-| `legacy.account_check` | `none` \| `doveadm` | `none` | yes | check that the account exists before the password is forwarded |
+| `legacy.account_check` | `none` \| `doveadm` | `none` | yes | check that the account exists before the password is forwarded; for every backend that sets no `account_check` of its own |
 | `legacy.doveadm_url` | URL | required with `doveadm` | yes | doveadm HTTP API endpoint (`…/doveadm/v1`); https, http only for localhost; no `user:password@` |
 | `legacy.doveadm_key_file` | path | required with `doveadm` | yes | file with the `doveadm_api_key` |
 | `legacy.doveadm_ca_file` | path | system store | yes | PEM CAs for the doveadm certificate |
@@ -333,6 +335,11 @@ logins and the SMTP and ManageSieve capability probes are the checks; with
 tried only after all that are up have failed, and by one login or check at a time; when
 every address is down and each is being tried, a login gets the retry-later reply at once.
 Without active checks a standby that came back shows as down until a login needs it.
+
+The account check belongs to the backend, not to an address: one `account_check` and one
+`doveadm_url` for all its addresses, which serve the same mailboxes from one userdb. The
+doveadm endpoint is not part of the pool: it is neither failed over nor health-checked, and
+while it is unreachable password logins to the backend are outages.
 
 A reload keeps the health of each address the backend keeps, and the counters of a backend
 that keeps its name.
