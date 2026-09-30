@@ -2,6 +2,7 @@
 //! backend login, then a byte relay.
 
 mod backend;
+pub(crate) use backend::check;
 pub(crate) mod preauth;
 
 use crate::auth::discovery::{self, Answer};
@@ -9,7 +10,7 @@ use crate::auth::token::TokenError;
 use crate::auth::{self, refused, sasl};
 use crate::limits;
 use crate::obs::metrics;
-use crate::server::{BackendConn, Ctx};
+use crate::server::Ctx;
 use crate::wire;
 use anyhow::Result;
 use preauth::read_client_auth;
@@ -23,7 +24,7 @@ pub struct Imap {
     /// TLS with ALPN `imap`.
     pub acceptor: crate::server::tls::Acceptor,
     /// Every backend a credential can be routed to (`route::Pick::index`).
-    pub backends: Vec<BackendConn>,
+    pub backends: Vec<crate::pool::Pool>,
 }
 
 pub async fn handle(

@@ -216,9 +216,10 @@ JWKS handling:
 ## Backend TLS
 
 - Each backend has its own trust anchors: the CAs in its `ca_file`, or the system store (`rustls-native-certs`, which also honours `SSL_CERT_FILE`/`SSL_CERT_DIR`). Certificate verification cannot be turned off.
-- The name verified is the backend's `verify_name`, or the host part of its `address`.
+- The name verified is the backend's `verify_name`, or the host part of each address.
 - `tls = "implicit"` starts the handshake on the new connection; `tls = "starttls"` reads the plaintext greeting, sends the protocol's STARTTLS and starts the handshake after the backend's go-ahead. Nothing the backend sent before TLS is used afterwards: IMAP and ManageSieve capabilities, and the SMTP EHLO extensions, are read again over TLS (RFC 9051 §6.2.1, RFC 5804 §2.2, RFC 3207 §4.2). The line reader takes one byte at a time, so no byte after the go-ahead is read as plaintext.
 - TCP connect and TLS handshake each have a `timeouts.connect_secs` timeout (default 10 s).
+- A backend with several `addresses` is a pool: a login moves to the next address only while no credential has been sent, and a temporary failure after the credential is an outage of that login ([configuration: backend pools](configuration.md#backend-pools)).
 
 ## Client address: PROXY protocol v2, XCLIENT, none
 

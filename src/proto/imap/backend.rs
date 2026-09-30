@@ -22,8 +22,9 @@ use zeroize::Zeroizing;
 const MAX_AUTH_LINES: usize = 32;
 
 /// Connect and secure the connection as the backend's `tls` says, then
-/// read what it offers. Also returns whether its capabilities include
-/// SASL-IR.
+/// read what it offers: the stream and its capabilities. `origin` is the
+/// client's `(address, local address)` for the PROXY header, `None` for the
+/// proxy's own check.
 ///
 /// Implicit TLS: the greeting comes over TLS; its CAPABILITY code, if any,
 /// is the list (without one: no SASL-IR). STARTTLS (RFC 9051 §6.2.1): the
@@ -31,13 +32,11 @@ const MAX_AUTH_LINES: usize = 32;
 /// `P0 CAPABILITY`: what the server said before TLS is discarded.
 async fn connect_tls(
     backend: &BackendConn,
-    client: SocketAddr,
-    local: SocketAddr,
+    origin: Option<(SocketAddr, SocketAddr)>,
     tuning: &Tuning,
-) -> Result<(TlsStream<TcpStream>, bool)> {
-    let mut tcp =
-        connect::connect(backend, Some((client, local)), tuning.connect, "backend").await?;
-    let (stream, caps) = match backend.tls_mode {
+) -> Result<(TlsStream<TcpStream>, Vec<String>)> {
+    let mut tcp = connect::connect(backend, origin, tuning.connect, "backend").await?;
+    match backend.tls_mode {
         BackendTls::Implicit => {
             let mut stream = connect::tls(backend, tcp, tuning.connect, "backend").await?;
             let greeting = read_line(&mut stream, tuning.idle).await?;
@@ -47,7 +46,7 @@ async fn connect_tls(
                 .into_iter()
                 .map(str::to_string)
                 .collect();
-            (stream, caps)
+            Ok((stream, caps))
         }
         BackendTls::Starttls => {
             let greeting = read_line(&mut tcp, tuning.idle).await?;
@@ -59,14 +58,22 @@ async fn connect_tls(
             }
             let mut stream = connect::tls(backend, tcp, tuning.connect, "backend").await?;
             let caps = query_capabilities(&mut stream, "P0", tuning.idle).await?;
-            (stream, caps)
+            Ok((stream, caps))
         }
-    };
-    if offers_unauthenticate(&caps) {
-        return Err(anyhow!(crate::auth::UNAUTHENTICATE_OFFERED));
     }
-    let sasl_ir = caps.iter().any(|c| c.eq_ignore_ascii_case("SASL-IR"));
-    Ok((stream, sasl_ir))
+}
+
+/// An active health check of one address: the connection and greeting a
+/// login would get, without a credential (a PROXY `LOCAL` header where the
+/// backend takes one), then LOGOUT.
+pub(crate) async fn check(backend: &BackendConn, tuning: &Tuning) -> Result<()> {
+    let (mut stream, _) = connect_tls(backend, None, tuning).await?;
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        stream.write_all(b"P9 LOGOUT\r\n").await?;
+        stream.flush().await
+    })
+    .await;
+    Ok(())
 }
 
 /// A greeting the proxy can log in after: `* OK` (not PREAUTH, not BYE).
@@ -245,7 +252,7 @@ async fn await_auth_ok(
 
 /// The IMAP backend login of one client session.
 pub struct ImapLogin<'a> {
-    pub backends: &'a [BackendConn],
+    pub backends: &'a [crate::pool::Pool],
     pub tuning: &'a Tuning,
     /// The client's address.
     pub peer: SocketAddr,
@@ -268,24 +275,56 @@ impl BackendLogin for ImapLogin<'_> {
         index: usize,
         credential: BackendCredential<'_>,
     ) -> Result<Self::Conn, BackendError> {
-        let backend = &self.backends[index];
+        let pool = &self.backends[index];
         match credential {
             // The same token the client presented, for its verified identity.
             BackendCredential::Token {
                 identity, issuer, ..
             } => {
-                tracing::info!(target: crate::obs::target::MAIN, peer = %self.peer, user = %sanitize(identity), mech = %self.mech, backend = %backend.id, issuer = %issuer, "oauth validated; proxying to backend");
+                tracing::info!(target: crate::obs::target::MAIN, peer = %self.peer, user = %sanitize(identity), mech = %self.mech, backend = %pool.id, issuer = %issuer, "oauth validated; proxying to backend");
             }
             // The client's own password; the backend validates it (the proxy
             // never holds a master credential). Never log the password.
             BackendCredential::Password { user, .. } => {
-                tracing::info!(target: crate::obs::target::MAIN, peer = %self.peer, user = %sanitize(user), mech = %self.mech, backend = %backend.id, issuer = %"", "password auth; forwarding to backend");
+                tracing::info!(target: crate::obs::target::MAIN, peer = %self.peer, user = %sanitize(user), mech = %self.mech, backend = %pool.id, issuer = %"", "password auth; forwarding to backend");
             }
         }
+        // Up to the credential an address that fails gives way to the next.
+        let origin = Some((self.peer, self.local));
+        let ((stream, caps), member) = pool
+            .open(Some(credential.account()), |i| {
+                connect_tls(&pool.members[i].conn, origin, self.tuning)
+            })
+            .await?;
+        let result = self
+            .authenticate(&pool.members[member].conn, stream, &caps, credential)
+            .await;
+        match &result {
+            Ok(_) => pool.session(),
+            Err(BackendError::Unavailable(_)) => pool.tempfail(member),
+            Err(BackendError::Rejected(_)) => {}
+        }
+        result
+    }
+}
+
+impl ImapLogin<'_> {
+    /// The login on a connection to `backend` that offers `caps`: never
+    /// retried on another address, a credential goes to one server once.
+    async fn authenticate(
+        &self,
+        backend: &BackendConn,
+        mut stream: TlsStream<TcpStream>,
+        caps: &[String],
+        credential: BackendCredential<'_>,
+    ) -> Result<(TlsStream<TcpStream>, String), BackendError> {
+        // Checked before the credential is sent.
+        if offers_unauthenticate(caps) {
+            return Err(anyhow!(crate::auth::UNAUTHENTICATE_OFFERED).into());
+        }
+        let sasl_ir = caps.iter().any(|c| c.eq_ignore_ascii_case("SASL-IR"));
         let fwd = credential.forward(backend);
         let (mech, response) = (fwd.mech, &fwd.response);
-        let (mut stream, sasl_ir) =
-            connect_tls(backend, self.peer, self.local, self.tuning).await?;
         if sasl_ir {
             // `concat` sizes the line once; it is zeroized on drop like the
             // response.

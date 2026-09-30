@@ -101,8 +101,14 @@ pub(super) async fn backend_caps(
             ));
         }
     }
-    let (mut be, caps) = match backend_session(&up.conn, None, tuning).await {
-        Ok(v) => v,
+    let pool = &up.pool;
+    let (mut be, caps) = match pool
+        .open(None, |i| {
+            backend_session(&pool.members[i].conn, None, tuning)
+        })
+        .await
+    {
+        Ok((v, _)) => v,
         Err(e) => {
             *last_failure = Some(Instant::now());
             crate::obs::metrics::record_backend_error(crate::obs::metrics::Proto::Sieve);
@@ -119,6 +125,19 @@ pub(super) async fn backend_caps(
     let caps = Arc::new(caps);
     *up.caps.caps.write().unwrap_or_else(|p| p.into_inner()) = Some((Instant::now(), caps.clone()));
     Ok(caps)
+}
+
+/// An active health check of one address: the session up to the
+/// capabilities over TLS (a PROXY `LOCAL` header where the backend takes
+/// one), then LOGOUT.
+pub(crate) async fn check(backend: &BackendConn, tuning: &Tuning) -> Result<()> {
+    let (mut be, _) = backend_session(backend, None, tuning).await?;
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        be.write_all(b"LOGOUT\r\n").await?;
+        be.flush().await
+    })
+    .await;
+    Ok(())
 }
 
 /// The capabilities to show a client before it authenticates: those every
@@ -250,7 +269,7 @@ impl BackendLogin for SieveLogin<'_> {
     type Conn = (TlsStream<TcpStream>, String);
 
     fn name(&self, index: usize) -> &str {
-        &self.backends[index].conn.id
+        &self.backends[index].pool.id
     }
 
     async fn login(
@@ -258,7 +277,35 @@ impl BackendLogin for SieveLogin<'_> {
         index: usize,
         credential: BackendCredential<'_>,
     ) -> Result<Self::Conn, BackendError> {
-        let backend = &self.backends[index].conn;
+        let pool = &self.backends[index].pool;
+        // Up to the credential an address that fails gives way to the next.
+        let ((be, caps), member) = pool
+            .open(Some(credential.account()), |i| {
+                backend_session(&pool.members[i].conn, Some(self.origin), self.tuning)
+            })
+            .await?;
+        let result = self
+            .authenticate(&pool.members[member].conn, be, &caps, credential)
+            .await;
+        match &result {
+            Ok(_) => pool.session(),
+            Err(BackendError::Unavailable(_)) => pool.tempfail(member),
+            Err(BackendError::Rejected(_)) => {}
+        }
+        result
+    }
+}
+
+impl SieveLogin<'_> {
+    /// The login on a session with `backend` that listed `caps`: never
+    /// retried on another address.
+    async fn authenticate(
+        &self,
+        backend: &BackendConn,
+        mut be: TlsStream<TcpStream>,
+        caps: &[String],
+        credential: BackendCredential<'_>,
+    ) -> Result<(TlsStream<TcpStream>, String), BackendError> {
         let fwd = credential.forward(backend);
         let (mech, response) = (fwd.mech, fwd.response.as_str());
         // A quoted string holds at most 1024 octets (RFC 5804 §4); a longer
@@ -281,7 +328,6 @@ impl BackendLogin for SieveLogin<'_> {
                 .concat(),
             )
         };
-        let (mut be, caps) = backend_session(backend, Some(self.origin), self.tuning).await?;
         // Checked before the credential is sent.
         if caps.iter().any(|l| is_cap(l, "UNAUTHENTICATE")) {
             return Err(anyhow!(crate::auth::UNAUTHENTICATE_OFFERED).into());
@@ -455,7 +501,16 @@ mod tests {
     #[tokio::test]
     async fn a_backend_that_never_answered_is_left_out() {
         let answered = Arc::new(Upstream {
-            conn: unreachable("one"),
+            pool: crate::pool::Pool::new(
+                "one".into(),
+                vec![crate::pool::Member {
+                    conn: unreachable("one"),
+                    health: Arc::default(),
+                }],
+                crate::config::PoolStrategy::Failover,
+                Arc::default(),
+                None,
+            ),
             caps: Arc::default(),
         });
         *answered.caps.caps.write().unwrap() = Some((
@@ -467,7 +522,16 @@ mod tests {
             ]),
         ));
         let silent = Arc::new(Upstream {
-            conn: unreachable("two"),
+            pool: crate::pool::Pool::new(
+                "two".into(),
+                vec![crate::pool::Member {
+                    conn: unreachable("two"),
+                    health: Arc::default(),
+                }],
+                crate::config::PoolStrategy::Failover,
+                Arc::default(),
+                None,
+            ),
             caps: Arc::default(),
         });
         let tuning = Tuning::default();

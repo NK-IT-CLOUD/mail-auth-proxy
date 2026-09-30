@@ -4,6 +4,7 @@
 
 pub(crate) mod backend;
 pub mod ehlo;
+pub(crate) use ehlo::check;
 pub(crate) mod preauth;
 
 use crate::auth::discovery::{self, Answer};
@@ -11,7 +12,7 @@ use crate::auth::sasl::Discovery;
 use crate::auth::{self, refused};
 use crate::limits::ConnPermit;
 use crate::obs::metrics::{Listener, Proto};
-use crate::server::{BackendConn, Ctx};
+use crate::server::Ctx;
 use crate::wire::deadline_at;
 use crate::wire::line::{read_client_line, verb_is};
 use anyhow::{anyhow, Result};
@@ -40,7 +41,7 @@ pub struct Submission {
 /// A submission backend and its post-TLS EHLO extensions; a reload that
 /// keeps the backend keeps them.
 pub struct Upstream {
-    pub conn: BackendConn,
+    pub pool: crate::pool::Pool,
     pub ehlo: Arc<ehlo::EhloCache>,
 }
 
@@ -53,7 +54,7 @@ pub async fn probe_at_startup(ctx: Arc<Ctx<Submission>>) {
         if let Err(e) =
             ehlo::backend_extensions(up, sub.caps_ttl, &ctx.tuning, ctx.hostname()).await
         {
-            tracing::warn!(target: crate::obs::target::SUBMISSION, backend=%up.conn.id, error=%format!("{e:#}"), "submission backend EHLO extensions not available at startup");
+            tracing::warn!(target: crate::obs::target::SUBMISSION, backend=%up.pool.id, error=%format!("{e:#}"), "submission backend EHLO extensions not available at startup");
         }
     }
 }

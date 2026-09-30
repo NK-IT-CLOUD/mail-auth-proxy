@@ -2,6 +2,7 @@
 //! each under the connect timeout; address parsing.
 
 use super::deadline;
+use crate::pool::{staged, Stage};
 use crate::server::BackendConn;
 use anyhow::Result;
 use std::net::SocketAddr;
@@ -12,7 +13,8 @@ use tokio_rustls::client::TlsStream;
 
 /// Open a TCP connection to `backend` and write the PROXY protocol header if
 /// the backend expects one (see `send_proxy_header` for `origin`). `what`
-/// names the backend in errors (`backend`, `sieve backend`, …).
+/// names the backend in errors (`backend`, `sieve backend`, …). Errors are
+/// marked `Stage::Connect` for the pool.
 pub async fn connect(
     backend: &BackendConn,
     origin: Option<(SocketAddr, SocketAddr)>,
@@ -22,15 +24,19 @@ pub async fn connect(
     let mut tcp = deadline(timeout, &format!("{what} connect"), async {
         Ok(TcpStream::connect(&backend.address).await?)
     })
-    .await?;
+    .await
+    .map_err(|e| staged(Stage::Connect, e))?;
     if let Err(e) = backend.keepalive.apply(&tcp) {
         tracing::warn!(target: crate::obs::target::MAIN, backend=%backend.address, error=%e, "{what}: TCP keepalive not set");
     }
-    send_proxy_header(backend, &mut tcp, origin, timeout).await?;
+    send_proxy_header(backend, &mut tcp, origin, timeout)
+        .await
+        .map_err(|e| staged(Stage::Connect, e))?;
     Ok(tcp)
 }
 
 /// TLS handshake with `backend` on `tcp`, verified against its `verify_name`.
+/// Errors are marked `Stage::Tls` for the pool.
 pub async fn tls(
     backend: &BackendConn,
     tcp: TcpStream,
@@ -41,6 +47,7 @@ pub async fn tls(
         Ok(backend.tls.connect(backend.name.clone(), tcp).await?)
     })
     .await
+    .map_err(|e| staged(Stage::Tls, e))
 }
 
 /// Write the PROXY protocol v2 header if enabled (see `proxyproto`): the

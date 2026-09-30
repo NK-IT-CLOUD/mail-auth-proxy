@@ -518,6 +518,26 @@ pub fn set_cert_not_after(cert: &str, unix: u64) {
     }
 }
 
+/// One backend of the configuration in use: its label values, counters
+/// and the health of each address (`register_backends`).
+pub struct BackendEntry {
+    pub proto: Proto,
+    pub backend: String,
+    pub stats: Arc<crate::pool::Stats>,
+    pub addresses: Vec<(String, Arc<crate::pool::Health>)>,
+}
+
+// The backends of the configuration in use: the label sets of the backend
+// families, replaced when a configuration is loaded. The counters live with
+// the backends, which keep them across a reload.
+static BACKENDS: RwLock<Vec<BackendEntry>> = RwLock::new(Vec::new());
+
+/// Set the backends of the configuration in use; one that is no longer
+/// listed is no longer exported.
+pub fn register_backends(entries: Vec<BackendEntry>) {
+    *BACKENDS.write().unwrap_or_else(|p| p.into_inner()) = entries;
+}
+
 // Configuration reloads (SIGHUP) by result: ok, error.
 static CONFIG_RELOADS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 // Unix time (s) the configuration in use was loaded.
@@ -757,6 +777,58 @@ fn render() -> String {
         o.push_str(&format!(
             "mail_auth_proxy_upstream_forward_total{{proto=\"{plabel}\"}} {v}\n"
         ));
+    }
+
+    {
+        let backends = BACKENDS.read().unwrap_or_else(|p| p.into_inner());
+        o.push_str("# HELP mail_auth_proxy_backend_up Whether a backend address is up (1) or down (0) by the passive and active health checks.\n");
+        o.push_str("# TYPE mail_auth_proxy_backend_up gauge\n");
+        for b in backends.iter() {
+            for (address, health) in &b.addresses {
+                o.push_str(&format!(
+                    "mail_auth_proxy_backend_up{{backend=\"{}\",address=\"{}\"}} {}\n",
+                    escape_label(&b.backend),
+                    escape_label(address),
+                    u8::from(health.is_up())
+                ));
+            }
+        }
+        o.push_str("# HELP mail_auth_proxy_backend_address_errors_total Failures of a backend address, by where: connect, tls, greeting (before the credential), auth_tempfail (after it, without a verdict).\n");
+        o.push_str("# TYPE mail_auth_proxy_backend_address_errors_total counter\n");
+        for b in backends.iter() {
+            for (address, health) in &b.addresses {
+                for stage in crate::pool::Stage::ALL {
+                    o.push_str(&format!(
+                        "mail_auth_proxy_backend_address_errors_total{{backend=\"{}\",address=\"{}\",stage=\"{}\"}} {}\n",
+                        escape_label(&b.backend),
+                        escape_label(address),
+                        stage.label(),
+                        health.errors(stage)
+                    ));
+                }
+            }
+        }
+        o.push_str("# HELP mail_auth_proxy_backend_failovers_total Logins and probes that succeeded on another address of the backend than the first they tried.\n");
+        o.push_str("# TYPE mail_auth_proxy_backend_failovers_total counter\n");
+        for b in backends.iter() {
+            o.push_str(&format!(
+                "mail_auth_proxy_backend_failovers_total{{backend=\"{}\"}} {}\n",
+                escape_label(&b.backend),
+                b.stats.failovers.load(Ordering::Relaxed)
+            ));
+        }
+        o.push_str(
+            "# HELP mail_auth_proxy_backend_sessions_total Sessions spliced to a backend.\n",
+        );
+        o.push_str("# TYPE mail_auth_proxy_backend_sessions_total counter\n");
+        for b in backends.iter() {
+            o.push_str(&format!(
+                "mail_auth_proxy_backend_sessions_total{{proto=\"{}\",backend=\"{}\"}} {}\n",
+                b.proto.label(),
+                escape_label(&b.backend),
+                b.stats.sessions.load(Ordering::Relaxed)
+            ));
+        }
     }
 
     o.push_str("# HELP mail_auth_proxy_route_misses_total Credentials that no route takes (refused as unknown_domain).\n");

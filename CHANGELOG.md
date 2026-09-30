@@ -6,6 +6,24 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Backend pools: `addresses` (up to 16) instead of `address`, with `strategy = "failover"`
+  (default: the first address that is up), `"hash"` (a rendezvous hash of the identity or
+  login keeps a user on one address) or `"round_robin"`. A login moves to the next address
+  only while no credential has been sent (connect, PROXY header, TLS, greeting, STARTTLS,
+  EHLO, capabilities; at most 3 addresses); a temporary failure after the credential is an
+  outage of that login, never retried elsewhere. Outages stay outages: retry-later, no
+  `authresult` line.
+- Health per address: 3 failures in a row mark it down, 2 successes up again, from the
+  logins and probes and, with `health_check_secs`, from active checks (the dialog up to the
+  greeting, no credential). Down addresses come last and take one login or check at a time.
+  Health and counters are kept across a reload.
+- Metrics `mail_auth_proxy_backend_up{backend,address}`,
+  `mail_auth_proxy_backend_address_errors_total{backend,address,stage}`,
+  `mail_auth_proxy_backend_failovers_total{backend}` and
+  `mail_auth_proxy_backend_sessions_total{proto,backend}`; label values come from the
+  configuration only.
+
 ## [0.4.0] - 2026-09-29
 
 ### Added

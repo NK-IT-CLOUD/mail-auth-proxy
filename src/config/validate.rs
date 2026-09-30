@@ -12,6 +12,10 @@ use std::net::{IpAddr, SocketAddr};
 /// label and a refusal-timing pool.
 const MAX_BACKENDS: usize = 64;
 
+/// Upper bound of a backend's `addresses`: each is a metric label set and
+/// a health state.
+const MAX_ADDRESSES: usize = 16;
+
 /// Upper bound of `[[routes]]`: each credential walks them in order.
 const MAX_ROUTES: usize = 256;
 
@@ -598,22 +602,57 @@ fn default_tls(protocol: Protocol) -> BackendTls {
 /// `address`, `verify_name` and `ca_file` of the backend at `key`.
 fn check_backend_address(key: &str, b: &Backend, err: &mut impl FnMut(String)) {
     check_path(&format!("{key}.ca_file"), b.ca_file.as_deref(), err);
-    let address_ok = b
-        .address
-        .rsplit_once(':')
-        .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok());
-    if !address_ok {
-        err(format!("{key}.address = {:?} must be host:port", b.address));
-    }
-    // Without verify_name the name comes from the address; a bad address is
-    // reported once, above.
-    let vname = match &b.verify_name {
-        Some(n) => n.clone(),
-        None if address_ok => crate::wire::connect::host_of(&b.address).to_string(),
-        None => return,
+    let list: Vec<(String, &str)> = match (b.address.is_empty(), b.addresses.is_empty()) {
+        (false, true) => vec![(format!("{key}.address"), b.address.as_str())],
+        (true, false) => b
+            .addresses
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (format!("{key}.addresses[{i}]"), a.as_str()))
+            .collect(),
+        (true, true) => {
+            err(format!("{key}: set address or addresses"));
+            return;
+        }
+        (false, false) => {
+            err(format!("{key}: address and addresses cannot be combined"));
+            return;
+        }
     };
-    if rustls::pki_types::ServerName::try_from(vname.clone()).is_err() {
-        err(format!("{key}: {vname:?} is not a valid certificate name"));
+    if list.len() > MAX_ADDRESSES {
+        err(format!("{key}.addresses: at most {MAX_ADDRESSES}"));
+    }
+    if let Some(secs) = b.health_check_secs {
+        if !(1..=MAX_TIMEOUT_SECS).contains(&secs) {
+            err(format!(
+                "{key}.health_check_secs must be between 1 and {MAX_TIMEOUT_SECS}"
+            ));
+        }
+    }
+    for (i, (at, address)) in list.iter().enumerate() {
+        if list[..i]
+            .iter()
+            .any(|(_, o)| o.eq_ignore_ascii_case(address))
+        {
+            err(format!("{at} = {address:?} is listed twice"));
+        }
+        let address_ok = address
+            .rsplit_once(':')
+            .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok());
+        if !address_ok {
+            err(format!("{at} = {address:?} must be host:port"));
+        }
+        // Without verify_name the name comes from each address; a bad
+        // address is reported once, above.
+        let vname = match &b.verify_name {
+            Some(_) if i > 0 => continue,
+            Some(n) => n.clone(),
+            None if address_ok => crate::wire::connect::host_of(address).to_string(),
+            None => continue,
+        };
+        if rustls::pki_types::ServerName::try_from(vname.clone()).is_err() {
+            err(format!("{key}: {vname:?} is not a valid certificate name"));
+        }
     }
 }
 
@@ -2163,5 +2202,66 @@ mod tests {
             "{:?}",
             l.warnings
         );
+    }
+
+    /// A pool: `addresses` instead of `address`, a strategy, active checks;
+    /// the printed form parses back.
+    #[test]
+    fn backend_pools_are_validated() {
+        let pool = |keys: &str| {
+            V2.replace(
+                "backend = { address = \"192.0.2.10:993\", verify_name = \"mail.example.org\", client_ip = \"proxy_v2\" }",
+                &format!("backend = {{ {keys}, verify_name = \"mail.example.org\", client_ip = \"proxy_v2\" }}"),
+            )
+        };
+        let good = pool("addresses = [\"192.0.2.10:993\", \"192.0.2.11:993\"], strategy = \"hash\", health_check_secs = 10");
+        let l = parse(&good).unwrap();
+        let b = inline(&l.config.imap.backend);
+        assert_eq!(b.address_list(), ["192.0.2.10:993", "192.0.2.11:993"]);
+        assert_eq!(b.strategy, crate::config::PoolStrategy::Hash);
+        let again = parse(&toml::to_string(&l.config).unwrap()).unwrap();
+        assert_eq!(again.config.imap.backend, l.config.imap.backend);
+        for (keys, expect) in [
+            (
+                "verify_name = \"x\"".to_string(),
+                "imap.backend: set address or addresses",
+            ),
+            (
+                "address = \"192.0.2.10:993\", addresses = [\"192.0.2.11:993\"]".into(),
+                "address and addresses cannot be combined",
+            ),
+            (
+                "addresses = [\"192.0.2.10:993\", \"192.0.2.10:993\"]".into(),
+                "imap.backend.addresses[1] = \"192.0.2.10:993\" is listed twice",
+            ),
+            (
+                "addresses = [\"192.0.2.10:993\", \"nope\"]".into(),
+                "imap.backend.addresses[1] = \"nope\" must be host:port",
+            ),
+            (
+                "address = \"192.0.2.10:993\", health_check_secs = 0".into(),
+                "imap.backend.health_check_secs must be between 1 and 3600",
+            ),
+            (
+                format!(
+                    "addresses = [{}]",
+                    (0..17)
+                        .map(|i| format!("\"192.0.2.{i}:993\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                "imap.backend.addresses: at most 16",
+            ),
+        ] {
+            let text = if keys.starts_with("verify_name") {
+                V2.replace("address = \"192.0.2.10:993\", ", "")
+            } else {
+                pool(&keys)
+            };
+            let e = errors_of(&text);
+            assert!(e.contains(expect), "want {expect:?}, got {e}");
+        }
+        let bad = pool("addresses = [\"192.0.2.10:993\"], strategy = \"random\"");
+        assert!(crate::config::parse(&bad).is_err(), "unknown strategy");
     }
 }

@@ -115,9 +115,23 @@ impl Tls {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Backend {
-    /// `host:port`.
+    /// `host:port`; or `addresses`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub address: String,
-    /// Name verified on the backend certificate; default: host of `address`.
+    /// Several `host:port` of one backend (a pool): servers with the same
+    /// configuration and mailboxes, chosen by `strategy`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<String>,
+    /// How the address of a login is chosen from `addresses`.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub strategy: PoolStrategy,
+    /// Seconds between active health checks of each address (the protocol's
+    /// greeting, without a credential); unset: none, the logins and
+    /// capability probes are the checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check_secs: Option<u64>,
+    /// Name verified on the backend certificate; default: the host of each
+    /// address.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify_name: Option<String>,
     /// PEM file with the CA(s) the backend certificate must chain to. Replaces
@@ -142,6 +156,15 @@ pub struct Backend {
 }
 
 impl Backend {
+    /// Its addresses: `addresses`, or the one `address`.
+    pub fn address_list(&self) -> Vec<&str> {
+        if self.addresses.is_empty() {
+            vec![self.address.as_str()]
+        } else {
+            self.addresses.iter().map(String::as_str).collect()
+        }
+    }
+
     /// `client_ip` with its default applied; `xclient` is
     /// `submission.xclient` (false for the other backends).
     pub fn effective_client_ip(&self, xclient: bool) -> ClientIp {
@@ -152,6 +175,21 @@ impl Backend {
             None => ClientIp::None,
         }
     }
+}
+
+/// How a login's address is chosen from a backend's `addresses`. Addresses
+/// that are down come after those that are up, whatever the strategy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PoolStrategy {
+    /// In the order listed: the first that is up (a primary and standbys).
+    #[default]
+    Failover,
+    /// By a rendezvous hash of the identity or login: a user stays on one
+    /// address while it is up (servers that share storage).
+    Hash,
+    /// In turn (stateless backends such as a submission relay).
+    RoundRobin,
 }
 
 /// A listener's backend: a table of its own, or the name of a

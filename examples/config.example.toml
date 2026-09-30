@@ -64,6 +64,8 @@ capability_cache_secs = 600
 #
 # [backends.partner-imap]
 # address = "192.0.2.20:993"
+# # or a pool: addresses = ["192.0.2.20:993", "192.0.2.21:993"],
+# # strategy = "failover" | "hash" | "round_robin", health_check_secs = 10
 # verify_name = "imap.partner.example"
 # client_ip = "proxy_v2"
 #

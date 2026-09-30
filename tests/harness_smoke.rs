@@ -32,6 +32,12 @@ async fn proxy_starts_and_relays_each_protocol() {
     assert!(started <= now && now - started < 60, "{started} vs {now}");
     let loaded = m["mail_auth_proxy_config_last_reload_success_timestamp_seconds"];
     assert!(loaded >= started && loaded <= now, "{loaded} vs {started}");
+    let up: Vec<u64> = m
+        .iter()
+        .filter(|(k, _)| k.starts_with("mail_auth_proxy_backend_up{"))
+        .map(|(_, v)| *v)
+        .collect();
+    assert_eq!(up, [1, 1, 1], "one address per protocol, up");
     let timestamps = [
         "process_start_time_seconds",
         "mail_auth_proxy_config_last_reload_success_timestamp_seconds",
@@ -41,6 +47,8 @@ async fn proxy_starts_and_relays_each_protocol() {
     assert!(
         m.iter()
             .filter(|(k, _)| !k.starts_with("mail_auth_proxy_build_info"))
+            // Every backend address starts up.
+            .filter(|(k, _)| !k.starts_with("mail_auth_proxy_backend_up"))
             .filter(|(k, _)| !timestamps.iter().any(|t| k.starts_with(t)))
             .all(|(_, v)| *v == 0),
         "fresh process, all counters and gauges at 0: {m:?}"

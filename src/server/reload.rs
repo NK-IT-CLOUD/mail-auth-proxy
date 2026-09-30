@@ -67,9 +67,11 @@ async fn reload(path: &str, current: &watch::Sender<Arc<Generation>>) -> Result<
         ));
     }
     let (new, fetched) = Generation::build(loaded.config, Some(&old)).await?;
+    let replaced = old.clone();
     drop(old);
     // The metric label sets follow the configuration in use.
     metrics::register_certs(new.config.tls.pairs().map(|(_, cert, _)| cert));
+    new.register_backends();
     new.certs.record_expiry();
     metrics::register_issuers(new.config.oauth.issuers.iter().map(|i| i.issuer.as_str()));
     for issuer in &fetched {
@@ -81,6 +83,7 @@ async fn reload(path: &str, current: &watch::Sender<Arc<Generation>>) -> Result<
     new.announce();
     new.start();
     current.send_replace(Arc::new(new));
+    replaced.retire();
     tracing::info!(target: crate::obs::target::MAIN, path=%path, changed=?plan.changed,
         "reload: configuration loaded; new connections use it, open ones keep theirs");
     Ok(())

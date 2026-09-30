@@ -121,6 +121,11 @@ async fn probe(backend: &BackendConn, tuning: &Tuning, name: &str) -> Result<Vec
     Ok(lines)
 }
 
+/// An active health check of one address: the EHLO probe.
+pub(crate) async fn check(backend: &BackendConn, tuning: &Tuning, name: &str) -> Result<()> {
+    probe(backend, tuning, name).await.map(|_| ())
+}
+
 /// The backend's post-TLS EHLO extension lines, from the cache (younger
 /// than `ttl`) or a probe.
 ///
@@ -148,8 +153,12 @@ pub(super) async fn backend_extensions(
             ));
         }
     }
-    let lines = match probe(&up.conn, tuning, name).await {
-        Ok(l) => Arc::new(l),
+    let pool = &up.pool;
+    let lines = match pool
+        .open(None, |i| probe(&pool.members[i].conn, tuning, name))
+        .await
+    {
+        Ok((l, _)) => Arc::new(l),
         Err(e) => {
             *last_failure = Some(Instant::now());
             crate::obs::metrics::record_backend_error(crate::obs::metrics::Proto::Smtp);
@@ -169,7 +178,7 @@ async fn lines_for(up: &Upstream, ttl: Duration, tuning: &Tuning, name: &str) ->
     match backend_extensions(up, ttl, tuning, name).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::warn!(target: crate::obs::target::SUBMISSION, backend=%up.conn.id, error=%format!("{e:#}"), "submission backend EHLO extensions not available, advertising the last known ones");
+            tracing::warn!(target: crate::obs::target::SUBMISSION, backend=%up.pool.id, error=%format!("{e:#}"), "submission backend EHLO extensions not available, advertising the last known ones");
             up.ehlo.cached(None).unwrap_or_default()
         }
     }

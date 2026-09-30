@@ -61,7 +61,7 @@ impl BackendLogin for SmtpLogin<'_> {
     type Conn = TlsStream<TcpStream>;
 
     fn name(&self, index: usize) -> &str {
-        &self.backends[index].conn.id
+        &self.backends[index].pool.id
     }
 
     async fn login(
@@ -69,8 +69,38 @@ impl BackendLogin for SmtpLogin<'_> {
         index: usize,
         credential: BackendCredential<'_>,
     ) -> Result<Self::Conn, BackendError> {
+        let pool = &self.backends[index].pool;
+        // Up to the credential an address that fails gives way to the next.
+        let origin = Some((self.peer, self.local));
+        let ((be, ehlo_lines), member) = pool
+            .open(Some(credential.account()), |i| {
+                connect_ehlo(&pool.members[i].conn, origin, self.tuning, self.name)
+            })
+            .await?;
+        let result = self
+            .authenticate(&pool.members[member].conn, be, &ehlo_lines, credential)
+            .await;
+        match &result {
+            Ok(_) => pool.session(),
+            Err(BackendError::Unavailable(_)) => pool.tempfail(member),
+            Err(BackendError::Rejected(_)) => {}
+        }
+        result
+    }
+}
+
+impl SmtpLogin<'_> {
+    /// The login on a connection to `backend` whose EHLO listed
+    /// `ehlo_lines`: never retried on another address.
+    async fn authenticate(
+        &self,
+        backend: &BackendConn,
+        be: TlsStream<TcpStream>,
+        ehlo_lines: &[String],
+        credential: BackendCredential<'_>,
+    ) -> Result<TlsStream<TcpStream>, BackendError> {
         let password = matches!(credential, BackendCredential::Password { .. });
-        let (be, code, error_result) = self.dialog(&self.backends[index].conn, credential).await?;
+        let (be, code, error_result) = self.dialog(backend, be, ehlo_lines, credential).await?;
         match auth_verdict(code, password) {
             AuthVerdict::Ok => Ok(be),
             // The backend refused the credential (bad password, unknown user,
@@ -181,21 +211,16 @@ async fn expect_greeting<S: AsyncRead + Unpin>(s: &mut S, idle: Duration) -> Res
 }
 
 impl SmtpLogin<'_> {
-    /// `connect_ehlo`, optional XCLIENT, then AUTH with the client's own
-    /// credential (never a master password). Returns the final AUTH reply
-    /// code and the OAUTHBEARER error result, if there was one.
+    /// After `connect_ehlo`: optional XCLIENT, then AUTH with the client's
+    /// own credential (never a master password). Returns the final AUTH
+    /// reply code and the OAUTHBEARER error result, if there was one.
     async fn dialog(
         &self,
         backend: &BackendConn,
+        mut be: TlsStream<TcpStream>,
+        ehlo_lines: &[String],
         credential: BackendCredential<'_>,
     ) -> Result<(TlsStream<TcpStream>, u16, Option<ErrorResult>)> {
-        let (mut be, ehlo_lines) = connect_ehlo(
-            backend,
-            Some((self.peer, self.local)),
-            self.tuning,
-            self.name,
-        )
-        .await?;
         let xclient = backend.client_ip == crate::config::ClientIp::Xclient;
 
         // XCLIENT (optional): Postfix then logs and stamps the real client

@@ -9,6 +9,7 @@ pub(crate) use listener::ACCEPT_BACKOFF;
 
 use crate::config::{self, Protocol};
 use crate::obs::metrics;
+use crate::pool::Pool;
 use crate::proto::imap::Imap;
 use crate::proto::sieve::Sieve;
 use crate::proto::smtp::Submission;
@@ -21,8 +22,9 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsConnector;
 
-/// A backend and how to reach it: address, the name its certificate must
-/// carry, and a TLS connector with that backend's trust anchors.
+/// One address of a backend and how to reach it: the address, the name its
+/// certificate must carry, and a TLS connector with that backend's trust
+/// anchors. A backend with several addresses is a `pool::Pool` of these.
 ///
 /// Every backend hop is TLS-verified — it carries passwords (PLAIN) as well as
 /// tokens, so an unverified backend would let a MITM harvest secrets. There is
@@ -45,11 +47,13 @@ pub struct BackendConn {
 }
 
 impl BackendConn {
-    /// `xclient` is `submission.xclient`, `default_tls` the protocol's
-    /// default of `tls` (both already applied by `config::parse`).
+    /// The connection to `address` of the backend `b`. `xclient` is
+    /// `submission.xclient`, `default_tls` the protocol's default of `tls`
+    /// (both already applied by `config::parse`).
     fn new(
         id: &str,
         b: &config::Backend,
+        address: &str,
         xclient: bool,
         default_tls: config::BackendTls,
         keepalive: crate::wire::Keepalive,
@@ -57,12 +61,12 @@ impl BackendConn {
         let name = b
             .verify_name
             .clone()
-            .unwrap_or_else(|| crate::wire::connect::host_of(&b.address).to_string());
+            .unwrap_or_else(|| crate::wire::connect::host_of(address).to_string());
         let name = ServerName::try_from(name)
-            .map_err(|e| anyhow::anyhow!("{}: bad certificate name: {e}", b.address))?;
+            .map_err(|e| anyhow::anyhow!("{address}: bad certificate name: {e}"))?;
         Ok(BackendConn {
             id: id.to_owned(),
-            address: b.address.clone(),
+            address: address.to_owned(),
             name,
             tls: tls::backend_connector(b.ca_file.as_deref())?,
             client_ip: b.effective_client_ip(xclient),
@@ -155,9 +159,53 @@ pub(crate) struct Generation {
     imap: Arc<Ctx<Imap>>,
     submission: Option<Arc<Ctx<Submission>>>,
     sieve: Option<Arc<Ctx<Sieve>>>,
+    /// Set when a reload replaced this generation: its health checks stop.
+    retired: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Generation {
+    /// The backends of protocol `p`.
+    fn pools(&self, p: Protocol) -> Vec<&Pool> {
+        match p {
+            Protocol::Imap => self.imap.protocol.backends.iter().collect(),
+            Protocol::Submission => self
+                .submission
+                .iter()
+                .flat_map(|c| c.protocol.backends.iter().map(|u| &u.pool))
+                .collect(),
+            Protocol::Sieve => self
+                .sieve
+                .iter()
+                .flat_map(|c| c.protocol.backends.iter().map(|u| &u.pool))
+                .collect(),
+        }
+    }
+
+    /// Register the backends of this generation with the metrics: their
+    /// label sets follow the configuration in use.
+    pub(super) fn register_backends(&self) {
+        let entries = Protocol::ALL.into_iter().flat_map(|p| {
+            self.pools(p)
+                .into_iter()
+                .map(move |pool| metrics::BackendEntry {
+                    proto: proto_of(p),
+                    backend: pool.id.clone(),
+                    stats: pool.stats.clone(),
+                    addresses: pool
+                        .members
+                        .iter()
+                        .map(|m| (m.conn.address.clone(), m.health.clone()))
+                        .collect(),
+                })
+        });
+        metrics::register_backends(entries.collect());
+    }
+
+    /// Mark this generation replaced: its health checks end.
+    pub(super) fn retire(&self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     /// Build from `cfg` (validated): certificates, backends, gate, limits,
     /// then the token validator. `prev` is the generation in use on a
     /// reload: what runs across configurations (open connections, rate
@@ -179,7 +227,9 @@ impl Generation {
             cfg.backends_of(p).into_iter().map(move |u| (proto, u.name))
         }));
         let keepalive = keepalive(&cfg.session);
-        let conns = |p: Protocol| -> Result<Vec<(config::UsedBackend<'_>, BackendConn)>> {
+        // Each backend a pool of its addresses. A backend that stays (same
+        // name) keeps its counters, and each address it keeps its health.
+        let pools = |p: Protocol| -> Result<Vec<(config::UsedBackend<'_>, Pool)>> {
             let xclient =
                 p == Protocol::Submission && cfg.submission.as_ref().is_some_and(|s| s.xclient);
             let default_tls = match p {
@@ -189,9 +239,38 @@ impl Generation {
             cfg.backends_of(p)
                 .into_iter()
                 .map(|u| {
-                    let conn = BackendConn::new(u.name, u.backend, xclient, default_tls, keepalive)
+                    let old = prev.and_then(|g| g.pools(p).into_iter().find(|o| o.id == u.name));
+                    let members = u
+                        .backend
+                        .address_list()
+                        .into_iter()
+                        .map(|address| {
+                            let conn = BackendConn::new(
+                                u.name,
+                                u.backend,
+                                address,
+                                xclient,
+                                default_tls,
+                                keepalive,
+                            )?;
+                            let health = old
+                                .and_then(|o| o.members.iter().find(|m| m.conn.address == address))
+                                .map(|m| m.health.clone())
+                                .unwrap_or_default();
+                            Ok(crate::pool::Member { conn, health })
+                        })
+                        .collect::<Result<Vec<_>>>()
                         .with_context(|| u.key())?;
-                    Ok((u, conn))
+                    let pool = Pool::new(
+                        u.name.to_owned(),
+                        members,
+                        u.backend.strategy,
+                        old.map(|o| o.stats.clone()).unwrap_or_default(),
+                        u.backend
+                            .health_check_secs
+                            .map(std::time::Duration::from_secs),
+                    );
+                    Ok((u, pool))
                 })
                 .collect()
         };
@@ -207,15 +286,15 @@ impl Generation {
         };
         let imap = Imap {
             acceptor: tls::acceptor(&certs, Some(b"imap")),
-            backends: conns(Protocol::Imap)?.into_iter().map(|(_, c)| c).collect(),
+            backends: pools(Protocol::Imap)?.into_iter().map(|(_, p)| p).collect(),
         };
         let submission = cfg
             .submission
             .as_ref()
             .map(|s| -> Result<Submission> {
-                let backends = conns(Protocol::Submission)?
+                let backends = pools(Protocol::Submission)?
                     .into_iter()
-                    .map(|(u, conn)| {
+                    .map(|(u, pool)| {
                         Arc::new(crate::proto::smtp::Upstream {
                             ehlo: kept(Protocol::Submission, &u)
                                 .and_then(|i| {
@@ -223,7 +302,7 @@ impl Generation {
                                     Some(ctx.protocol.backends.get(i)?.ehlo.clone())
                                 })
                                 .unwrap_or_default(),
-                            conn,
+                            pool,
                         })
                     })
                     .collect();
@@ -239,9 +318,9 @@ impl Generation {
             .sieve
             .as_ref()
             .map(|s| -> Result<Sieve> {
-                let backends = conns(Protocol::Sieve)?
+                let backends = pools(Protocol::Sieve)?
                     .into_iter()
-                    .map(|(u, conn)| {
+                    .map(|(u, pool)| {
                         Arc::new(crate::proto::sieve::Upstream {
                             caps: kept(Protocol::Sieve, &u)
                                 .and_then(|i| {
@@ -249,7 +328,7 @@ impl Generation {
                                     Some(ctx.protocol.backends.get(i)?.caps.clone())
                                 })
                                 .unwrap_or_default(),
-                            conn,
+                            pool,
                         })
                     })
                     .collect();
@@ -344,6 +423,7 @@ impl Generation {
             certs,
             shared,
             config: cfg,
+            retired: Arc::default(),
         };
         Ok((generation, fetched))
     }
@@ -358,6 +438,72 @@ impl Generation {
         }
         if let Some(ctx) = &self.sieve {
             tokio::spawn(crate::proto::sieve::probe_at_startup(ctx.clone()));
+        }
+        self.start_health_checks();
+    }
+
+    /// The active health checks of every backend that sets
+    /// `health_check_secs`, one task each. A task holds its context only
+    /// for one round and ends when the generation is replaced or gone.
+    fn start_health_checks(&self) {
+        let hostname = self.shared.hostname.clone();
+        for (i, pool) in self.imap.protocol.backends.iter().enumerate() {
+            let Some(every) = pool.health_check else {
+                continue;
+            };
+            let ctx = Arc::downgrade(&self.imap);
+            spawn_checks(every, self.retired.clone(), move || {
+                let ctx = ctx.upgrade();
+                async move {
+                    let ctx = ctx?;
+                    let pool = ctx.protocol.backends.get(i)?;
+                    crate::pool::check_round(pool, |m| {
+                        crate::proto::imap::check(&pool.members[m].conn, &ctx.tuning)
+                    })
+                    .await;
+                    Some(())
+                }
+            });
+        }
+        if let Some(sub) = &self.submission {
+            for (i, up) in sub.protocol.backends.iter().enumerate() {
+                let Some(every) = up.pool.health_check else {
+                    continue;
+                };
+                let (ctx, name) = (Arc::downgrade(sub), hostname.clone());
+                spawn_checks(every, self.retired.clone(), move || {
+                    let (ctx, name) = (ctx.upgrade(), name.clone());
+                    async move {
+                        let ctx = ctx?;
+                        let up = ctx.protocol.backends.get(i)?;
+                        crate::pool::check_round(&up.pool, |m| {
+                            crate::proto::smtp::check(&up.pool.members[m].conn, &ctx.tuning, &name)
+                        })
+                        .await;
+                        Some(())
+                    }
+                });
+            }
+        }
+        if let Some(sv) = &self.sieve {
+            for (i, up) in sv.protocol.backends.iter().enumerate() {
+                let Some(every) = up.pool.health_check else {
+                    continue;
+                };
+                let ctx = Arc::downgrade(sv);
+                spawn_checks(every, self.retired.clone(), move || {
+                    let ctx = ctx.upgrade();
+                    async move {
+                        let ctx = ctx?;
+                        let up = ctx.protocol.backends.get(i)?;
+                        crate::pool::check_round(&up.pool, |m| {
+                            crate::proto::sieve::check(&up.pool.members[m].conn, &ctx.tuning)
+                        })
+                        .await;
+                        Some(())
+                    }
+                });
+            }
         }
     }
 
@@ -388,6 +534,28 @@ impl Generation {
             tracing::info!(target: crate::obs::target::MAIN, "auth rate limit disabled");
         }
     }
+}
+
+/// Run `round` every `every` until `retired` is set or `round` finds its
+/// generation gone (`None`).
+fn spawn_checks<F, Fut>(
+    every: std::time::Duration,
+    retired: Arc<std::sync::atomic::AtomicBool>,
+    round: F,
+) where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Option<()>> + Send,
+{
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            if retired.load(std::sync::atomic::Ordering::Relaxed) || round().await.is_none() {
+                break;
+            }
+        }
+    });
 }
 
 /// The metrics protocol of a configuration protocol.
@@ -563,6 +731,7 @@ pub async fn run(path: String, cfg: config::Config) -> Result<()> {
     crate::ratelimit::init_fingerprint_key().context("rate limit fingerprint key")?;
     let (generation, _) = Generation::build(cfg, None).await?;
     metrics::register_certs(generation.config.tls.pairs().map(|(_, cert, _)| cert));
+    generation.register_backends();
     generation.certs.record_expiry();
     metrics::mark_config_loaded();
     generation.announce();

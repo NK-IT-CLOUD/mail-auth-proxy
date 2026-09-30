@@ -182,8 +182,11 @@ key over (`yes`) or it needs a restart ([Reload](#reload)).
 | `routes[].sni` | array | any | yes | the name the client asked for (SNI) is one of these; without SNI the route does not match |
 | `routes[].audiences` | array | any | yes | OAuth: the token's `aud` contains one of these, binding a token to the backend it was issued for |
 | `routes[].imap`, `.submission`, `.sieve` | name | none | yes | the `[backends]` entry of each protocol the route serves |
-| backend `.address` | `host:port` | required | yes | where to connect |
-| backend `.verify_name` | string | host of `address` | yes | name verified on the backend certificate |
+| backend `.address` | `host:port` | required, or `addresses` | yes | where to connect |
+| backend `.addresses` | array of `host:port` | none | yes | several addresses of one backend, a pool ([Backend pools](#backend-pools)); at most 16, each once; not together with `address` |
+| backend `.strategy` | `failover` \| `hash` \| `round_robin` | `failover` | yes | how a login's address is chosen from `addresses`: the first that is up in the listed order; by a rendezvous hash of the identity or login, so a user stays on one address while it is up; or in turn |
+| backend `.health_check_secs` | integer | off | yes | active health checks: every that many seconds (1-3600) each address gets the dialog of a login up to the greeting and capabilities, without a credential (with a PROXY `LOCAL` header where the backend takes one) |
+| backend `.verify_name` | string | host of each address | yes | name verified on the backend certificate |
 | backend `.ca_file` | path | system store | yes | PEM CAs the backend certificate must chain to; replaces the system store for this backend |
 | backend `.tls` | `starttls` \| `implicit` | `implicit` for IMAP, `starttls` for submission and ManageSieve | yes | how the proxy secures its connection to the backend. `starttls`: the plaintext greeting, then STARTTLS (IMAP RFC 9051 §6.2.1, SMTP RFC 3207, ManageSieve RFC 5804 §2.2); what the backend offered before TLS is discarded and asked again over TLS. `implicit`: TLS from the first byte (RFC 8314). Either way the certificate is verified. The EHLO and capability probes take the same way |
 | backend `.auth_forward` | `xoauth2` \| `oauthbearer` | `xoauth2` | yes | the SASL mechanism a validated token is forwarded with, whatever the client used. `oauthbearer` (RFC 7628): the verified identity as GS2 authzid, the backend's `verify_name` (or host of `address`) as `host` and its port as `port`. Passwords always go as PLAIN |
@@ -304,6 +307,43 @@ name = "partner"
 domains = ["partner.example"]
 issuers = ["https://sso.partner.example/realms/mail"]
 imap = "stalwart"
+```
+
+## Backend pools
+
+A backend with `addresses` is a pool of servers that serve the same mailboxes with the same
+configuration; the capability caches are kept per backend, not per address. Each login
+takes the addresses in the order of `strategy`, those that are down after those that are
+up, the longest-failed first:
+
+- **Before the credential** (TCP connect, PROXY header, TLS handshake, greeting, STARTTLS,
+  EHLO, capabilities) an address that fails gives way to the next, at most 3 addresses per
+  login, all within the pre-auth budget. A login that succeeds on another address than the
+  first it tried counts in `mail_auth_proxy_backend_failovers_total`.
+- **After the credential** a reply without a verdict (IMAP `NO [UNAVAILABLE]`, SMTP `4xx`,
+  ManageSieve `NO (TRYLATER)`, a timeout) ends the login as an outage: the credential goes
+  to one server once, never to a second one. It counts as `auth_tempfail` for the address.
+- An outage is never a failed login: the client gets the retry-later reply, no `authresult`
+  line is written, and `mail_auth_proxy_backend_errors_total` counts it.
+
+Health is kept per address. 3 failures in a row before the credential mark an address
+down, 2 successes in a row up again (haproxy's defaults for `fall` and `rise`). The
+logins and the SMTP and ManageSieve capability probes are the checks; with
+`health_check_secs` the proxy also checks every address on its own. A down address is
+tried only after all that are up have failed, and by one login or check at a time; when
+every address is down and each is being tried, a login gets the retry-later reply at once.
+Without active checks a standby that came back shows as down until a login needs it.
+
+A reload keeps the health of each address the backend keeps, and the counters of a backend
+that keeps its name.
+
+```toml
+[backends.store]
+addresses = ["192.0.2.10:993", "192.0.2.11:993"]
+strategy = "hash"                  # users stay on one server
+health_check_secs = 10
+verify_name = "imap.example.org"
+client_ip = "proxy_v2"
 ```
 
 ## TLS server names

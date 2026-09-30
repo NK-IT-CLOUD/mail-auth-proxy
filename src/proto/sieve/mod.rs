@@ -3,6 +3,7 @@
 //! a byte relay.
 
 pub(crate) mod backend;
+pub(crate) use backend::check;
 pub(crate) mod preauth;
 
 pub use backend::CapsCache;
@@ -13,7 +14,7 @@ use crate::auth::token::TokenError;
 use crate::auth::{self, refused};
 use crate::limits::ConnPermit;
 use crate::obs::metrics::Proto;
-use crate::server::{BackendConn, Ctx};
+use crate::server::Ctx;
 use crate::wire::deadline_at;
 use crate::wire::line::{read_client_line, verb_is};
 use anyhow::{anyhow, Context as _, Result};
@@ -106,7 +107,7 @@ pub struct Sieve {
 /// A ManageSieve backend and its capabilities; a reload that keeps the
 /// backend keeps them.
 pub struct Upstream {
-    pub conn: BackendConn,
+    pub pool: crate::pool::Pool,
     pub caps: Arc<CapsCache>,
 }
 
@@ -118,7 +119,7 @@ pub async fn probe_at_startup(ctx: Arc<Ctx<Sieve>>) {
     let sieve = &ctx.protocol;
     for up in &sieve.backends {
         if let Err(e) = backend_caps(up, sieve.caps_ttl, &ctx.tuning).await {
-            tracing::warn!(target: crate::obs::target::SIEVE, backend=%up.conn.id, error=%format!("{e:#}"), "sieve backend capabilities not available at startup");
+            tracing::warn!(target: crate::obs::target::SIEVE, backend=%up.pool.id, error=%format!("{e:#}"), "sieve backend capabilities not available at startup");
         }
     }
 }

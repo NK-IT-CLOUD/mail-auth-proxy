@@ -111,6 +111,15 @@ pub enum BackendCredential<'a> {
 }
 
 impl BackendCredential<'_> {
+    /// The account it logs in to: the token's identity or the login. It
+    /// keeps a user on one address of a pool (`strategy = "hash"`).
+    pub fn account(&self) -> &str {
+        match *self {
+            BackendCredential::Token { identity, .. } => identity,
+            BackendCredential::Password { user, .. } => user,
+        }
+    }
+
     /// The credential as it goes to `backend`: a token as the backend's
     /// `auth_forward` mechanism, a password as PLAIN.
     pub fn forward(&self, backend: &crate::server::BackendConn) -> Forwarded {

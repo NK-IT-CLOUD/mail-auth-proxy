@@ -607,6 +607,9 @@ pub struct MockBackend {
     /// SMTP: the extension lines of the post-TLS EHLO reply besides
     /// XCLIENT and AUTH, instead of `SMTP_EHLO`.
     pub smtp_ehlo: Arc<Mutex<Option<Vec<String>>>>,
+    /// While set, every connection is closed at accept, before a greeting
+    /// (a backend whose service is down behind a listening port).
+    pub refuse: Arc<AtomicBool>,
 }
 
 /// The SMTP mock's post-TLS EHLO extensions besides XCLIENT and AUTH:
@@ -649,12 +652,18 @@ impl MockBackend {
         let no_ir = no_sasl_ir.clone();
         let smtp_ehlo: Arc<Mutex<Option<Vec<String>>>> = Arc::default();
         let ehlo = smtp_ehlo.clone();
+        let refuse: Arc<AtomicBool> = Arc::default();
+        let refusing = refuse.clone();
         let acceptor = tokio_rustls::TlsAcceptor::from(tls);
         let accept = tokio::spawn(async move {
             loop {
                 let Ok((tcp, _)) = listener.accept().await else {
                     continue;
                 };
+                if refusing.load(Ordering::SeqCst) {
+                    drop(tcp);
+                    continue;
+                }
                 let idx = {
                     let mut l = log.lock().unwrap();
                     l.push(Seen::default());
@@ -692,6 +701,7 @@ impl MockBackend {
             caps_untagged,
             no_sasl_ir,
             smtp_ehlo,
+            refuse,
         }
     }
 
@@ -1463,6 +1473,10 @@ pub struct Opts {
     pub listener_backends: [Option<&'static str>; 3],
     /// `[[routes]]` tables.
     pub routes: String,
+    /// Backends with several addresses: name, the named mocks whose
+    /// addresses it lists (in that order; they are no `[backends]` entries
+    /// of their own), and more keys (`strategy`, `health_check_secs`).
+    pub pools: Vec<(&'static str, Vec<&'static str>, &'static str)>,
 }
 
 /// The mock backends a configuration names: those of the three protocol
@@ -1536,6 +1550,7 @@ impl Default for Opts {
             named: Vec::new(),
             listener_backends: [None; 3],
             routes: String::new(),
+            pools: Vec::new(),
         }
     }
 }
@@ -1638,9 +1653,44 @@ impl Proxy {
                 Some("") => String::new(),
                 Some(name) => format!("backend = \"{name}\"\n"),
             };
+        let pooled = |name: &str| opts.pools.iter().any(|(_, m, _)| m.contains(&name));
+        let mock = |name: &str| {
+            &backends
+                .named
+                .iter()
+                .find(|(n, _)| *n == name)
+                .expect("a mock for every named backend")
+                .1
+        };
+        let pools: String = opts
+            .pools
+            .iter()
+            .map(|(name, members, extra)| {
+                let (_, kind, profile) = opts
+                    .named
+                    .iter()
+                    .find(|(n, ..)| n == &members[0])
+                    .expect("pool members are named mocks");
+                let addresses: Vec<String> = members
+                    .iter()
+                    .map(|m| format!("\"{}\"", mock(m).addr))
+                    .collect();
+                let keys = profile.keys(*kind != Kind::Smtp);
+                let extra = if extra.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {extra}")
+                };
+                format!(
+                    "{name} = {{ addresses = [{}], verify_name = \"{BACKEND_NAME}\", ca_file = \"{ca}\"{keys}{extra} }}\n",
+                    addresses.join(", ")
+                )
+            })
+            .collect();
         let named: String = opts
             .named
             .iter()
+            .filter(|(name, ..)| !pooled(name))
             .map(|(name, kind, profile)| {
                 let (_, mock) = backends
                     .named
@@ -1650,6 +1700,7 @@ impl Proxy {
                 format!("{name} = {}\n", table(mock, profile, *kind != Kind::Smtp))
             })
             .collect();
+        let named = named + &pools;
         let named = if named.is_empty() {
             named
         } else {

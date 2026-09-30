@@ -9,6 +9,7 @@ pub mod config;
 pub mod fuzz_api;
 mod limits;
 mod obs;
+mod pool;
 mod proto;
 mod ratelimit;
 mod route;
