@@ -99,36 +99,59 @@ sequenceDiagram
     participant C as IMAP client
     participant P as mail-auth-proxy
     participant I as JWKS (cached)
-    participant B as Dovecot (IMAP)
-    C->>P: TCP connect (limit check at accept)
-    C->>P: TLS ClientHello (SNI)
-    P-->>C: * OK [CAPABILITY … AUTH=XOAUTH2 AUTH=OAUTHBEARER (+PLAIN LOGIN as offered by the legacy rules)]
-    opt up to 8 of CAPABILITY / NOOP / ID
-        C->>P: a CAPABILITY
-        P-->>C: * CAPABILITY … / a OK
+    participant B as Backend (addresses of the pool)
+    C->>P: TCP connect (993)
+    break source blocked by the rate limit, or a connection limit reached
+        P--xC: closed at accept, no greeting
     end
-    C->>P: b AUTHENTICATE XOAUTH2 [ir]
-    alt no IR
-        P-->>C: "+ "
-        C->>P: base64 IR (or "*" → b BAD)
+    C->>P: TLS ClientHello (SNI, ALPN)
+    break SNI no certificate carries / ALPN offered without imap
+        P--xC: TLS alert unrecognized_name / no_application_protocol
     end
-    P->>I: validate JWT (kid → key, alg pinned, iss/aud/exp/nbf, email_verified, typ=Bearer)
-    alt invalid
-        P-->>C: + base64(error result)
-        C->>P: AQ== (OAUTHBEARER) / empty line (XOAUTH2) / *
-        P-->>C: b NO [AUTHENTICATIONFAILED] Authentication failed (b BAD for *) (close after the last attempt)
-    else valid → email
-        P->>B: TCP + [PROXY v2] + TLS (verify backend verify_name)
-        B-->>P: * OK …
-        P->>B: P1 AUTHENTICATE XOAUTH2 base64(user=email ^A auth=Bearer jwt ^A^A)
-        alt P1 OK
-            B-->>P: P1 OK [CAPABILITY …] Logged in
-            P-->>C: b OK [CAPABILITY …] Logged in
-            C-->>B: byte relay (copy_bidirectional, [session] limits off by default)
-        else P1 NO / failure
-            P-->>C: b NO [AUTHENTICATIONFAILED] backend rejected token (close after the last attempt)
+    P-->>C: * OK [CAPABILITY … AUTH=XOAUTH2 AUTH=OAUTHBEARER (+PLAIN LOGIN by the legacy rules)]
+    loop each credential, up to limits.max_auth_attempts
+        C->>P: b AUTHENTICATE mech [ir]  or  b LOGIN user pass
+        break source blocked since the accept
+            P--xC: closed, credential not judged
         end
+        alt token (XOAUTH2, OAUTHBEARER)
+            P->>I: validate JWT (key, alg, iss, aud, exp, typ, identity_domains), OAUTHBEARER host = SNI
+            alt token invalid (bad_token)
+                P-->>C: + base64(error result)
+                C->>P: dummy answer (or *)
+                P-->>C: b NO [AUTHENTICATIONFAILED] Authentication failed
+            else authzid names another identity (authzid_mismatch)
+                P-->>C: b NO [AUTHORIZATIONFAILED] Authorization failed
+            else no route for the identity's domain (unknown_domain)
+                P-->>C: b NO [AUTHENTICATIONFAILED] backend rejected token
+            end
+        else password (LOGIN, PLAIN)
+            alt mechanism not offered here (blocked_endpoint)
+                P-->>C: b NO password authentication not available on this endpoint
+            else refused: rule, domain gate, route (2b), account check of the backend, throttle
+                P-->>C: b NO [AUTHENTICATIONFAILED] backend rejected credentials (padded)
+            end
+        end
+        opt credential passed the local checks, route chose the backend
+            P->>B: Pool.open: TCP, PROXY v2 (client_ip), TLS implicit or STARTTLS, greeting, capabilities
+            Note over P,B: before the credential a failing address gives way to the next, at most 3
+            P->>B: P1 AUTHENTICATE XOAUTH2 or OAUTHBEARER (auth_forward), PLAIN for a password
+            alt P1 OK, no UNAUTHENTICATE (CAPABILITY code or P2 CAPABILITY)
+                B-->>P: P1 OK [CAPABILITY …]
+                P-->>C: b OK [CAPABILITY …] Logged in
+                C-->>B: byte relay
+            else P1 NO (backend_reject)
+                P-->>C: b NO [AUTHENTICATIONFAILED] backend rejected token / credentials (password padded)
+            else outage: no address, tempfail, UNAUTHENTICATE, budget used up
+                P-->>C: b NO [UNAVAILABLE] Backend temporarily unavailable
+                break no authresult line, connection closed
+                    P--xC: close
+                end
+            end
+        end
+        Note over P: authresult line: result proto scope mech user peer reason pwfp rule listener backend
     end
+    Note over C,P: the connection closes after the last refused attempt
 ```
 
 ## SMTP submission (STARTTLS and implicit TLS)
@@ -214,41 +237,72 @@ sequenceDiagram
     autonumber
     participant C as SMTP client
     participant P as mail-auth-proxy
-    participant B as Postfix (submission)
-    C->>P: TCP connect
-    P-->>C: 220 <hostname> ESMTP
+    participant I as JWKS (cached)
+    participant B as Backend (addresses of the pool)
+    C->>P: TCP connect (587 STARTTLS or 465 implicit TLS)
+    break source blocked by the rate limit, or a connection limit reached
+        P--xC: closed at accept, no greeting
+    end
+    opt 587
+        P-->>C: 220 hostname ESMTP
+        C->>P: EHLO, STARTTLS
+        P-->>C: 250 STARTTLS, 220 2.0.0 Ready to start TLS
+    end
+    C->>P: TLS ClientHello (SNI, ALPN)
+    break SNI no certificate carries / ALPN of another protocol
+        P--xC: TLS alert unrecognized_name / no_application_protocol (120)
+    end
+    opt 465
+        P-->>C: 220 hostname ESMTP
+    end
     C->>P: EHLO
-    P-->>C: 250-<hostname> / 250 STARTTLS
-    C->>P: STARTTLS
-    P-->>C: 220 2.0.0 Ready to start TLS
-    C->>P: TLS handshake (SNI)
-    C->>P: EHLO
-    P-->>C: 250-… backend's extensions (cached probe) … 250 AUTH XOAUTH2 OAUTHBEARER (+PLAIN LOGIN)
-    C->>P: AUTH XOAUTH2 <ir>
-    P->>P: validate JWT → email
-    opt invalid
-        P-->>C: 334 base64(error result)
-        C->>P: empty line (XOAUTH2) / AQ== (OAUTHBEARER) / *
-        P-->>C: 535 5.7.8 Authentication credentials invalid (501 for *), + 421 (close) after the last attempt
+    P-->>C: 250 extensions every submission backend offers (cached probes), AUTH XOAUTH2 OAUTHBEARER (+PLAIN LOGIN)
+    loop each credential, up to limits.max_auth_attempts
+        C->>P: AUTH mech [ir]
+        break source blocked since the accept
+            P--xC: closed, credential not judged
+        end
+        alt token (XOAUTH2, OAUTHBEARER)
+            P->>I: validate JWT (key, alg, iss, aud, exp, typ, identity_domains), OAUTHBEARER host = SNI
+            alt token invalid (bad_token)
+                P-->>C: 334 base64(error result)
+                C->>P: dummy answer (or *)
+                P-->>C: 535 5.7.8 Authentication credentials invalid (501 for *)
+            else authzid names another identity (authzid_mismatch)
+                P-->>C: 535 5.7.8 Authentication credentials invalid
+            else no route for the identity's domain (unknown_domain)
+                P-->>C: 535 5.7.8 Authentication credentials invalid
+            end
+        else password (PLAIN, LOGIN)
+            alt mechanism not offered here (blocked_endpoint)
+                P-->>C: 504 5.5.4 password authentication not available on this endpoint
+            else refused: rule, domain gate, route (2b), account check of the backend, throttle
+                P-->>C: 535 5.7.8 Authentication credentials invalid (padded)
+            end
+        end
+        opt credential passed the local checks, route chose the backend
+            P->>B: Pool.open: TCP, PROXY v2 (client_ip), 220, EHLO, STARTTLS, TLS, EHLO (or implicit TLS)
+            Note over P,B: before the credential a failing address gives way to the next, at most 3
+            opt client_ip = xclient and the backend lists XCLIENT
+                P->>B: XCLIENT HELO PROTO PORT NAME ADDR, 220, EHLO
+            end
+            P->>B: AUTH XOAUTH2 or OAUTHBEARER (auth_forward), PLAIN for a password, response after 334
+            alt 235
+                B-->>P: 235
+                P-->>C: 235 2.7.0 Authentication successful
+                C-->>B: byte relay
+            else 510-599, or 500-509 to a password (backend_reject)
+                P-->>C: 535 5.7.8 Authentication credentials invalid (password padded)
+            else outage: no address, 4xx, XCLIENT misconfiguration, budget used up
+                P-->>C: 454 4.7.0 Temporary authentication failure
+                break no authresult line
+                    P--xC: 421 4.7.0 hostname closing connection
+                end
+            end
+        end
+        Note over P: authresult line: result proto scope mech user peer reason pwfp rule listener backend
     end
-    P->>B: TCP connect
-    B-->>P: 220
-    P->>B: EHLO / STARTTLS / TLS / EHLO
-    opt client_ip = "xclient" and backend advertises XCLIENT
-        P->>B: XCLIENT HELO=<client ehlo> PROTO=ESMTP NAME=[UNAVAILABLE] ADDR=<client ip>
-        B-->>P: 220
-        P->>B: EHLO
-    end
-    P->>B: AUTH XOAUTH2 base64(user=email ^A auth=Bearer jwt ^A^A)
-    alt 235
-        B-->>P: 235
-        P-->>C: 235 2.7.0 Authentication successful
-        C-->>B: byte relay
-    else other code
-        P-->>C: 535 5.7.8 …, + 421 (close) after the last attempt
-    else backend unreachable / TLS failure
-        P-->>C: 454 4.7.0 Temporary authentication failure + 421 (close)
-    end
+    Note over C,P: the reply to the last refused attempt is followed by 421 and the close
 ```
 
 ## ManageSieve (STARTTLS)
@@ -328,34 +382,70 @@ sequenceDiagram
     autonumber
     participant C as Sieve client
     participant P as mail-auth-proxy
-    participant B as Dovecot (ManageSieve)
-    C->>P: TCP connect
-    P-->>C: greeting (SASL "", backend's SIEVE, STARTTLS) + OK "ready"
+    participant I as JWKS (cached)
+    participant B as Backend (addresses of the pool)
+    C->>P: TCP connect (4190)
+    break source blocked by the rate limit, or a connection limit reached
+        P--xC: closed at accept, no greeting
+    end
+    P-->>C: greeting: SASL "", SIEVE of the backends that answered a probe, STARTTLS, OK
     C->>P: STARTTLS
     P-->>C: OK "Begin TLS negotiation now"
-    C->>P: TLS handshake (SNI)
-    alt capability cache cold (older than capability_cache_secs)
-        P->>B: TCP + [PROXY v2 LOCAL] + greeting + STARTTLS + TLS
-        B-->>P: post-TLS caps + OK
-        P->>B: LOGOUT
+    C->>P: TLS ClientHello (SNI, ALPN)
+    break SNI no certificate carries / ALPN offered without managesieve
+        P--xC: TLS alert unrecognized_name / no_application_protocol
     end
-    P-->>C: backend caps (no STARTTLS, SASL rewritten by the legacy rules) + OK "TLS negotiation successful."
-    C->>P: AUTHENTICATE "XOAUTH2" "<ir>"  (or {n+} literal)
-    P->>P: validate JWT → email
-    opt invalid
-        P-->>C: "base64(error result)"
-        C->>P: "AQ==" (OAUTHBEARER) / "" (XOAUTH2) / "*"
-        P-->>C: NO "Authentication failed" (close after the last attempt)
+    opt a capability cache older than capability_cache_secs
+        P->>B: probe through the pool: TCP, PROXY v2 LOCAL, greeting, STARTTLS, TLS, capabilities, LOGOUT
     end
-    P->>B: TCP + [PROXY v2] + greeting + STARTTLS + TLS + caps
-    P->>B: AUTHENTICATE "XOAUTH2" "base64(user=email ^A auth=Bearer jwt ^A^A)"
-    alt OK
-        B-->>P: OK "Logged in."
-        P-->>C: OK "Logged in."
-        C-->>B: byte relay
-    else NO / failure
-        P-->>C: NO "Authentication failed" (close after the last attempt)
+    alt every probe failed
+        P--xC: BYE "Service temporarily unavailable"
+    else
+        P-->>C: capabilities all backends have, SASL by the legacy rules, OK "TLS negotiation successful."
     end
+    loop each credential, up to limits.max_auth_attempts
+        C->>P: AUTHENTICATE "mech" "ir" (or literal)
+        break source blocked since the accept
+            P--xC: closed, credential not judged
+        end
+        alt token (XOAUTH2, OAUTHBEARER)
+            P->>I: validate JWT (key, alg, iss, aud, exp, typ, identity_domains), OAUTHBEARER host = SNI
+            alt token invalid (bad_token)
+                P-->>C: "base64(error result)"
+                C->>P: dummy answer (or "*")
+                P-->>C: NO "Authentication failed"
+            else authzid names another identity (authzid_mismatch)
+                P-->>C: NO "Authorization failed"
+            else no route for the identity's domain (unknown_domain)
+                P-->>C: NO "Authentication failed"
+            end
+        else password (PLAIN)
+            alt mechanism not offered here (blocked_endpoint)
+                P-->>C: NO "password authentication not available on this endpoint"
+            else refused: rule, domain gate, route (2b), account check of the backend, throttle
+                P-->>C: NO "Authentication failed" (padded)
+            end
+        end
+        opt credential passed the local checks, route chose the backend
+            P->>B: Pool.open: TCP, PROXY v2 (client_ip), greeting, STARTTLS, TLS, capabilities (or implicit TLS)
+            Note over P,B: before the credential a failing address gives way to the next, at most 3
+            P->>B: AUTHENTICATE XOAUTH2 or OAUTHBEARER (auth_forward), PLAIN for a password
+            alt OK
+                B-->>P: OK "Logged in."
+                P-->>C: OK "Logged in."
+                C-->>B: byte relay
+            else NO, BYE (AUTH-TOO-WEAK) (backend_reject)
+                P-->>C: NO "Authentication failed" (password padded)
+            else outage: no address, NO (TRYLATER), other BYE, UNAUTHENTICATE, budget used up
+                P-->>C: NO (TRYLATER) "Service temporarily unavailable"
+                break no authresult line, connection closed
+                    P--xC: close
+                end
+            end
+        end
+        Note over P: authresult line: result proto scope mech user peer reason pwfp rule listener backend
+    end
+    Note over C,P: the connection closes after the last refused attempt
 ```
 
 ## OAuth error result

@@ -32,6 +32,53 @@ client ──TLS──▶ mail-auth-proxy ────────────�
 
 Each connection is one tokio task. It takes the configuration in use when it is accepted and keeps it to its end ([configuration reload](#configuration-reload)). Connections share only the JWKS key set, the server certificates, the ManageSieve capability and SMTP EHLO caches of each backend, the health of each backend address, the legacy gate's caches and counters, the connection limits, the failed-login counters and the metrics. Trust boundaries and the threat model are in [SECURITY.md](../SECURITY.md#trust-boundaries).
 
+### Authentication decision
+
+The path every protocol shares, from the accept to the verdict on one credential
+(`auth::authorize`, with `legacy::Gate::check_routed` for passwords). The replies and the
+backend dialog of each protocol are in [protocols.md](protocols.md): [IMAP](protocols.md#imap-sequence),
+[SMTP](protocols.md#smtp-sequence), [ManageSieve](protocols.md#managesieve-sequence).
+
+```mermaid
+flowchart TD
+    A["accept"] --> L{"source blocked, or a connection limit reached?"}
+    L -- yes --> X1["closed at accept, no greeting"]
+    L -- no --> T{"TLS: SNI a certificate name, ALPN fits the protocol?"}
+    T -- no --> X2["TLS alert, closed"]
+    T -- yes --> G["greeting and dialog up to the credential"]
+    G --> CR["credential, up to limits.max_auth_attempts"]
+    CR --> SB{"source blocked since the accept?"}
+    SB -- yes --> X3["closed, credential not judged"]
+    SB -- no --> K{"token or password?"}
+    K -- token --> V["validate the JWT: key, algorithm, iss, aud, exp, typ, identity_domains, OAUTHBEARER host against SNI"]
+    V -- invalid --> R1["refused: bad_token"]
+    V -- "keys stale, budget used up" --> OUT
+    V -- valid --> AZ{"authzid names the identity?"}
+    AZ -- no --> R2["refused: authzid_mismatch"]
+    AZ -- yes --> RO{"a route for the identity's domain?"}
+    RO -- no --> R3["refused: unknown_domain"]
+    RO -- yes --> POOL
+    K -- password --> M{"mechanism offered on this connection?"}
+    M -- no --> R4["refused: blocked_endpoint"]
+    M -- yes --> GATE["size cap, legacy rule, domain gate, route (2b), account check of the backend, throttle"]
+    GATE -- refused --> R5["refused, padded like a wrong password"]
+    GATE -- "account check unavailable" --> OUT
+    GATE -- passed --> POOL
+    POOL["Pool.open: the backend's addresses in strategy order, failover before the credential, at most 3"]
+    POOL -- "no address answered" --> OUT
+    POOL -- open --> BA["backend login with the client's own credential"]
+    BA -- accepted --> OK["ok: relay"]
+    BA -- rejected --> R6["refused: backend_reject, a password padded"]
+    BA -- "temporary failure, misconfiguration, budget used up" --> OUT["outage: retry-later, connection closed"]
+    R1 & R2 & R3 & R4 & R5 & R6 & OK --> LOG["authresult line"]
+    OUT --> NOLOG["no authresult line, backend_errors_total"]
+```
+
+A refused credential leaves the connection open for the next attempt until the last one
+([D-GEN-1](standards.md#d-gen-1-limited-authentication-attempts-per-connection)); an
+outage on the password path is answered no earlier than a refusal
+([refusal replies and timing](#refusal-replies-and-timing)).
+
 ## Startup
 
 - The configuration is validated before anything else; an error aborts the start, and warnings are logged. File paths (`tls.cert`, `tls.key`, `ca_file`, `domains_file`, `doveadm_key_file`, `doveadm_ca_file`, `users_file`) must be absolute: a relative path would resolve against the working directory, so `--check-config` in a shell could pass on files the service never reads. A relative path is a validation error.
