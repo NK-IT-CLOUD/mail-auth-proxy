@@ -1,8 +1,8 @@
 # Standards compliance
 
-mail-auth-proxy terminates TLS for IMAP, SMTP submission and ManageSieve. It runs each protocol's dialog up to the point where the client presents a credential, checks that credential, logs in to a backend server with the client's own credential, and then relays bytes without looking at them. This document lists which parts of which specifications the proxy implements itself, where it deliberately differs, and where it falls short.
+mail-auth-proxy terminates TLS for IMAP, SMTP submission and ManageSieve. It runs each protocol's dialog up to the point where the client presents a credential, checks that credential, logs in to a backend server with the client's own credential, and then relays bytes, looking only at what could end the login (IMAP and ManageSieve, see [After login](#after-login)). This document lists which parts of which specifications the proxy implements itself, where it deliberately differs, and where it falls short.
 
-It covers the dialog before authentication, which the proxy speaks itself, and the proxy's client role toward the backend where client-side rules apply. After a successful login the connection is a transparent byte relay; mailbox commands, mail transactions and Sieve script management are the backend's responsibility and are not covered.
+It covers the dialog before authentication, which the proxy speaks itself, and the proxy's client role toward the backend where client-side rules apply. After a successful login the connection is relayed; apart from the commands that would end or replace the login, mailbox commands, mail transactions and Sieve script management are the backend's responsibility and are not covered.
 
 Status values:
 - Yes: implemented as specified.
@@ -185,7 +185,7 @@ Bearer tokens are validated locally as signed JWTs (JWS compact serialisation) a
 | XCLIENT only when advertised; xtext values; `IPV6:` prefix; `[UNAVAILABLE]`; at most 512 octets | | Postfix XCLIENT_README | Yes | NAME and ADDR always; HELO (the client's post-TLS EHLO or HELO name), PROTO and PORT where the backend lists them. A HELO name that is empty, longer than 255 characters or would push the command past 512 octets is sent as `[UNAVAILABLE]`. A backend that advertises XCLIENT while `submission.backend.client_ip` is not `xclient`, or still advertises it after the proxy's XCLIENT, is an outage: the client could send its own XCLIENT after login. |
 | EHLO again after XCLIENT's `220` | | XCLIENT_README | Yes | |
 | STARTTLS to the backend, EHLO again after TLS | MUST | RFC 3207 §4.2 | Yes | With the submission backend's `tls = "starttls"` (default) |
-| IMAP STARTTLS to the backend: capabilities discarded and asked again after TLS | MUST | RFC 9051 §6.2.1 | Yes | With the IMAP backend's `tls = "starttls"`; SASL-IR and UNAUTHENTICATE are read from the post-TLS list |
+| IMAP STARTTLS to the backend: capabilities discarded and asked again after TLS | MUST | RFC 9051 §6.2.1 | Yes | With the IMAP backend's `tls = "starttls"`; SASL-IR is read from the post-TLS list |
 | ManageSieve STARTTLS to the backend: capabilities read again after TLS | MUST | RFC 5804 §2.2 | Yes | With the ManageSieve backend's `tls = "starttls"` (default) |
 | Implicit TLS to the backend | | RFC 8314 §3 | Yes | `tls = "implicit"` per backend (default for IMAP): the handshake first, then the greeting |
 | SMTP client: no initial response if the AUTH line would exceed the command-line limit | MUST | RFC 4954 §4, RFC 5321 §4.5.3.1.4 | Yes | The response is always sent after `334`. A reply 500-509 (syntax class) to the response is a rejection for a password and an outage for a token. |
@@ -238,6 +238,20 @@ Metric names follow the Prometheus naming guidelines: an application prefix (`ma
 | `mail_auth_proxy_jwks_keys_skipped_total{issuer}` | counter |
 | `mail_auth_proxy_backend_login_duration_seconds{proto,le}` | histogram |
 
+## 9. After login
+
+The relay after login; details in [protocols](protocols.md#imap-and-managesieve-after-login).
+
+| Requirement | Level | Reference | Status | Notes |
+|---|---|---|---|---|
+| IMAP `UNAUTHENTICATE` | | RFC 8437 | No | Never offered: taken out of `CAPABILITY` responses and codes; the command gets `BAD` (RFC 9051 §7.1.3: unknown command) and never reaches the backend |
+| ManageSieve `UNAUTHENTICATE` | | RFC 5804 §2.14.1 | No | Never offered; the command gets `NO`, the answer to a command the server does not take, and never reaches the backend |
+| IMAP `LOGIN`, `AUTHENTICATE` only in the Not Authenticated state | | RFC 9051 §6.2 | Yes | Answered `BAD` by the proxy |
+| SMTP `AUTH` refused after a successful one | MUST | RFC 4954 §4 | N/A | The backend's: SMTP is relayed as it is, and Postfix answers `503 5.5.1` |
+| IMAP `COMPRESS=DEFLATE` | | RFC 4978 | No | Taken out of the capabilities; the command gets `BAD`: the guard could not read a compressed stream |
+| Non-synchronising literals `{n+}`, `{n-}` | | RFC 7888 | Yes | Accepted from the client; passed to the backend as synchronising literals, whose `+` the proxy does not relay |
+| Pipelining | MAY | RFC 9051 §5.5 | Partial | Commands outside the known set (`IDLE` among them) and literals wait for the backend's answer before the next client octets are read |
+
 ## Known deviations
 
 ### D-GEN-1: limited authentication attempts per connection
@@ -263,7 +277,7 @@ Metric names follow the Prometheus naming guidelines: an application prefix (`ma
   - IMAP: a server SHOULD NOT close the connection without an untagged `BYE` (RFC 9051 §3.4); a post-login autologout timer MUST be at least 30 minutes (RFC 9051 §5.4).
   - ManageSieve: `BYE` SHOULD be used when the server closes the connection; an autologout timer MUST be at least 30 minutes after authentication (RFC 5804 §1.2).
   - SMTP: a server closes only after QUIT, after a `421`, or after a timeout (RFC 5321 §3.8); a client treats an unexpected close as a temporary failure.
-- Rationale: after login the proxy relays bytes without parsing them, so it cannot tell whether the client is in the middle of a response. A `BYE` or `421` written into an IMAP or ManageSieve literal, or between the lines of an SMTP multi-line reply, would corrupt the client's data. A closed connection is something every client already handles. The idle limit counts traffic in both directions, which is at least as lenient as the RFC 9051 timer (reset by client commands); `--check-config` warns about either limit below 30 minutes. `max_session_secs` ends sessions that are not idle, which none of the three protocols foresees; it exists to bound how long a session outlives its credential.
+- Rationale: a limit can fire while the client is in the middle of a response. A `BYE` or `421` written into an IMAP or ManageSieve literal, or between the lines of an SMTP multi-line reply, would corrupt the client's data. A closed connection is something every client already handles. The idle limit counts traffic in both directions, which is at least as lenient as the RFC 9051 timer (reset by client commands); `--check-config` warns about either limit below 30 minutes. `max_session_secs` ends sessions that are not idle, which none of the three protocols foresees; it exists to bound how long a session outlives its credential.
 
 ### D-AUTH-1: password mechanisms are a policy decision
 

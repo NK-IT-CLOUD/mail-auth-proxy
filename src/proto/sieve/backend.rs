@@ -279,13 +279,13 @@ impl BackendLogin for SieveLogin<'_> {
     ) -> Result<Self::Conn, BackendError> {
         let pool = &self.backends[index].pool;
         // Up to the credential an address that fails gives way to the next.
-        let ((be, caps), member) = pool
+        let ((be, _caps), member) = pool
             .open(Some(credential.account()), |i| {
                 backend_session(&pool.members[i].conn, Some(self.origin), self.tuning)
             })
             .await?;
         let result = self
-            .authenticate(&pool.members[member].conn, be, &caps, credential)
+            .authenticate(&pool.members[member].conn, be, credential)
             .await;
         match &result {
             Ok(_) => pool.session(),
@@ -297,13 +297,12 @@ impl BackendLogin for SieveLogin<'_> {
 }
 
 impl SieveLogin<'_> {
-    /// The login on a session with `backend` that listed `caps`: never
-    /// retried on another address.
+    /// The login on a session with `backend`: never retried on another
+    /// address.
     async fn authenticate(
         &self,
         backend: &BackendConn,
         mut be: TlsStream<TcpStream>,
-        caps: &[String],
         credential: BackendCredential<'_>,
     ) -> Result<(TlsStream<TcpStream>, String), BackendError> {
         let fwd = credential.forward(backend);
@@ -328,10 +327,6 @@ impl SieveLogin<'_> {
                 .concat(),
             )
         };
-        // Checked before the credential is sent.
-        if caps.iter().any(|l| is_cap(l, "UNAUTHENTICATE")) {
-            return Err(anyhow!(crate::auth::UNAUTHENTICATE_OFFERED).into());
-        }
         be.write_all(auth_line.as_bytes()).await?;
         // The backend's reply; it is forwarded verbatim on OK.
         let mut be_reply = read_line(&mut be, self.tuning.idle).await?;

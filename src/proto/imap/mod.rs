@@ -142,9 +142,11 @@ pub async fn handle(
                     // Relay the backend's own tagged OK under the client's tag: its
                     // CAPABILITY response code is what the client may cache for the
                     // session (RFC 9051 section 7.1), so it must list the backend's real
-                    // post-login capabilities.
+                    // post-login capabilities, less those the relay's guard keeps
+                    // from the backend.
+                    let ok = format!("{tag} {logged_in}\r\n");
                     client
-                        .write_all(format!("{tag} {logged_in}\r\n").as_bytes())
+                        .write_all(&wire::guard::imap_response(ok.as_bytes()))
                         .await?;
                     wire::splice(&mut client, &mut be, metrics::Proto::Imap, tuning).await;
                     return Ok(());

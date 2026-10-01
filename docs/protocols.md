@@ -67,8 +67,7 @@ Each of these is an attempt: the connection stays open for another one, up to `l
 | OAuth valid, the backend's OAUTHBEARER error result has `status` `invalid_request` | `t NO [UNAVAILABLE] Backend temporarily unavailable` | none (counted in `mail_auth_proxy_backend_errors_total`) |
 | password, backend answers `NO` | `t NO [AUTHENTICATIONFAILED] backend rejected credentials`, after `failure_delay_ms` | `backend_reject` (with `pwfp`) |
 | backend unreachable, TLS or greeting failure, or the backend answers `NO` with a temporary RFC 5530 code (`[UNAVAILABLE]`, e.g. its passdb is down; `[INUSE]`, `[SERVERBUG]`, `[LIMIT]`) or `BAD` | `t NO [UNAVAILABLE] Backend temporarily unavailable` | none (counted in `mail_auth_proxy_backend_errors_total`) |
-| backend offers `UNAUTHENTICATE` (RFC 8437) in its greeting or after the login | `t NO [UNAVAILABLE] Backend temporarily unavailable`; the journal names the capability | none (counted in `mail_auth_proxy_backend_errors_total`) |
-| success | `t ` + the backend's own tagged reply text, e.g. `t OK [CAPABILITY IMAP4rev1 IDLE MOVE] Logged in` | `ok` |
+| success | `t ` + the backend's own tagged reply text, e.g. `t OK [CAPABILITY IMAP4rev1 IDLE MOVE] Logged in`, without `UNAUTHENTICATE` and `COMPRESS=…` ([after login](#imap-and-managesieve-after-login)) | `ok` |
 
 After a refused attempt the client may try again, up to `limits.max_auth_attempts` attempts per connection (default 3; [D-GEN-1](standards.md#d-gen-1-limited-authentication-attempts-per-connection)). The last one, a retry-later reply (`[UNAVAILABLE]`), an unparsable `LOGIN` and a command not valid before authentication close the connection.
 
@@ -78,16 +77,15 @@ Backend login steps:
 2. PROXY v2 header (`client_ip = "proxy_v2"`).
 3. `tls = "implicit"` (default): TLS handshake, verified; read the greeting, which must start with `* OK`. Its `[CAPABILITY …]` code is the capability list (without one: none).
    `tls = "starttls"` (RFC 9051 §6.2.1): read the plaintext greeting (`* OK`), send `P0 STARTTLS` and expect a tagged `OK`, TLS handshake, verified, then `P0 CAPABILITY`: its list replaces whatever the backend said before TLS.
-4. A capability list with `UNAUTHENTICATE` ends the login as an outage before the credential is sent.
-5. With `SASL-IR` in the list: `P1 AUTHENTICATE <mech> <ir>`, `<mech>` being `XOAUTH2` or `OAUTHBEARER` for a token (`auth_forward`) and `PLAIN` for a password. Without it: `P1 AUTHENTICATE <mech>`, and the response on its own line after the backend's `+` (RFC 4959 §3); any other reply to the bare command is an outage.
-6. Read up to 32 lines:
+4. With `SASL-IR` in the list: `P1 AUTHENTICATE <mech> <ir>`, `<mech>` being `XOAUTH2` or `OAUTHBEARER` for a token (`auth_forward`) and `PLAIN` for a password. Without it: `P1 AUTHENTICATE <mech>`, and the response on its own line after the backend's `+` (RFC 4959 §3); any other reply to the bare command is an outage.
+5. Read up to 32 lines:
    - `P1 OK…` means success; its text is relayed.
    - `P1 NO` means rejection, except with `[UNAVAILABLE]`, `[INUSE]`, `[SERVERBUG]` or `[LIMIT]`, which mean an outage.
    - `P1 BAD` means an outage for a token. For a password it means a rejection, unless it answers the proxy's own `*` cancel.
    - An untagged `* BYE` (e.g. Dovecot's connection limit, shutdown) is an outage.
    - For a token, the first `+` continuation is the error challenge (`+ <base64 JSON>`) and is answered with an empty line (XOAUTH2) or `AQ==` (OAUTHBEARER), after which the backend sends its tagged `NO`. Any other continuation is answered with `*` (cancel).
    - Untagged backend lines before the tagged reply are discarded.
-7. After `P1 OK`: the capabilities from its `[CAPABILITY …]` code or, without one, from a `P2 CAPABILITY` the proxy sends itself (the client never sees it). `UNAUTHENTICATE` among them is an outage: the logged-in client could otherwise return to the unauthenticated state and try passwords directly at the backend.
+6. After `P1 OK` the relay starts ([after login](#imap-and-managesieve-after-login)).
 
 Every step runs within the pre-auth budget (`timeouts.preauth_secs`, from the accept); running out is an outage.
 
@@ -136,13 +134,13 @@ sequenceDiagram
             P->>B: Pool.open: TCP, PROXY v2 (client_ip), TLS implicit or STARTTLS, greeting, capabilities
             Note over P,B: before the credential a failing address gives way to the next, at most 3
             P->>B: P1 AUTHENTICATE XOAUTH2 or OAUTHBEARER (auth_forward), PLAIN for a password
-            alt P1 OK, no UNAUTHENTICATE (CAPABILITY code or P2 CAPABILITY)
+            alt P1 OK
                 B-->>P: P1 OK [CAPABILITY …]
-                P-->>C: b OK [CAPABILITY …] Logged in
-                C-->>B: byte relay
+                P-->>C: b OK [CAPABILITY …] Logged in (UNAUTHENTICATE, COMPRESS= taken out)
+                C-->>B: relay through the command guard
             else P1 NO (backend_reject)
                 P-->>C: b NO [AUTHENTICATIONFAILED] backend rejected token / credentials (password padded)
-            else outage: no address, tempfail, UNAUTHENTICATE, budget used up
+            else outage: no address, tempfail, budget used up
                 P-->>C: b NO [UNAVAILABLE] Backend temporarily unavailable
                 break no authresult line, connection closed
                     P--xC: close
@@ -370,7 +368,7 @@ Before `AUTHENTICATE`, `CAPABILITY` (the capability list again, then `OK "Capabi
 | the pre-auth budget runs out during token validation, the account check or the backend login | `NO (TRYLATER) "Service temporarily unavailable"` | none (counted in `mail_auth_proxy_backend_errors_total`) |
 | backend reply `NO` (except `NO (TRYLATER)`), `BYE (AUTH-TOO-WEAK)`, `BYE (TRANSITION-NEEDED)`, or any other reply that is neither `OK` nor `BYE` | `NO "Authentication failed"` | `backend_reject` |
 | the backend's OAUTHBEARER error result has `status` `invalid_request` | `NO (TRYLATER) "Service temporarily unavailable"` | none (counted in `mail_auth_proxy_backend_errors_total`) |
-| backend session fails (connect, TLS, capabilities), its capabilities list `UNAUTHENTICATE` (RFC 5804 §2.14.1, checked before the credential is sent), or it answers `NO (TRYLATER)` or any other `BYE` (shutdown, connection limit) | `NO (TRYLATER) "Service temporarily unavailable"` | none (counted in `mail_auth_proxy_backend_errors_total`) |
+| backend session fails (connect, TLS, capabilities), or it answers `NO (TRYLATER)` or any other `BYE` (shutdown, connection limit) | `NO (TRYLATER) "Service temporarily unavailable"` | none (counted in `mail_auth_proxy_backend_errors_total`) |
 | backend `OK …` | the backend's reply line verbatim (e.g. `OK "Logged in."`), then relay | `ok` |
 
 The backend session is opened only after the credential has passed the local checks. It sends `AUTHENTICATE "<mech>" "<ir>"` (`XOAUTH2` or `OAUTHBEARER` for a token, `PLAIN` for a password), with a response over 1024 octets (any sizable token) as a literal `{n+}` instead of the quoted string (RFC 5804 §4), and reads the reply. For a token, a reply that is a string (quoted, or a literal `{n}` of at most 4096 octets) is the backend's error challenge: it is answered with `""` (XOAUTH2) or `"AQ=="` (OAUTHBEARER), and the next line is the verdict. An authenticated session therefore uses one backend connection, plus one probe connection when the capability cache is cold.
@@ -433,10 +431,10 @@ sequenceDiagram
             alt OK
                 B-->>P: OK "Logged in."
                 P-->>C: OK "Logged in."
-                C-->>B: byte relay
+                C-->>B: relay through the command guard
             else NO, BYE (AUTH-TOO-WEAK) (backend_reject)
                 P-->>C: NO "Authentication failed" (password padded)
-            else outage: no address, NO (TRYLATER), other BYE, UNAUTHENTICATE, budget used up
+            else outage: no address, NO (TRYLATER), other BYE, budget used up
                 P-->>C: NO (TRYLATER) "Service temporarily unavailable"
                 break no authresult line, connection closed
                     P--xC: close
@@ -492,6 +490,27 @@ the result is `{"status":"invalid_token"}`.
   credential: its `authresult` line is `reason="protocol"` with the mechanism and the
   SASL user, and it counts neither as a failed login nor in the rate limit.
 
+## IMAP and ManageSieve after login
+
+After the login the proxy relays both ways and passes the client's commands through a command guard (`wire::guard`). It keeps a session from returning to the unauthenticated state, or from presenting a second credential, whatever the backend offers or does ([SECURITY.md](../SECURITY.md#invariants), invariant 4). SMTP is relayed as it is; Postfix refuses a second `AUTH` with `503 5.5.1 Error: already authenticated` (RFC 4954 §4).
+
+| Client sends | IMAP | ManageSieve |
+|---|---|---|
+| `UNAUTHENTICATE` (RFC 8437, RFC 5804 §2.14.1) | `t BAD Command not permitted after login` | `NO "Command not permitted after login"` |
+| `LOGIN`, `AUTHENTICATE` | `t BAD Command not permitted after login` | `NO "Command not permitted after login"` (`AUTHENTICATE`) |
+| `STARTTLS`, `COMPRESS` (IMAP) | `t BAD Command not permitted after login` | `NO "Command not permitted after login"` (`STARTTLS`) |
+| such a command where the proxy cannot answer it: inside `IDLE`, in literal data, after the backend answered unexpectedly (IMAP), with a literal argument, or (ManageSieve) while an earlier command is unanswered | the session ends without a message; `WARN … session closed` names the command; `mail_auth_proxy_sessions_ended_total{reason="blocked"}` | the same |
+
+The backend never receives these commands. The reply is that of a server that does not know the command (RFC 9051 §7.1.3 `BAD`; ManageSieve answers it with `NO`), which is what the client has to expect: the capability is not offered. The tag of a refused IMAP command is echoed; an invalid tag gets an untagged `* BAD`. A command is compared ASCII case-insensitively, also when quoted, after leading blanks, or after a tag that holds the word; lines are ended by LF with or without CR.
+
+Capabilities: `UNAUTHENTICATE` and `COMPRESS=…` are taken out of `* CAPABILITY` responses and `[CAPABILITY …]` response codes (the login's tagged OK included); `"UNAUTHENTICATE"` and `"STARTTLS"` out of the ManageSieve `CAPABILITY` response. Literal data passes unchanged.
+
+Framing. The guard reads the client stream as the backend does, so that a command hidden where the proxy sees data cannot pass:
+
+- IMAP: a literal (`{n}`, `{n+}`, `{n-}`, `~{n}`, RFC 9051 §4.3, RFC 7888, RFC 3516) at the end of a command line is passed to the backend as a synchronising one (`{n}`), and the client is not read on until the backend answers: after its `+` the literal's octets pass unchecked (a `+` the client did not ask for, for a non-synchronising literal, is not relayed); after a tagged reply the command is over, and octets the client sent anyway are dropped. Commands other than the RFC 9051 commands and the common extensions (`IDLE` among them) are completed (tagged reply) before the next command is read; a `+` to one of them lets one client line through (`DONE`). A `+` nobody asked for, an untagged `BAD` while the guard waits, a tag over 64 characters or a literal in place of the tag or command make the guard check every line for the rest of the session, literal data included.
+- ManageSieve: client literals (`{n+}`, also `{n}`) have no continuation (RFC 5804 §4), so the guard cannot know whether the backend read one. Literal data is checked line by line for `UNAUTHENTICATE`; a line that starts with it ends the session. Other script text (a comment `# UNAUTHENTICATE`, a string `"UNAUTHENTICATE"`) passes.
+- Server responses are framed by their literals (not those of status responses, whose text may end in `{n}`, RFC 9051 §7.1), so a mail body or a script is never taken for a response.
+
 ## Surprising and client-incompatible behaviour
 
 1. **A few authentication attempts per connection.** A connection takes `limits.max_auth_attempts` attempts (default 3), so a client can fall back from one mechanism to another (Python `smtplib.login()` from PLAIN to LOGIN after a 535). After the last one, after a retry-later reply, after an IMAP command that is not valid before authentication and after a malformed command ([D-GEN-1](standards.md#d-gen-1-limited-authentication-attempts-per-connection)) the connection closes; SMTP announces the close with `421 4.7.0 <hostname> closing connection`. When the rate limit has blocked the source in the meantime, the next credential is not judged and the connection closes without an answer.
@@ -503,7 +522,7 @@ the result is `{"status":"invalid_token"}`.
 7. **Password mechanisms that are not offered are refused before the password.** `AUTHENTICATE PLAIN` / `AUTH PLAIN` without an initial response, and SASL `LOGIN`, on a connection without a matching legacy rule get IMAP `NO`, SMTP `504 5.5.4` or ManageSieve `NO` at once; the client is never asked for a password the proxy would not use, nor sent the continuation for an IMAP `LOGIN` literal. A password already sent (IMAP `LOGIN` with a quoted string or a non-synchronising literal, a PLAIN initial response) is still logged with its fingerprint.
 8. **OAUTHBEARER `host` must be the name the client connected to.** When the client sent SNI, a different `host` (another name or alias of the server) is refused like an invalid token. XOAUTH2 has no `host`; without SNI nothing is compared.
 9. **Slow IdPs and backends count against the pre-auth budget.** Token validation (including a JWKS refresh for an unknown `kid`), the legacy account check and the backend login all have to finish within `timeouts.preauth_secs` (default 60 s) from the accept. A login that runs out gets the retry-later reply, not a failure, and is not logged as a failed login.
-10. **A backend that offers `UNAUTHENTICATE` (RFC 8437) gets no logins.** IMAP (greeting or post-login capabilities) and ManageSieve (capabilities before the credential) logins then end as an outage, with a journal line that names the capability; ManageSieve clients never see the capability.
+10. **No `UNAUTHENTICATE`, second login, `COMPRESS` or `STARTTLS` after the login** (IMAP, ManageSieve), whatever the backend offers: the proxy answers them, or ends the session where it cannot ([after login](#imap-and-managesieve-after-login)). IMAP clients lose `COMPRESS=DEFLATE`; a literal costs one round trip, also a non-synchronising one; `IDLE` and commands the proxy does not know are completed before the next command is read. A ManageSieve script with a line that starts with `UNAUTHENTICATE` cannot be uploaded (the session ends).
 11. **Token rules are per issuer.** A wrong `token_type` either rejects every token (`keycloak` for an IdP without the `typ` claim) or lets ID tokens with an accepted audience in (`any`); `email_verified` must be a real boolean when required.
 12. **Connection-limit, rate-limit and timeout closes are silent:** no `421`/`554`/`BYE`. The one exception is a client that does not answer the [OAuth error result](#oauth-error-result): it still gets the failure reply. A source blocked after too many failed logins ([architecture.md](architecture.md#failed-login-rate-limit)) has every new connection closed at accept, before TLS or any greeting, on all three protocols, until the block ends; the client sees a connection failure, not an authentication error. The replies to the failed logins before the block are unchanged; a rejected token with its error-result round trip counts once.
 13. **Session limits after authentication are off by default and close silently.** TCP keepalive is on; `session.idle_limit_secs` and `session.max_session_secs` are off. When one of them ends a session, the connection closes without `BYE`/`421`. A session does not end at the token's `exp` ([architecture.md](architecture.md#after-authentication)).

@@ -88,7 +88,9 @@ async fn traffic_keeps_the_session_open() {
     while t0.elapsed() < Duration::from_secs(5) {
         tokio::time::sleep(Duration::from_millis(700)).await;
         c.send(&format!("i{i} IDLE")).await;
-        assert_eq!(c.line().await, format!("ECHO i{i} IDLE"));
+        assert_eq!(c.line().await, "+ idling");
+        c.send("DONE").await;
+        assert_eq!(c.line().await, format!("i{i} OK Idle completed."));
         i += 1;
     }
     assert_eq!(h.proxy.metric(&ended(Kind::Imap, "idle_limit")).await, 0);

@@ -75,8 +75,8 @@ const SASL_FULL: &[u8] = b"\"SASL\" \"XOAUTH2 OAUTHBEARER PLAIN\"\r\n";
 /// The post-TLS capability lines for the client (each with CRLF, without
 /// the final OK) from the backend's: SASL rewritten to what this endpoint
 /// offers (`plain`: the legacy gate allows PLAIN), STARTTLS dropped (already
-/// done) and UNAUTHENTICATE dropped (the proxy does not offer it; a backend
-/// with it gets no login, see `auth::UNAUTHENTICATE_OFFERED`).
+/// done) and UNAUTHENTICATE dropped (the proxy does not offer it; after the
+/// login the relay's guard keeps it from the backend, see `wire::guard`).
 fn rewrite_caps(be_caps: &[String], plain: bool) -> String {
     let mut caps = String::new();
     for cap_line in be_caps {

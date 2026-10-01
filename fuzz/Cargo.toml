@@ -1,6 +1,7 @@
-# Fuzz targets for the pre-auth parsers (cargo-fuzz, libFuzzer). A crate of
-# its own with its own lock file and workspace: the main build, its
-# Cargo.lock and cargo-deny never see it. See CONTRIBUTING.md, "Fuzzing".
+# Fuzz targets for the pre-auth parsers and the relay's command guard
+# (cargo-fuzz, libFuzzer). A crate of its own with its own lock file and
+# workspace: the main build, its Cargo.lock and cargo-deny never see it. See
+# CONTRIBUTING.md, "Fuzzing".
 [package]
 name = "mail-auth-proxy-fuzz"
 version = "0.0.0"
@@ -98,6 +99,13 @@ bench = false
 [[bin]]
 name = "domain"
 path = "fuzz_targets/domain.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "relay_guard"
+path = "fuzz_targets/relay_guard.rs"
 test = false
 doc = false
 bench = false

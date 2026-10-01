@@ -48,6 +48,28 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   domain. The login the backend gets and the log show stays as the client sent it; the
   local part is compared as before. The throttle counts the spellings of one address
   together. New fuzz target `domain`.
+- A backend that offers `UNAUTHENTICATE` is no longer an outage: Stalwart can be used as
+  an IMAP backend. The proxy no longer sends its own `CAPABILITY` after an IMAP login.
+- IMAP after login: every literal waits for the backend's `+` (a non-synchronising one is
+  passed on as synchronising, and the `+` is not relayed), and `IDLE` and commands the
+  proxy does not know are completed before the next command is read. IMAP clients no
+  longer get `COMPRESS=DEFLATE`.
+
+### Security
+- IMAP and ManageSieve: after the login no client command can take the session back to
+  the unauthenticated state or present a second credential, whatever the backend offers
+  or does. The relay passes the client's commands through a guard that keeps
+  `UNAUTHENTICATE` (RFC 8437, RFC 5804 §2.14.1), `AUTHENTICATE`, IMAP `LOGIN`,
+  `STARTTLS` and IMAP `COMPRESS` from the backend: at a command position they get
+  `<tag> BAD` or `NO "Command not permitted after login"`, elsewhere (inside `IDLE`, in
+  literal data) the session ends (`mail_auth_proxy_sessions_ended_total{reason="blocked"}`).
+  Before, a backend that took `UNAUTHENTICATE` without offering it (Stalwart's
+  ManageSieve) let a logged-in client try passwords for any account past the password
+  gate and the rate limit. Dovecot, Pigeonhole and Postfix refuse such commands
+  themselves.
+- `UNAUTHENTICATE` and `COMPRESS=…` are taken out of the IMAP capabilities after the
+  login (`* CAPABILITY`, `[CAPABILITY …]` codes), `"UNAUTHENTICATE"` and `"STARTTLS"` out
+  of the ManageSieve `CAPABILITY` response.
 
 ## [0.4.0] - 2026-09-29
 

@@ -1,7 +1,8 @@
 //! Entry points for the fuzz targets in `fuzz/`. Compiled only with
 //! `--cfg fuzzing` (set by cargo-fuzz), never in a release build: thin
-//! wrappers that make the pre-auth parsers reachable from outside the crate.
-//! Not an API; see CONTRIBUTING.md, "Fuzzing".
+//! wrappers that make the pre-auth parsers and the relay's command guard
+//! reachable from outside the crate. Not an API; see CONTRIBUTING.md,
+//! "Fuzzing".
 
 use anyhow::Result;
 use std::time::Duration;
@@ -17,6 +18,7 @@ pub use crate::auth::sasl::{
 pub use crate::auth::token::{TokenError, Validator};
 pub use crate::domain::{account_key as domain_account_key, canonical as domain_canonical};
 pub use crate::proto::imap::preauth::ClientAuth;
+pub use crate::wire::guard::{Dialect as GuardDialect, Event as GuardEvent, Guard};
 pub use crate::wire::line::{
     decode_login_field, read_client_line, read_line, read_sasl_response, verb_is, LineError,
 };

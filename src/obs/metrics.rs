@@ -270,14 +270,18 @@ pub enum SessionEnd {
     /// A read or write failed: reset, or a peer dropped by TCP keepalive or
     /// the retransmission timeout.
     Error,
+    /// The client sent a command the relay keeps from the backend where it
+    /// cannot refuse it (`wire::guard`).
+    Blocked,
 }
 
-const SESSION_ENDS: [SessionEnd; 5] = [
+const SESSION_ENDS: [SessionEnd; 6] = [
     SessionEnd::ClientClose,
     SessionEnd::BackendClose,
     SessionEnd::IdleLimit,
     SessionEnd::MaxSession,
     SessionEnd::Error,
+    SessionEnd::Blocked,
 ];
 
 impl SessionEnd {
@@ -289,6 +293,7 @@ impl SessionEnd {
             SessionEnd::IdleLimit => "idle_limit",
             SessionEnd::MaxSession => "max_session",
             SessionEnd::Error => "error",
+            SessionEnd::Blocked => "blocked",
         }
     }
 

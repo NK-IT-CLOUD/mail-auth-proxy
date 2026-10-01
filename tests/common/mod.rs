@@ -862,19 +862,108 @@ fn oauthbearer_error(login: &str) -> String {
 
 /// After a successful login: record and echo every line as `ECHO <line>`;
 /// `BACKEND-CLOSE` drops the connection (no TLS close_notify), as a backend
-/// that ends the session.
-async fn echo<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S, rec: &Rec) {
+/// that ends the session. IMAP and ManageSieve also act on what the relay's
+/// guard must keep in order (`echo_imap`, `echo_sieve`).
+async fn echo<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S, rec: &Rec, kind: Kind) {
     while let Some(l) = read_line_raw(s).await {
         rec.update(|r| r.relayed.push(l.clone()));
         if l == "BACKEND-CLOSE" {
             return;
         }
-        if s.write_all(format!("ECHO {l}\r\n").as_bytes())
-            .await
-            .is_err()
-        {
+        let reply = match kind {
+            Kind::Imap => echo_imap(s, rec, &l).await,
+            Kind::Sieve => echo_sieve(s, rec, &l).await,
+            Kind::Smtp => None,
+        };
+        let reply = reply.unwrap_or_else(|| format!("ECHO {l}\r\n"));
+        if s.write_all(reply.as_bytes()).await.is_err() {
             return;
         }
+    }
+}
+
+/// The post-login capabilities of the IMAP mock: what Stalwart offers
+/// (RFC 8437 UNAUTHENTICATE, COMPRESS=DEFLATE).
+pub const IMAP_POSTLOGIN_CAPS: &str =
+    "IMAP4rev1 IMAP4rev2 LITERAL+ UNAUTHENTICATE COMPRESS=DEFLATE IDLE MOVE";
+
+/// A literal marker `{n}` / `{n+}` at the end of `l`: `(n, synchronizing)`.
+fn literal_marker(l: &str) -> Option<(usize, bool)> {
+    let inner = l.strip_suffix('}')?;
+    let open = inner.rfind('{')?;
+    let n = &inner[open + 1..];
+    match n.strip_suffix('+') {
+        Some(n) => n.parse().ok().map(|n| (n, false)),
+        None => n.parse().ok().map(|n| (n, true)),
+    }
+}
+
+/// Read a literal of `n` octets and record it as `LITERAL <data>`.
+async fn read_literal<S: AsyncRead + Unpin>(s: &mut S, rec: &Rec, n: usize) -> Option<()> {
+    let mut data = vec![0u8; n];
+    s.read_exact(&mut data).await.ok()?;
+    let data = String::from_utf8_lossy(&data).into_owned();
+    rec.update(|r| r.relayed.push(format!("LITERAL {data}")));
+    Some(())
+}
+
+/// IMAP after login like a server that takes every command it knows,
+/// UNAUTHENTICATE included, offered or not: a literal gets `+` (a
+/// synchronizing one) and is read; IDLE runs until the next line;
+/// CAPABILITY lists `IMAP_POSTLOGIN_CAPS`.
+async fn echo_imap<S: AsyncRead + AsyncWrite + Unpin>(
+    s: &mut S,
+    rec: &Rec,
+    l: &str,
+) -> Option<String> {
+    let mut line = l.to_string();
+    // A command with literals: each is read, then the line goes on.
+    while let Some((n, sync)) = literal_marker(&line) {
+        if sync {
+            s.write_all(b"+ Ready for literal data\r\n").await.ok()?;
+        }
+        read_literal(s, rec, n).await?;
+        let rest = read_line_raw(s).await?;
+        rec.update(|r| r.relayed.push(rest.clone()));
+        line = rest;
+    }
+    let mut w = l.splitn(3, ' ');
+    let (tag, cmd) = (w.next().unwrap_or(""), w.next().unwrap_or(""));
+    match cmd.to_ascii_uppercase().as_str() {
+        "IDLE" => {
+            s.write_all(b"+ idling\r\n").await.ok()?;
+            let done = read_line_raw(s).await?;
+            rec.update(|r| r.relayed.push(done.clone()));
+            Some(format!("{tag} OK Idle completed.\r\n"))
+        }
+        "CAPABILITY" => Some(format!(
+            "* CAPABILITY {IMAP_POSTLOGIN_CAPS}\r\n{tag} OK [CAPABILITY {IMAP_POSTLOGIN_CAPS}] Capability completed.\r\n"
+        )),
+        "UNAUTHENTICATE" => Some(format!("{tag} OK Unauthenticated.\r\n")),
+        _ if literal_marker(l).is_some() => Some(format!("{tag} OK {cmd} completed.\r\n")),
+        _ => None,
+    }
+}
+
+/// ManageSieve after login like a server that takes UNAUTHENTICATE without
+/// offering it to the proxy: CAPABILITY lists it, a literal is read.
+async fn echo_sieve<S: AsyncRead + AsyncWrite + Unpin>(
+    s: &mut S,
+    rec: &Rec,
+    l: &str,
+) -> Option<String> {
+    if let Some((n, _)) = literal_marker(l) {
+        read_literal(s, rec, n).await?;
+        let rest = read_line_raw(s).await?;
+        rec.update(|r| r.relayed.push(rest.clone()));
+        return Some(format!("OK \"{l}\"\r\n"));
+    }
+    match l.to_ascii_uppercase().as_str() {
+        "CAPABILITY" => Some(
+            "\"IMPLEMENTATION\" \"mock\"\r\n\"SIEVE\" \"fileinto\"\r\n\"UNAUTHENTICATE\"\r\n\"VERSION\" \"1.0\"\r\nOK \"Capability completed.\"\r\n".into(),
+        ),
+        "UNAUTHENTICATE" => Some("OK \"Unauthenticated.\"\r\n".into()),
+        _ => None,
     }
 }
 
@@ -1011,7 +1100,7 @@ async fn mock_imap(
             s.write_all(format!("ECHO {l}\r\n").as_bytes()).await?;
         }
     }
-    echo(&mut s, &rec).await;
+    echo(&mut s, &rec, Kind::Imap).await;
     Ok(())
 }
 
@@ -1156,7 +1245,7 @@ async fn mock_smtp(
                 };
                 s.write_all(reply).await?;
                 if v == Verdict::Ok {
-                    echo(&mut s, &rec).await;
+                    echo(&mut s, &rec, Kind::Smtp).await;
                 }
                 return Ok(());
             }
@@ -1272,7 +1361,7 @@ async fn mock_sieve(
     };
     s.write_all(reply).await?;
     if v == Verdict::Ok {
-        echo(&mut s, &rec).await;
+        echo(&mut s, &rec, Kind::Sieve).await;
     }
     Ok(())
 }

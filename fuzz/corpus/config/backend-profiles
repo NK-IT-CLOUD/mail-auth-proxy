@@ -20,10 +20,8 @@
 #
 # (192.0.2.20: the proxy's address as Stalwart sees it.)
 #
-# Check before use: Stalwart lists RFC 8437 (IMAP UNAUTHENTICATE) among its
-# supported extensions. The proxy refuses to log in to a backend that offers
-# UNAUTHENTICATE (the client could leave its login and try passwords past the
-# proxy), so IMAP logins end as an outage while Stalwart advertises it.
+# Stalwart offers RFC 8437 (IMAP UNAUTHENTICATE); the proxy keeps the command
+# from it and does not relay the capability.
 
 config_version = 2
 

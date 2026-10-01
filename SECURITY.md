@@ -53,7 +53,7 @@ relays bytes. It never holds a master password or any other credential of its ow
 | Log injection | client text escaped or reduced to a fixed character set in every log field |
 | A rogue or intercepted backend | backend TLS always verified; no option to disable it |
 | An authenticated SMTP client sending its own `XCLIENT` to impersonate another user | the proxy never relays into a session in which the backend still offers `XCLIENT`. A backend that advertises it while the submission backend's `client_ip` is not `xclient`, or still advertises it after the proxy's own `XCLIENT` (the client's address is itself authorized), is treated as misconfigured, and the login fails as an outage |
-| A logged-in client returning to the unauthenticated state (`UNAUTHENTICATE`, RFC 8437) to try passwords directly at the backend | the proxy never relays into such a session: a backend that offers `UNAUTHENTICATE` gets no login (an outage), and the capability is not passed to clients |
+| A logged-in client returning to the unauthenticated state (`UNAUTHENTICATE`, RFC 8437, RFC 5804 §2.14.1) or presenting a second credential, to try passwords directly at the backend | the relay's command guard keeps these commands from the backend whatever it offers or does, and takes `UNAUTHENTICATE` out of the capabilities it relays (invariant 4) |
 | Bans of legitimate users during an outage | outages are answered with retry-later and never logged as failed logins |
 | One issuer asserting identities that belong to another | `oauth.issuers[].identity_domains`: an issuer logs in only to addresses in its domains. Without it, all issuers share one identity namespace, so an account name valid at issuer A can be asserted by issuer B; with more than one issuer the configuration warns about each issuer without it ([D-JWT-3](docs/standards.md#d-jwt-3-identity-namespace-across-issuers)) |
 
@@ -104,6 +104,26 @@ relays bytes. It never holds a master password or any other credential of its ow
    The same token is then replayed to the backend, which must validate it too.
 3. **Every backend hop is TLS-verified** against the backend's `verify_name` and trust
    anchors (system store or `ca_file`). There is no option to disable verification.
+4. **A logged-in session stays logged in as the credential the proxy judged.** After
+   the login the IMAP and ManageSieve relay passes the client's commands through a
+   guard that keeps these from the backend, whatever the backend offers or does:
+   - IMAP: `UNAUTHENTICATE` (RFC 8437), `AUTHENTICATE` and `LOGIN` (a second
+     credential), `STARTTLS` and `COMPRESS` (either would turn the rest of the stream
+     into bytes the guard cannot read);
+   - ManageSieve: `UNAUTHENTICATE` (RFC 5804 §2.14.1), `AUTHENTICATE`, `STARTTLS`.
+
+   The guard frames the client stream as the backend does (lines, quoted strings,
+   literals) and lets octets pass unchecked only where the backend has shown that it
+   reads them as literal data: an IMAP literal after the backend's `+` (non-synchronising
+   literals are passed on as synchronising ones for this). ManageSieve has no such
+   confirmation, so its literal data is checked line by line for `UNAUTHENTICATE`. A
+   backend answer the framing does not expect makes IMAP check every line for the rest
+   of the session. A blocked command at a sure command position is answered by the
+   proxy (`<tag> BAD`, `NO`); anywhere else the session ends (`reason="blocked"` in
+   `mail_auth_proxy_sessions_ended_total`). `UNAUTHENTICATE` and `COMPRESS=…` (IMAP),
+   `"UNAUTHENTICATE"` and `"STARTTLS"` (ManageSieve) are taken out of the capabilities
+   the proxy relays. SMTP has no such command: a second `AUTH` must be refused by the
+   backend (RFC 4954 §4; Postfix answers `503 5.5.1 Error: already authenticated`).
 
 ### Hardening
 
@@ -167,12 +187,11 @@ relays bytes. It never holds a master password or any other credential of its ow
   client as the proxy's address: its own per-address limits and bans then act on all
   users at once, and its logs cannot tell clients apart. Prefer `proxy_v2` or `xclient`
   and restrict the backend listener to the proxy; the proxy warns about `none`.
-- **No `UNAUTHENTICATE` at the backend.** The IMAP and ManageSieve backends must not offer
-  `UNAUTHENTICATE` (RFC 8437, RFC 5804 §2.14.1). After login the proxy relays bytes
-  blindly, so a client could leave its login and try passwords for any account past the
-  password gate and the rate limit. While a backend offers it, every login there is an
-  outage (retry-later, counted in `mail_auth_proxy_backend_errors_total`), with a
-  journal line that names the capability.
+- **No second SMTP login at the backend.** The submission backend must refuse `AUTH`
+  after a successful one (RFC 4954 §4), as Postfix does; the proxy relays SMTP after the
+  login without looking at it. IMAP and ManageSieve need nothing of the kind: the relay
+  keeps `UNAUTHENTICATE` and a second login from the backend (invariant 4), so a backend
+  that offers `UNAUTHENTICATE`, such as Stalwart, can be used.
 - **Audiences.** Give the mail audience only to mail clients. Any token with an accepted
   audience, issuer and identity opens that mailbox.
 - **`token_type = "any"`** also accepts ID tokens that carry an accepted audience; use it

@@ -51,7 +51,7 @@ A single crate with a library (`src/lib.rs`) and a thin binary (`src/main.rs`).
 | `packaging/` | systemd unit, sysusers.d, nfpm manifest, maintainer scripts, hermetic build, package smoke test and systemd start test |
 | `packaging/public-files.txt`, `public-tree.sh`, `leak-gate*.sh` | release tooling: the list of public paths, the script that builds the public tree from it, and the leak gate (with its self-test) that checks a tree or commit range before publication |
 | `contrib/crowdsec/` | CrowdSec parser and scenarios with `cscli hubtest` cases |
-| `fuzz/` | cargo-fuzz targets for the pre-auth parsers, their seed corpus and dictionaries (a crate of its own, see [Fuzzing](#fuzzing)) |
+| `fuzz/` | cargo-fuzz targets for the pre-auth parsers and the command guard after login, their seed corpus and dictionaries (a crate of its own, see [Fuzzing](#fuzzing)) |
 | `docs/` | user documentation ([index](docs/README.md)) |
 
 ## Building and testing
@@ -109,6 +109,7 @@ cargo install cargo-fuzz --locked
 | `token` | `auth/token.rs`: unverified `iss`, header and payload decoding, claim checks | no token without a valid signature passes; the identity is one plain address; error texts carry no control characters |
 | `config` | `config::parse`, `config::plan` (the reload comparison) | a valid configuration printed with `--print-config` parses again, is valid and compares as unchanged; two configurations separated by a line `#---` compare symmetrically, with changes exactly when their printed forms differ |
 | `backend_auth` | `auth/sasl.rs`: the backend's OAUTHBEARER error result (RFC 7628 §3.2.2) and the forwarded OAUTHBEARER response; `proto/sieve/backend.rs`: the ManageSieve challenge string (RFC 5804 §4) | a status that reaches a log line is a short plain word; nothing read past the challenge; a literal challenge at most 4096 octets; build/parse roundtrip of the forwarded response |
+| `relay_guard` | `wire/guard.rs`: the command guard after login, client and backend octets interleaved in any chunks (IMAP and ManageSieve framing: lines, quoted strings, literals, continuations) | until the backend sends a `+`, no complete line naming `UNAUTHENTICATE` (ManageSieve: first word; IMAP: after a tag) reaches the backend |
 | `tls_not_after` | `server/tls.rs`: the DER walk to a certificate's `notAfter` (RFC 5280 §4.1) | on raw bytes and as the time value in a certificate skeleton: never a time past year 9999, every well-formed time from 1970 on parses |
 
 Run a target from `fuzz/`. New inputs go to the first directory; keep it outside the

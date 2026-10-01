@@ -55,13 +55,12 @@ auth_forward = "oauthbearer"
 
 ## Open points for the live test
 
-- **UNAUTHENTICATE.** Stalwart lists RFC 8437 (IMAP UNAUTHENTICATE) among its supported
-  extensions ([stalw.art/docs/development/rfcs](https://stalw.art/docs/development/rfcs)),
-  and its IMAP settings have no switch for it. The proxy refuses to log in to a backend
-  that offers UNAUTHENTICATE, because a logged-in client could leave its login and try
-  passwords past the proxy ([SECURITY.md](../SECURITY.md#operator-responsibilities)); IMAP
-  logins then end as an outage with a journal line naming the capability. Whether
-  Stalwart advertises it, before or after login, and on ManageSieve, is to be checked.
+- **UNAUTHENTICATE.** Stalwart offers RFC 8437 (IMAP UNAUTHENTICATE) after the login,
+  with no switch to turn it off
+  ([stalw.art/docs/development/rfcs](https://stalw.art/docs/development/rfcs)), and
+  takes it on ManageSieve too. This does not stand in the way: the proxy takes the
+  capability out of what it relays and answers the command itself, so it never reaches
+  Stalwart, offered or not ([protocols](protocols.md#imap-and-managesieve-after-login)).
 - The `LOCAL` PROXY header of the proxy's own ManageSieve and EHLO probes.
 - The OAUTHBEARER error result Stalwart sends for a rejected token, and whether it checks
   the GS2 authzid, `host` and `port` the proxy sends.

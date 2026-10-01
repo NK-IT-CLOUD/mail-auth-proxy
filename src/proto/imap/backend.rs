@@ -113,14 +113,8 @@ fn capability_code(resp: &str) -> Option<Vec<&str>> {
         .then(|| caps.split_ascii_whitespace().collect())
 }
 
-fn offers_unauthenticate<S: AsRef<str>>(caps: &[S]) -> bool {
-    caps.iter()
-        .any(|c| c.as_ref().eq_ignore_ascii_case("UNAUTHENTICATE"))
-}
-
-/// Ask the backend for its capabilities (`<tag> CAPABILITY`): after
-/// STARTTLS, and after a login whose tagged OK has no CAPABILITY code. The
-/// exchange is the proxy's own; the client never sees it.
+/// Ask the backend for its capabilities (`<tag> CAPABILITY`) after
+/// STARTTLS. The exchange is the proxy's own; the client never sees it.
 async fn query_capabilities(
     stream: &mut TlsStream<TcpStream>,
     tag: &str,
@@ -318,10 +312,6 @@ impl ImapLogin<'_> {
         caps: &[String],
         credential: BackendCredential<'_>,
     ) -> Result<(TlsStream<TcpStream>, String), BackendError> {
-        // Checked before the credential is sent.
-        if offers_unauthenticate(caps) {
-            return Err(anyhow!(crate::auth::UNAUTHENTICATE_OFFERED).into());
-        }
         let sasl_ir = caps.iter().any(|c| c.eq_ignore_ascii_case("SASL-IR"));
         let fwd = credential.forward(backend);
         let (mech, response) = (fwd.mech, &fwd.response);
@@ -350,17 +340,9 @@ impl ImapLogin<'_> {
                 .write_all(Zeroizing::new([response, "\r\n"].concat()).as_bytes())
                 .await?;
         }
+        // UNAUTHENTICATE (RFC 8437), offered or not, is kept from the backend
+        // by the relay's guard (`wire::guard`).
         let ok = await_auth_ok(&mut stream, self.tuning.idle, &fwd).await?;
-        // RFC 8437 advertises UNAUTHENTICATE in the authenticated state.
-        let unauthenticate = match capability_code(&ok) {
-            Some(caps) => offers_unauthenticate(&caps),
-            None => offers_unauthenticate(
-                &query_capabilities(&mut stream, "P2", self.tuning.idle).await?,
-            ),
-        };
-        if unauthenticate {
-            return Err(anyhow!(crate::auth::UNAUTHENTICATE_OFFERED).into());
-        }
         Ok((stream, ok))
     }
 }
@@ -382,8 +364,6 @@ mod tests {
         assert_eq!(capability_code("OK Logged in [CAPABILITY X]"), None);
         assert_eq!(capability_code("OK [ALERT] x"), None);
         assert_eq!(capability_code("OK"), None);
-        assert!(offers_unauthenticate(&["IMAP4rev1", "unauthenticate"]));
-        assert!(!offers_unauthenticate(&["IMAP4rev1", "UNAUTHENTICATEX"]));
     }
 
     #[test]

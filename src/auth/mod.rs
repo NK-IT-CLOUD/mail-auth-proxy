@@ -69,13 +69,6 @@ impl From<LineError> for BackendError {
     }
 }
 
-/// The outage of a backend that offers `UNAUTHENTICATE` (RFC 8437, RFC 5804
-/// §2.14.1). The relay is blind: a client that logged in with a token could
-/// return to the unauthenticated state and try passwords for any account
-/// directly against the backend, past the password gate and the rate limit.
-pub const UNAUTHENTICATE_OFFERED: &str = "backend offers UNAUTHENTICATE (RFC 8437): a client \
-     could leave its login and try passwords past the password gate; disable it on the backend";
-
 /// Why a session ended after its credential was refused (blocked, denied,
 /// bad token, wrong authzid, rejected by the backend). The `authresult` line
 /// has already recorded the refusal, so the listener logs the session end

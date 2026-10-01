@@ -2,6 +2,7 @@
 //! line reader, backend connects and the byte relay.
 
 pub mod connect;
+pub(crate) mod guard;
 pub mod line;
 pub mod proxyproto;
 mod relay;
