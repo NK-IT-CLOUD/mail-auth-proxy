@@ -35,6 +35,10 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   backend is checked that way; a backend without its own uses `[legacy]`'s. A protocol with
   several backends where one inherits `legacy.account_check = "doveadm"` gives a warning.
   `--check-config` and a reload read each backend's doveadm key and CA file.
+- `mail_auth_proxy_sessions_ended_total` gets the reason `blocked`: the command guard
+  after login ended the session (see Security). Log lines `command not permitted
+  after login; refused` (`INFO`) and `… where it cannot be refused; session closed`
+  (`WARN`), each with `command=`. New fuzz target `relay_guard`.
 
 ### Changed
 - Domains are compared in one canonical form: UTS #46 ToASCII (IDNA, RFC 5890/5891,

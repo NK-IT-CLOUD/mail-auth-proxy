@@ -44,7 +44,7 @@ A single crate with a library (`src/lib.rs`) and a thin binary (`src/main.rs`).
 | `src/auth/token.rs` | JWKS fetching and refresh, local JWT validation |
 | `src/auth/legacy.rs`, `account.rs` | the legacy (password) gate, doveadm account check |
 | `src/auth/sasl.rs`, `policy.rs`, `mod.rs` | SASL parsing and rebuilding, network matching, the decision shared by all protocols |
-| `src/wire/` | line reader, deadlines, backend connect, PROXY protocol v2, byte relay |
+| `src/wire/` | line reader, deadlines, backend connect, PROXY protocol v2, relay and its command guard after login |
 | `src/obs/` | the `authresult` log line and Prometheus metrics |
 | `tests/` | black-box tests: the real binary against mock Dovecot/Postfix/Pigeonhole backends, a local JWKS and a mock doveadm API (`tests/common/`) |
 | `examples/config.example.toml` | example configuration; the package ships it in `/usr/share/mail-auth-proxy/` and creates `config.toml` from it on install |

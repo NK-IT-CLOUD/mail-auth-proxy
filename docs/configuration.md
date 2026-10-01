@@ -188,7 +188,7 @@ key over (`yes`) or it needs a restart ([Reload](#reload)).
 | `routes[].imap`, `.submission`, `.sieve` | name | none | yes | the `[backends]` entry of each protocol the route serves |
 | backend `.address` | `host:port` | required, or `addresses` | yes | where to connect |
 | backend `.addresses` | array of `host:port` | none | yes | several addresses of one backend, a pool ([Backend pools](#backend-pools)); at most 16, each once; not together with `address` |
-| backend `.strategy` | `failover` \| `hash` \| `round_robin` | `failover` | yes | how a login's address is chosen from `addresses`: the first that is up in the listed order; by a rendezvous hash of the identity or login, so a user stays on one address while it is up; or in turn |
+| backend `.strategy` | `failover` \| `hash` \| `round_robin` | `failover` | yes | how a login's address is chosen from `addresses`: the first that is up in the listed order; by a rendezvous hash of the identity or login (local part in lower case, domain in canonical form, [Domain names](#domain-names)), so a user stays on one address while it is up; or in turn |
 | backend `.health_check_secs` | integer | off | yes | active health checks: every that many seconds (1-3600) each address gets the dialog of a login up to the greeting and capabilities, without a credential (with a PROXY `LOCAL` header where the backend takes one) |
 | backend `.verify_name` | string | host of each address | yes | name verified on the backend certificate |
 | backend `.ca_file` | path | system store | yes | PEM CAs the backend certificate must chain to; replaces the system store for this backend |
@@ -374,11 +374,12 @@ configuration, in a list file and in a login alike.
 - A login whose domain has none matches no domain: the domain gate refuses it as
   `unknown_domain`, no `users` entry with a domain and no route takes it.
 - Only the domain is canonical. The local part is compared as written (case included,
-  except in the `authzid` check and the throttle, which fold it), and the login the backend
+  except in the `authzid` check, the throttle and the `hash` pool strategy, which fold it), and the login the backend
   gets, like the one in the log, stays byte for byte what the client sent: whether two
   spellings are one mailbox is the mail server's decision.
-- The throttle counts per account in the form `local part in lower case @ canonical
-  domain`, so the spellings of one address share one count.
+- The throttle counts, and the `hash` pool strategy chooses, per account in the form
+  `local part in lower case @ canonical domain`, so the spellings of one address share one
+  count and one address.
 
 ## TLS server names
 

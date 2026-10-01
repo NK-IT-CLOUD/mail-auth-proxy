@@ -56,6 +56,7 @@ When a `protocol` record is written:
   - `submission auth ok; splicing user=… mech=… issuer=…`
   - `sieve auth ok; splicing user=… mech=… issuer=…` (`issuer`: the configured issuer whose key verified the token, empty for a password)
   - `session closed by limit proto=… reason="idle_limit"|"max_session" secs=…` when a `[session]` limit ended a logged-in session
+  - `command not permitted after login; refused command=…` when the command guard answered a client command itself, and at `WARN` `command not permitted after login where it cannot be refused; session closed command=…` when it ended the session ([protocols](protocols.md#imap-and-managesieve-after-login))
 - Startup, at `INFO`:
   - `legacy password rule rule=<name> networks=[…] sni=… users=… users_file=… protocols=… mechanisms=…` per rule and `legacy password gate domain_gate=… account_check=… throttle=… failure_delay_ms=…`, then `legacy account check of a backend backend=<key> account_check=… doveadm_url=…` per backend with an `account_check` of its own, or `password auth disabled: OAuth only`.
   - `auth rate limit failures=… window_secs=… block_secs=… max_block_secs=… exempt_internal=… exempt_networks=[…]`, or `auth rate limit disabled`.
@@ -85,7 +86,7 @@ When a `protocol` record is written:
   - `routed route=<name> backend=<name>` for each credential a route took (`route` empty without `[[routes]]`)
   - `…: connection limit reached, closing` for a connection closed at accept by a limit
   - `…: source blocked after failed logins, closing` for a connection closed at accept by the failed-login rate limit
-  - `relay ended with an error` when the byte relay after login ends with an I/O error
+  - `relay ended with an error` when the relay after login ends with an I/O error
   - `JWKS refreshed kids=… failed=…` after each periodic refresh
 
 ## Prometheus metrics
@@ -178,7 +179,7 @@ is handled at once meanwhile.
 A connection opened before a reload is judged by the rules it was accepted with: a
 stricter legacy rule, a removed issuer or a lower limit reaches it only if it reconnects.
 Before login that lasts at most `timeouts.preauth_secs`. After login the proxy checks no
-credential again (the session relays bytes), and the `[session]` limits it was accepted
+credential again (the session is relayed), and the `[session]` limits it was accepted
 with apply. To end open sessions after a change, restart the service or end them at the
 backend (`doveadm kick`).
 

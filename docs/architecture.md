@@ -2,7 +2,7 @@
 
 This document covers the parts every protocol shares. The per-protocol dialogs are in [protocols.md](protocols.md), every configuration key in [configuration.md](configuration.md), and logs, metrics and signals in [operations.md](operations.md). It is written from the source in `src/` and checked with the black-box tests in `tests/`; where it and the code disagree, the code wins.
 
-The proxy terminates client TLS for three protocols and runs each protocol's dialog only until the client presents a credential. It then decides whether that credential may be used, logs in to the backend (a standards-conforming IMAP, submission and ManageSieve server such as Dovecot and Postfix) with the client's own credential, and relays bytes without interpreting them. It never holds a master credential. OAuth bearer tokens are validated locally against JWKS keys, never by introspection at the IdP.
+The proxy terminates client TLS for three protocols and runs each protocol's dialog only until the client presents a credential. It then decides whether that credential may be used, logs in to the backend (a standards-conforming IMAP, submission and ManageSieve server such as Dovecot and Postfix) with the client's own credential, and relays the session: SMTP as it is, IMAP and ManageSieve through a command guard that keeps the session from returning to the unauthenticated state ([after authentication](#after-authentication)). It never holds a master credential. OAuth bearer tokens are validated locally against JWKS keys, never by introspection at the IdP.
 
 | Protocol | Client side | Backend side |
 |---|---|---|
@@ -27,7 +27,8 @@ client ──TLS──▶ mail-auth-proxy ────────────�
                     connect to it (implicit TLS or STARTTLS), pass the client address
                     (PROXY v2 / XCLIENT / none), log in with the same token (as XOAUTH2 or
                     OAUTHBEARER) or the same password (as PLAIN)
-                 7. relay the backend's verdict; on success relay bytes until either side closes
+                 7. relay the backend's verdict; on success relay until either side closes
+                    (IMAP, ManageSieve: through the command guard)
 ```
 
 Each connection is one tokio task. It takes the configuration in use when it is accepted and keeps it to its end ([configuration reload](#configuration-reload)). Connections share only the JWKS key set, the server certificates, the ManageSieve capability and SMTP EHLO caches of each backend, the health of each backend address, the legacy gate's caches and counters, the connection limits, the failed-login counters and the metrics. Trust boundaries and the threat model are in [SECURITY.md](../SECURITY.md#trust-boundaries).
@@ -67,7 +68,7 @@ flowchart TD
     POOL["Pool.open: the backend's addresses in strategy order, failover before the credential, at most 3"]
     POOL -- "no address answered" --> OUT
     POOL -- open --> BA["backend login with the client's own credential"]
-    BA -- accepted --> OK["ok: relay"]
+    BA -- accepted --> OK["ok: relay, IMAP and ManageSieve through the command guard"]
     BA -- rejected --> R6["refused: backend_reject, a password padded"]
     BA -- "temporary failure, misconfiguration, budget used up" --> OUT["outage: retry-later, connection closed"]
     R1 & R2 & R3 & R4 & R5 & R6 & OK --> LOG["authresult line"]
@@ -181,7 +182,7 @@ Sources: doc.dovecot.org 2.4.5 "Doveadm → HTTP API" and the `user` command in 
 
 ### Throttle
 
-Each backend rejection counts against the account for `window_secs` from its first failure. The key is the login folded to ASCII lower case, so `Bob@x` and `bob@x` share one counter. Once `failures` is reached, further attempts are refused without asking the backend until the window ends. A successful login resets the count. Password attempts for one account take turns: the next one is checked only after the previous one has its backend verdict counted, so parallel connections cannot run more attempts than `failures` allows. Correct passwords wait at most for one backend answer; nothing is refused because of parallel logins. At most 65 536 accounts are tracked. When a new account finds the table full, expired entries are dropped first, then the oldest running ones, down to 1,024 below the limit, so the scan under the lock runs once per 1,024 new accounts; the running windows dropped are counted in `mail_auth_proxy_legacy_throttle_evictions_total`. Only rejections of existing accounts are counted, so unknown names do not fill the table.
+Each backend rejection counts against the account for `window_secs` from its first failure. The key is the login with its local part folded to ASCII lower case and its domain in canonical form ([configuration: domain names](configuration.md#domain-names)), so `Bob@Example.org` and `bob@example.org.` share one counter. Once `failures` is reached, further attempts are refused without asking the backend until the window ends. A successful login resets the count. Password attempts for one account take turns: the next one is checked only after the previous one has its backend verdict counted, so parallel connections cannot run more attempts than `failures` allows. Correct passwords wait at most for one backend answer; nothing is refused because of parallel logins. At most 65 536 accounts are tracked. When a new account finds the table full, expired entries are dropped first, then the oldest running ones, down to 1,024 below the limit, so the scan under the lock runs once per 1,024 new accounts; the running windows dropped are counted in `mail_auth_proxy_legacy_throttle_evictions_total`. Only rejections of existing accounts are counted, so unknown names do not fill the table.
 
 ### User and domain files
 
@@ -284,7 +285,7 @@ A backend's `client_ip` says how it learns the client address.
 
 ## After authentication
 
-Once the backend accepts the credential, the proxy relays both ways until either side closes. SMTP is relayed with `tokio::io::copy_bidirectional`, without interpreting it. IMAP and ManageSieve pass the client's commands through the command guard (`wire::guard`): it keeps `UNAUTHENTICATE`, a second login, `STARTTLS` and IMAP `COMPRESS` from the backend and takes `UNAUTHENTICATE` out of the capabilities the backend sends ([protocols](protocols.md#imap-and-managesieve-after-login)). The guard is a state machine without I/O; the relay runs both directions concurrently in the session's task, reads 16 KiB at a time and holds at most a line start (256 octets) or a capability line (16 KiB), never a literal. While the guard waits for the backend's answer to an IMAP literal, the client is not read, and TCP pushes back. The credential is dropped (and zeroized) before the relay starts.
+Once the backend accepts the credential, the proxy relays both ways until either side closes. SMTP is relayed with `tokio::io::copy_bidirectional`, without interpreting it. IMAP and ManageSieve pass the client's commands through the command guard (`wire::guard`): it keeps `UNAUTHENTICATE`, a second login, `STARTTLS` and IMAP `COMPRESS` from the backend and takes `UNAUTHENTICATE` and IMAP `COMPRESS=…` (ManageSieve: `"UNAUTHENTICATE"` and `"STARTTLS"`) out of the capabilities the backend sends ([protocols](protocols.md#imap-and-managesieve-after-login)). The guard is a state machine without I/O; the relay runs both directions concurrently in the session's task, reads 16 KiB at a time and holds at most a line start (256 octets) or a capability line (16 KiB), never a literal. While the guard waits for the backend's answer to an IMAP literal, the client is not read, and TCP pushes back. The credential is dropped (and zeroized) before the relay starts.
 
 - **TCP keepalive** is on for every client connection from `accept()` and every backend connection from `connect()`: after `session.keepalive_idle_secs` (600 s) of silence the kernel probes every `session.keepalive_interval_secs` (60 s) and drops the connection after `session.keepalive_count` (5) unanswered probes. A peer that vanished without a FIN or RST (a phone that left the network, a crashed host) is found after at most 15 minutes of silence; the failed read ends the relay and frees the `max_connections` slot. A connection with unacknowledged data is not probed; it ends by the kernel's retransmission timeout instead.
 - **`session.idle_limit_secs`** (off by default) closes a session after that long without a byte in either direction. Reads and writes both count, so a client that slowly drains a large response is not idle, and neither is an IDLE session whose client re-issues IDLE or whose backend sends updates. Below 30 minutes `--check-config` warns: RFC 9051 §5.4 and RFC 5804 §1.2 let clients rely on 30 minutes of post-login inactivity, and IDLE clients re-issue IDLE only every 29 minutes (RFC 9051 §6.3.13). SMTP's 5-minute server timeout (RFC 5321 §4.5.3.2.7) is lower, and Postfix enforces its own.
@@ -347,7 +348,7 @@ To keep observing attacks on a legacy rule open to public networks, as a honeypo
 | `session.keepalive_idle_secs`, `_interval_secs`, `_count` | 600 s, 60 s, 5 | TCP keepalive of every client and backend connection, from accept or connect ([after authentication](#after-authentication)) |
 | `session.idle_limit_secs` | off | after login: no byte in either direction |
 | `session.max_session_secs` | off | after login: time since the login |
-| session close (fixed) | 2 s | closing both TLS streams after a session limit |
+| session close (fixed) | 2 s | closing both TLS streams after a session limit or the command guard ends a session |
 | shutdown drain (fixed) | 10 s | after SIGTERM/SIGINT, how long open sessions may continue ([operations: signals](operations.md#signals-and-service-manager)) |
 
 The pre-auth budget also covers token validation, the account check and the backend phase (connect, greeting, AUTH verdict); the connect and idle timeouts bound each step within it. A credential whose check or backend login runs out of budget gets the retry-later reply: an outage (`mail_auth_proxy_backend_errors_total`), not a failed login. Only the padding of a refused password may end after the budget.

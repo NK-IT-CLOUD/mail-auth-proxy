@@ -23,9 +23,10 @@
 mail-auth-proxy sits in front of your mail server, terminates TLS and checks every login
 before the backend sees it. OAuth2 tokens (`XOAUTH2`, `OAUTHBEARER`) are validated locally
 and then passed unchanged to the backend. Passwords (`PLAIN`, `LOGIN`) get in only through
-the legacy gate, which is off by default. After the login the proxy relays bytes; it does
-not implement IMAP or SMTP beyond the authentication preamble. It is one static Rust binary
-with one configuration file.
+the legacy gate, which is off by default. After the login the proxy relays the session; it
+does not implement IMAP or SMTP beyond the authentication preamble and a command guard
+that keeps IMAP and ManageSieve sessions logged in. It is one static Rust binary with one
+configuration file.
 
 ## Why
 
@@ -47,8 +48,9 @@ accepts a password only where a rule allows it.
    issuer's keys, a password against the legacy gate. Nothing reaches the backend before
    that check has passed.
 3. It logs in to the backend with the same credential, passing the real client address
-   (PROXY protocol v2 for Dovecot, XCLIENT for Postfix), and relays bytes until either
-   side closes.
+   (PROXY protocol v2 for Dovecot, XCLIENT for Postfix), and relays the session until
+   either side closes. IMAP and ManageSieve commands pass a guard that keeps
+   `UNAUTHENTICATE` and a second login from the backend.
 
 > [!IMPORTANT]
 > The backend must still validate the forwarded token itself; the proxy does not replace
@@ -282,6 +284,8 @@ forwarded token itself and speaks the standard dialogs; the backend profile
 - After login the idle limit and the session lifetime limit are off by default
   (`[session]`); TCP keepalive is on. A session does not end when its token expires.
 - ManageSieve `LOGIN` is not supported.
+- After login, IMAP and ManageSieve clients cannot use `UNAUTHENTICATE`, a second login,
+  `STARTTLS` or IMAP `COMPRESS`; an IMAP literal costs one round trip.
 - The SMTP `EHLO` list is the backend's as the proxy's own probe sees it, cached for
   `submission.capability_cache_secs`; extensions the proxy does not handle are left out.
 - Connections closed by a connection limit, a failed-login block or a timeout get no

@@ -9,7 +9,7 @@ Only the latest release receives security fixes. Upgrade older releases.
 The proxy sits on a public edge in front of an IMAP, ManageSieve and SMTP submission
 backend (for example Dovecot and Postfix). It terminates client TLS, decides how a client
 may authenticate, logs in to the backend with the client's **own** credential and then
-relays bytes. It never holds a master password or any other credential of its own.
+relays the session (IMAP and ManageSieve through a command guard, invariant 4). It never holds a master password or any other credential of its own.
 
 ### Trust boundaries
 
@@ -180,7 +180,8 @@ relays bytes. It never holds a master password or any other credential of its ow
   backend must use that same login as the account name (no `auth_username_format` that
   strips the domain or folds several logins onto one account); otherwise domain gate, user
   lists and throttle judge a different name than the backend authenticates. The throttle
-  folds logins to lower case, so differently-cased logins share one counter.
+  folds the local part to lower case and takes the domain in canonical form, so the
+  spellings of one login share one counter.
 - **Backend validation.** The backend (e.g. Dovecot `oauth2` passdb) must validate tokens
   itself. The proxy's check is a filter in front of it and does not replace it.
 - **Client address at the backend.** With `client_ip = "none"` the backend sees every
