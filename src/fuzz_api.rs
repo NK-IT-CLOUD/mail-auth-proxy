@@ -15,6 +15,7 @@ pub use crate::auth::sasl::{
     parse_plain, parse_sasl, ClientAuthKind, ErrorResult, SaslCreds, OAUTHBEARER_DUMMY,
 };
 pub use crate::auth::token::{TokenError, Validator};
+pub use crate::domain::{account_key as domain_account_key, canonical as domain_canonical};
 pub use crate::proto::imap::preauth::ClientAuth;
 pub use crate::wire::line::{
     decode_login_field, read_client_line, read_line, read_sasl_response, verb_is, LineError,

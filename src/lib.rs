@@ -4,6 +4,7 @@
 
 mod auth;
 pub mod config;
+mod domain;
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub mod fuzz_api;

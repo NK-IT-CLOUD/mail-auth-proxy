@@ -59,6 +59,15 @@ relays bytes. It never holds a master password or any other credential of its ow
 
 ### Invariants
 
+- **Domains compare in one canonical form** (UTS #46 ToASCII, nontransitional, lower case,
+  no trailing dot) on both sides of every comparison: the domain gate, the users of a rule,
+  routes, `identity_domains`, server names. A Unicode spelling in a login cannot slip past a
+  list written in Punycode or the other way round, and neither can a capital letter or a
+  trailing dot. Lookalikes from other scripts (a Cyrillic `а` for a Latin `a`) are other
+  code points and so other domains: they match nothing they were not configured for.
+  Nontransitional processing keeps `ß` and `ς` distinct, so two registrable domains never
+  become one. The login itself reaches the backend unchanged.
+
 1. **OAuth mail and legacy mail are separate paths.** OAuth (XOAUTH2/OAUTHBEARER) is
    gated by local token validation (invariant 2). Legacy mail (PLAIN/LOGIN) has no SSO:
    the backend checks the password, and the proxy forwards it only through the legacy

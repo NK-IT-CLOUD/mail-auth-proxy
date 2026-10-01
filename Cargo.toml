@@ -38,6 +38,9 @@ anyhow = "1"
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# UTS #46 (IDNA) for the canonical form of domain names; already in the tree
+# through url/reqwest, with the same features.
+idna = "1.1"
 # Clears passwords, tokens and the lines carrying them on drop; already in the
 # tree through rustls-pki-types and aws-lc-rs.
 zeroize = "1.9"

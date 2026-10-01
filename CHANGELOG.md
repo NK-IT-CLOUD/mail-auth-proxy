@@ -36,6 +36,19 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   several backends where one inherits `legacy.account_check = "doveadm"` gives a warning.
   `--check-config` and a reload read each backend's doveadm key and CA file.
 
+### Changed
+- Domains are compared in one canonical form: UTS #46 ToASCII (IDNA, RFC 5890/5891,
+  nontransitional), lower case, without a trailing dot. It applies to `allowed_domains`,
+  `domains_file`, the domains in `users`/`users_file`, `routes[].domains`,
+  `identity_domains`, the `sni` lists, certificate names, the OAUTHBEARER `host` and the
+  domain of every login and token identity. A login `MAIL@Exämple.ORG.` now meets a list
+  that says `xn--exmple-cua.org`, and the other way round; before, the two spellings were
+  different domains. A configured domain without a canonical form is a validation error,
+  in a list file it makes the file invalid; a login whose domain has none matches no
+  domain. The login the backend gets and the log show stays as the client sent it; the
+  local part is compared as before. The throttle counts the spellings of one address
+  together. New fuzz target `domain`.
+
 ## [0.4.0] - 2026-09-29
 
 ### Added

@@ -94,3 +94,10 @@ path = "fuzz_targets/backend_auth.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "domain"
+path = "fuzz_targets/domain.rs"
+test = false
+doc = false
+bench = false

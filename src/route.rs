@@ -13,13 +13,14 @@ use crate::obs::metrics::Proto;
 
 /// What a credential offers the routes.
 pub struct Key<'a> {
-    /// The domain of the validated identity or of the login; `None` when it
-    /// has none.
+    /// The domain of the validated identity or of the login in canonical form
+    /// (`crate::domain::of_login`); `None` when it has no valid one.
     pub domain: Option<&'a str>,
     /// OAuth: the issuer and the audiences of the validated token; `None`
     /// for a password.
     pub token: Option<(&'a str, &'a [String])>,
-    /// The TLS server name the client asked for.
+    /// The TLS server name the client asked for, in canonical form; `None`
+    /// without one or when it is not a valid name.
     pub sni: Option<&'a str>,
 }
 
@@ -34,12 +35,12 @@ pub struct Pick<'r> {
 
 struct Route {
     name: String,
-    /// ASCII lower case.
+    /// Canonical (`crate::domain`).
     domains: Vec<String>,
     /// `"*"`: every domain, also none.
     any_domain: bool,
     issuers: Vec<String>,
-    /// ASCII lower case.
+    /// Canonical.
     sni: Vec<String>,
     audiences: Vec<String>,
     /// Per protocol (`slot`): the index of its backend.
@@ -51,7 +52,7 @@ impl Route {
         // A route that names no domain is for tokens of its issuers only.
         let domain = self.any_domain
             || match key.domain {
-                Some(d) => self.domains.iter().any(|x| x.eq_ignore_ascii_case(d)),
+                Some(d) => self.domains.iter().any(|x| x == d),
                 None => false,
             }
             || (self.domains.is_empty() && key.token.is_some());
@@ -64,11 +65,7 @@ impl Route {
             ),
             None => (true, true),
         };
-        let sni = self.sni.is_empty()
-            || key.sni.is_some_and(|s| {
-                let s = s.strip_suffix('.').unwrap_or(s);
-                self.sni.iter().any(|x| x.eq_ignore_ascii_case(s))
-            });
+        let sni = self.sni.is_empty() || key.sni.is_some_and(|s| self.sni.iter().any(|x| x == s));
         domain && issuer && audience && sni
     }
 }
@@ -116,11 +113,11 @@ impl Router {
                         .domains
                         .iter()
                         .filter(|d| *d != "*")
-                        .map(|d| d.to_ascii_lowercase())
+                        .map(|d| canonical_or_lower(d))
                         .collect(),
                     any_domain: r.domains.iter().any(|d| d == "*"),
                     issuers: r.issuers.clone(),
-                    sni: r.sni.iter().map(|s| s.to_ascii_lowercase()).collect(),
+                    sni: r.sni.iter().map(|s| canonical_or_lower(s)).collect(),
                     audiences: r.audiences.clone(),
                     backend: Protocol::ALL.map(|p| {
                         // A protocol with a backend of its own ignores routes.
@@ -167,12 +164,11 @@ impl Router {
     }
 }
 
-/// The domain of a login or identity: after its last `@`, if not empty.
-pub fn domain_of(login: &str) -> Option<&str> {
-    login
-        .rsplit_once('@')
-        .map(|(_, d)| d)
-        .filter(|d| !d.is_empty())
+/// A configured name in canonical form. Validation has refused invalid
+/// names; the fallback keeps a name that slipped through from matching
+/// anything a client can send.
+fn canonical_or_lower(name: &str) -> String {
+    crate::domain::canonical(name).unwrap_or_else(|_| format!("invalid:{name}"))
 }
 
 #[cfg(test)]
@@ -241,11 +237,17 @@ token_type = "keycloak"
         Some(r.1.backends_of(Protocol::Imap)[pick.index].name.to_owned())
     }
 
+    /// The canonical form, as the caller passes it (`domain::canonical`).
+    fn canon(name: Option<&str>) -> Option<&'static str> {
+        name.and_then(|n| crate::domain::canonical(n).ok())
+            .map(|c| &*Box::leak(c.into_boxed_str()))
+    }
+
     fn password<'a>(domain: Option<&'a str>, sni: Option<&'a str>) -> Key<'a> {
         Key {
-            domain,
+            domain: canon(domain),
             token: None,
-            sni,
+            sni: canon(sni),
         }
     }
 
@@ -256,9 +258,9 @@ token_type = "keycloak"
         sni: Option<&'a str>,
     ) -> Key<'a> {
         Key {
-            domain,
+            domain: canon(domain),
             token: Some((iss, aud)),
-            sni,
+            sni: canon(sni),
         }
     }
 
@@ -371,12 +373,5 @@ token_type = "keycloak"
         ] {
             assert_eq!(imap(&r, key).as_deref(), Some("two"));
         }
-    }
-
-    #[test]
-    fn domains_of_logins() {
-        assert_eq!(domain_of("a@b.example"), Some("b.example"));
-        assert_eq!(domain_of("a"), None);
-        assert_eq!(domain_of("a@"), None);
     }
 }

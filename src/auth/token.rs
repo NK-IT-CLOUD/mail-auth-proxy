@@ -136,7 +136,13 @@ impl Policy {
             infer_key_algorithm: i.infer_key_algorithm,
             allowed_clients: i.allowed_clients.clone(),
             client_claim: i.client_claim().to_owned(),
-            identity_domains: i.identity_domains.clone(),
+            // Canonical, like the identity's domain they are compared with
+            // (`crate::domain`); validation has refused invalid names.
+            identity_domains: i
+                .identity_domains
+                .iter()
+                .map(|d| crate::domain::canonical(d).map_err(|e| anyhow!("identity_domains: {e}")))
+                .collect::<Result<_>>()?,
         })
     }
 
@@ -852,14 +858,13 @@ pub(crate) fn check_claims(
         return Err(invalid!("identity claim is not a plain login"));
     }
     // OIDC Core §5.7: one issuer's claim value says nothing about another
-    // issuer's users; the domains bound what this issuer may log in to.
+    // issuer's users; the domains bound what this issuer may log in to. The
+    // identity's domain in canonical form (`crate::domain`), as the list; one
+    // that is not a valid domain is outside every list.
     if !policy.identity_domains.is_empty()
-        && !id.rsplit_once('@').is_some_and(|(local, domain)| {
+        && !id.rsplit_once('@').is_some_and(|(local, _)| {
             !local.is_empty()
-                && policy
-                    .identity_domains
-                    .iter()
-                    .any(|d| d.eq_ignore_ascii_case(domain))
+                && crate::domain::of_login(id).is_some_and(|d| policy.identity_domains.contains(&d))
         })
     {
         return Err(invalid!("identity outside the issuer's identity_domains"));
@@ -1733,13 +1738,19 @@ mod tests {
     }
 
     /// With `identity_domains` an issuer vouches only for identities in its
-    /// domains (ASCII case-insensitive); another issuer's domain, a login
-    /// without a domain or a lookalike suffix is a bad token.
+    /// domains (in canonical form: case, trailing dot, U-label or A-label);
+    /// another issuer's domain, a login without a domain or a lookalike
+    /// suffix is a bad token. The policy holds the canonical form
+    /// (`Policy::from_config`), the identity is returned as the token has it.
     #[test]
     fn identity_domains_bound_the_issuer() {
         let (priv_pem, jwks) = test_es256_keypair("kid1");
         let mut p = policy(ISS_A);
-        p.identity_domains = vec!["example.org".into(), "Example.NET".into()];
+        p.identity_domains = vec![
+            "example.org".into(),
+            "example.net".into(),
+            "xn--exmple-cua.org".into(),
+        ];
         let v = Validator::from_parts(vec![(jwks, p)]).unwrap();
         let tok = |email: &str| {
             mint(
@@ -1755,6 +1766,12 @@ mod tests {
         assert_eq!(
             v.validate(&tok("bob@EXAMPLE.net")).unwrap(),
             "bob@EXAMPLE.net"
+        );
+        // A U-label identity against the A-label list: the same domain, and
+        // the identity stays as the token has it.
+        assert_eq!(
+            v.validate(&tok("MAIL@Exämple.ORG.")).unwrap(),
+            "MAIL@Exämple.ORG."
         );
         for other in [
             "carol@example.com",

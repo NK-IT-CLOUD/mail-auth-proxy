@@ -181,7 +181,7 @@ key over (`yes`) or it needs a restart ([Reload](#reload)).
 | `sieve.capability_cache_secs` | integer | 600 | yes | reuse of each backend's capability list; ≥ 1 |
 | `backends.<name>` | backend | none | yes | a named backend; the name (1-64 of `A-Z a-z 0-9 . _ -`, not `imap`, `submission` or `sieve`) is logged as `backend=` and used for the refusal timing. Serves the one protocol that names it; its `tls` default is that protocol's |
 | `routes[].name` | string | required | yes | unique, 1-64 of `A-Z a-z 0-9 . _ -` |
-| `routes[].domains` | array | none | yes | domains of the identity (OAuth) or login (password), exact and ASCII case-insensitive, no subdomains; `"*"` alone, in the last route only, takes every domain and a login without one |
+| `routes[].domains` | array | none | yes | domains of the identity (OAuth) or login (password), exact in canonical form ([Domain names](#domain-names)), no subdomains; `"*"` alone, in the last route only, takes every domain and a login without one |
 | `routes[].issuers` | array | any | yes | OAuth: the issuer of the token is one of these `oauth.issuers[].issuer`. A route with `issuers` and without `domains` takes tokens of those issuers whatever the identity, and no password |
 | `routes[].sni` | array | any | yes | the name the client asked for (SNI) is one of these; without SNI the route does not match |
 | `routes[].audiences` | array | any | yes | OAuth: the token's `aud` contains one of these, binding a token to the backend it was issued for |
@@ -209,7 +209,7 @@ key over (`yes`) or it needs a restart ([Reload](#reload)).
 | `oauth.issuers[].allowed_algorithms` | array | RS256/384/512, PS256/384/512, ES256, ES384 | yes | keys are used only with these |
 | `oauth.issuers[].infer_key_algorithm` | bool | `true` | yes | a JWKS key without `alg` is used with the one algorithm its type implies (ES256 for P-256, ES384 for P-384, RS256 for RSA); off: such keys are skipped |
 | `oauth.issuers[].allowed_clients` | array | empty (any) | yes | accepted values of `client_claim` |
-| `oauth.issuers[].identity_domains` | array | empty (any) | yes | the domains this issuer may log in to: the identity must be an address in one of them (ASCII case-insensitive, no subdomains), otherwise the token is a `bad_token`. With more than one issuer, each issuer without it gives a configuration warning, because it can log in to the other issuers' mailboxes |
+| `oauth.issuers[].identity_domains` | array | empty (any) | yes | the domains this issuer may log in to: the identity must be an address in one of them (canonical form, [Domain names](#domain-names), no subdomains), otherwise the token is a `bad_token`. With more than one issuer, each issuer without it gives a configuration warning, because it can log in to the other issuers' mailboxes |
 | `oauth.issuers[].client_claim` | string | `client_id` for `token_type = "rfc9068"` (RFC 9068 §2.2), otherwise `azp` | yes | claim naming the OAuth client |
 | `oauth.issuers[].openid_configuration_url` | URL | unset | yes | https only (also for `localhost`), no `user:password@`, no fragment. Sent as `openid-configuration` in the error result a client gets for a rejected token (RFC 7628 §3.2.2), so it can find the IdP. Warning when it is not `<issuer>/.well-known/openid-configuration` |
 | `oauth.issuers[].scope` | string | unset | yes | sent as `scope` in the same error result: the scope a client must request for mail. RFC 6749 scope tokens separated by single spaces; several scopes give a warning (RFC 7628 recommends one) |
@@ -217,12 +217,12 @@ key over (`yes`) or it needs a restart ([Reload](#reload)).
 | `legacy.rules[].name` | string | required | yes | unique, 1-64 of `A-Z a-z 0-9 . _ -`; logged as `rule=` |
 | `legacy.rules[].networks` | array of CIDR | required | yes | client source networks; the rule's security boundary |
 | `legacy.rules[].sni` | array | any SNI (also none) | yes | names the client must have asked for; each should be a name of a configured certificate ([TLS server names](#tls-server-names)) |
-| `legacy.rules[].users` | array | any user | yes | `user@domain` (local part exact, domain case-insensitive) or `*@domain` |
+| `legacy.rules[].users` | array | any user | yes | `user@domain` (local part exact, domain in canonical form) or `*@domain` |
 | `legacy.rules[].users_file` | path | none | yes | more `users` entries, one per line, `#` comments; re-read on change |
 | `legacy.rules[].protocols` | `imap` \| `submission` \| `sieve` | all | yes | protocols the rule applies to |
 | `legacy.rules[].mechanisms` | `PLAIN` \| `LOGIN` | both | yes | `LOGIN` also covers the IMAP LOGIN command |
 | `legacy.rules[].public` | bool | `false` | yes | required when `networks` contain a public range (anything but RFC 1918, loopback, link-local, ULA; `0.0.0.0/0` and `::/0` included) and the rule has no `users`/`users_file`; gives a warning |
-| `legacy.allowed_domains` | array | none | yes | domains whose logins may use passwords |
+| `legacy.allowed_domains` | array | none | yes | domains whose logins may use passwords; [Domain names](#domain-names) |
 | `legacy.domains_file` | path | none | yes | more allowed domains, one per line, `#` comments; re-read on change |
 | `legacy.account_check` | `none` \| `doveadm` | `none` | yes | check that the account exists before the password is forwarded; for every backend that sets no `account_check` of its own |
 | `legacy.doveadm_url` | URL | required with `doveadm` | yes | doveadm HTTP API endpoint (`…/doveadm/v1`); https, http only for localhost; no `user:password@` |
@@ -357,6 +357,29 @@ verify_name = "imap.example.org"
 client_ip = "proxy_v2"
 ```
 
+## Domain names
+
+Every domain is compared in one canonical form: `allowed_domains`, `domains_file`, the
+domains of `users` and `users_file`, `routes[].domains`, `identity_domains`, the `sni` lists
+of rules, routes and `[password_gate]`, the domain of a login or token identity, the
+OAUTHBEARER `host` and the TLS server name. The form is UTS #46 ToASCII (IDNA, RFC 5890,
+RFC 5891): Unicode labels become A-labels (Punycode), letters lower case, one trailing dot
+dropped. So `Exämple.ORG.`, `exämple.org` and `xn--exmple-cua.org` are one domain, in the
+configuration, in a list file and in a login alike.
+
+- A configured name that has no canonical form (an underscore, a label over 63 octets, a
+  name over 253, an empty label, a hyphen at either end of a label, invalid Punycode) is a
+  validation error under its key; in a list file it makes the file invalid, which closes
+  its rule or the domain gate as any invalid entry does.
+- A login whose domain has none matches no domain: the domain gate refuses it as
+  `unknown_domain`, no `users` entry with a domain and no route takes it.
+- Only the domain is canonical. The local part is compared as written (case included,
+  except in the `authzid` check and the throttle, which fold it), and the login the backend
+  gets, like the one in the log, stays byte for byte what the client sent: whether two
+  spellings are one mailbox is the mail server's decision.
+- The throttle counts per account in the form `local part in lower case @ canonical
+  domain`, so the spellings of one address share one count.
+
 ## TLS server names
 
 The names a client may ask for with SNI (RFC 6066 §3) are the DNS names in the
@@ -369,7 +392,8 @@ that sends SNI the proxy serves:
    label, so `imap.example.org` but neither `example.org` nor `a.b.example.org`
    (RFC 9525 §6.3). A wildcard needs two labels after `*.`; `*.org` covers nothing.
 
-Names compare ASCII case-insensitively, a trailing dot is ignored. The subject CN is not a
+Names compare in canonical form ([Domain names](#domain-names)): letter case and a trailing
+dot do not matter, a configured U-label equals the client's A-label. The subject CN is not a
 name (RFC 9525 §2), nor is an IP address in the subjectAltName.
 
 A client that sends no SNI (it connected by IP address) gets the default certificate

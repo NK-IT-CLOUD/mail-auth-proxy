@@ -104,7 +104,7 @@ The JWKS refresh and the rate limit's sweep run on the generation in use. An old
 ## Client TLS
 
 - rustls with the aws-lc-rs provider. TLS 1.2 and TLS 1.3 use rustls' default cipher suites. IMAP and ManageSieve negotiate ALPN with their IANA identifiers `imap` and `managesieve`: a client that offers ALPN without that identifier is refused in the handshake (`no_application_protocol`); one that offers none is accepted. SMTP has no identifier and selects none: on both submission listeners (STARTTLS and implicit TLS) a client that offers an ID of the IANA ALPN registry (another protocol: `http/1.1`, `h2`, `imap`, …; GREASE values excepted) is refused before the ServerHello with `no_application_protocol`, one that offers none or only unregistered values is accepted. There is no client-certificate authentication.
-- The certificate is chosen by SNI (RFC 6066 §3) from `tls.cert` (the default) and `tls.certificates`: exact DNS name first, then a wildcard for one leftmost label (RFC 9525 §6.3), ASCII case-insensitive; no SNI gets the default. The accepted names are the subjectAltName DNS names of the configured certificates. The proxy reads the ClientHello first (rustls `Acceptor`); a name that no certificate carries ends the handshake with the fatal alert `unrecognized_name` before a certificate is sent (RFC 9325 §3.7). Details in [configuration.md](configuration.md#tls-server-names).
+- The certificate is chosen by SNI (RFC 6066 §3) from `tls.cert` (the default) and `tls.certificates`: exact DNS name first, then a wildcard for one leftmost label (RFC 9525 §6.3), in canonical form; no SNI gets the default. The accepted names are the subjectAltName DNS names of the configured certificates. The proxy reads the ClientHello first (rustls `Acceptor`); a name that no certificate carries ends the handshake with the fatal alert `unrecognized_name` before a certificate is sent (RFC 9325 §3.7). Details in [configuration.md](configuration.md#tls-server-names).
 - The SNI after the handshake is therefore always a name of the proxy. It is used by the legacy rules ([legacy gate](#legacy-gate)) and the OAUTHBEARER `host` check. A client that sends no SNI matches only rules without `sni`. Clients that connect by IP address never send SNI.
 
 ## Line reading
@@ -127,7 +127,7 @@ On each connection, PLAIN and LOGIN are advertised as far as at least one rule m
 
 ```
 rule matches a connection  ⇔  source IP ∈ networks (IPv4-mapped IPv6 canonicalised first)
-                              AND  (no sni  OR  SNI equals one of sni, ASCII case-insensitive, exact)
+                              AND  (no sni  OR  SNI equals one of sni, canonical form, exact)
                               AND  (no protocols  OR  protocol ∈ protocols)
 offered mechanisms         =  union of the matching rules' mechanisms (default PLAIN and LOGIN)
 ```
@@ -143,7 +143,7 @@ A password the client has sent is always parsed, even when its mechanism is not 
 | 0 | the connection offers this mechanism | `blocked_endpoint`, reply "not available on this endpoint" |
 | | the password is at most 1024 bytes | `oversize` |
 | | the login is not empty, at most 255 bytes, has no control characters and at most one `@` | `unknown_account` |
-| 1 | a rule matches connection, mechanism and user (`users`, `users_file`: `user@domain` or `*@domain`; the local part is compared exactly, the domain ignoring ASCII case). The first matching rule in file order decides and is logged. | `blocked_endpoint` |
+| 1 | a rule matches connection, mechanism and user (`users`, `users_file`: `user@domain` or `*@domain`; the local part is compared exactly, the domain in canonical form, [configuration: domain names](configuration.md#domain-names)). The first matching rule in file order decides and is logged. | `blocked_endpoint` |
 | 2 | the login's domain is in `allowed_domains` ∪ `domains_file` (only if either is set; a login without `@domain` fails) | `unknown_domain` |
 | 2b | a route takes the login's domain ([configuration: routes](configuration.md#routes); without `[[routes]]` always) | `unknown_domain` |
 | 3 | the account exists (`account_check = "doveadm"` of the backend the route chose, else of `[legacy]`) | `unknown_account` |
@@ -191,7 +191,7 @@ A file that becomes missing, unreadable or invalid **fails closed**: a rule with
 
 ### Login names
 
-The gate compares the login the client sent and assumes the backend uses that same login as the account name. An `auth_username_format` that strips the domain or otherwise maps several logins to one account breaks this: the domain gate, user lists and throttle then see a different name than the backend.
+The gate compares the login the client sent, its domain in canonical form ([configuration: domain names](configuration.md#domain-names)), and assumes the backend uses that same login as the account name; the backend gets the login byte for byte as sent. An `auth_username_format` that strips the domain or otherwise maps several logins to one account breaks this: the domain gate, user lists and throttle then see a different name than the backend.
 
 ### Scope label
 
@@ -206,13 +206,13 @@ A source IP in `scope.internal_networks` counts as `scope=internal`, whatever th
 | Mechanism | Client → proxy | Proxy → backend |
 |---|---|---|
 | `XOAUTH2` | `user=<u>^Aauth=Bearer <jwt>^A^A`. The scheme `Bearer` is case-insensitive and `user=` must not be empty. | with `auth_forward = "xoauth2"` (default): `XOAUTH2` rebuilt as `user=<validated identity claim>^Aauth=Bearer <same jwt>^A^A`; with `auth_forward = "oauthbearer"`: `OAUTHBEARER` rebuilt as `n,a=<validated identity claim>,^Ahost=<backend name>^Aport=<backend port>^Aauth=Bearer <same jwt>^A^A` (RFC 7628 §3.1) |
-| `OAUTHBEARER` | GS2 header `n,a=<authzid>,` or `y,…` (the authzid is optional: `n,,`; `=2C` and `=3D` in it stand for `,` and `=`; `p=` channel binding is refused), then `^A`-separated fields with `auth=Bearer <jwt>`. A `host=` must match the TLS server name when the client sent SNI (RFC 7628 §3.2; ASCII case-insensitive, a trailing dot ignored), otherwise the token counts as rejected (`bad_token`). `port=` is ignored. | as for `XOAUTH2`: the backend's `auth_forward` mechanism, rebuilt |
+| `OAUTHBEARER` | GS2 header `n,a=<authzid>,` or `y,…` (the authzid is optional: `n,,`; `=2C` and `=3D` in it stand for `,` and `=`; `p=` channel binding is refused), then `^A`-separated fields with `auth=Bearer <jwt>`. A `host=` must match the TLS server name when the client sent SNI (RFC 7628 §3.2; the same domain in canonical form), otherwise the token counts as rejected (`bad_token`). `port=` is ignored. | as for `XOAUTH2`: the backend's `auth_forward` mechanism, rebuilt |
 | `PLAIN` | `authzid\0authcid\0passwd`. User and password must be non-empty, and the password must not contain a NUL (RFC 4616 §2). The login is the authcid; a non-empty authzid must equal it, otherwise the exchange fails (acting as another user is not supported). | `PLAIN` rebuilt as `\0<login>\0<passwd>` (empty authzid) |
 | `LOGIN` | Two base64 prompts (`Username:`, `Password:`). An initial response on the AUTH line is the username; then only the password is asked for. Neither field may contain a NUL. IMAP and SMTP only. | sent as `PLAIN` |
 
 A SASL user the client names (XOAUTH2 `user=`, OAUTHBEARER `a=`) longer than 255 bytes or with control characters makes the response malformed. An OAuth response whose `auth` value is empty (`auth=`, or `Bearer` without a token) is a discovery request (RFC 7628 §4.3): it gets the error result of a rejected token ([protocols](protocols.md#oauth-error-result)), is logged as `protocol` and counts as no failed login.
 
-For OAuth, the login forwarded to the backend is always the token's `identity_claim` (default `email`). The username the client supplies (XOAUTH2 `user=`, OAUTHBEARER `a=`, the SASL authorisation identity) is logged when validation fails. Once the token is valid, that username must be empty, name the same identity, or be its local part without a domain (ASCII case-insensitive). Any other name fails the exchange with `authzid_mismatch` before the backend is contacted (RFC 4422 §3.6).
+For OAuth, the login forwarded to the backend is always the token's `identity_claim` (default `email`). The username the client supplies (XOAUTH2 `user=`, OAUTHBEARER `a=`, the SASL authorisation identity) is logged when validation fails. Once the token is valid, that username must be empty, name the same identity (local part ASCII case-insensitive, domain in canonical form), or be its local part without a domain (ASCII case-insensitive). Any other name fails the exchange with `authzid_mismatch` before the backend is contacted (RFC 4422 §3.6).
 
 ### Credentials in memory
 
@@ -251,7 +251,7 @@ Validation is local; the proxy makes no introspection or userinfo call. A token 
    - Access tokens only, per `token_type`. `keycloak`: the claim `typ` equals `Bearer` (case-insensitive), so ID tokens (`typ=ID`) and tokens without `typ` fail. `rfc9068`: the JWT header `typ` is `at+jwt` or `application/at+jwt`. `any`: no check.
    - `email_verified` must be the JSON boolean `true` when `require_email_verified` is on (default for `identity_claim = "email"`). Missing, `false` or the string `"true"` fail.
    - With `allowed_clients` set, the `client_claim` must be one of them. It defaults to `client_id` for `token_type = "rfc9068"` (RFC 9068 §2.2) and to `azp` otherwise.
-7. Identity: the `identity_claim` (default `email`). It must be a string of at most 254 characters without whitespace or control characters; for `email` also exactly one `@` with non-empty local part and domain. With `identity_domains` set, it must be an address whose domain is one of them (ASCII case-insensitive, no subdomains). It is forwarded to the backend as the login.
+7. Identity: the `identity_claim` (default `email`). It must be a string of at most 254 characters without whitespace or control characters; for `email` also exactly one `@` with non-empty local part and domain. With `identity_domains` set, it must be an address whose domain is one of them (canonical form, no subdomains). It is forwarded to the backend as the login, as the token has it.
 
 JWKS handling:
 

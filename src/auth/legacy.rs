@@ -92,24 +92,22 @@ fn protocol(p: Proto) -> Protocol {
     }
 }
 
-/// The domain part of a login, if it has one.
-fn domain_of(user: &str) -> Option<&str> {
-    user.rsplit_once('@')
-        .map(|(_, d)| d)
-        .filter(|d| !d.is_empty())
-}
-
-/// Does login `user` match list entry `entry`? `*@domain` matches every
-/// login of the domain; otherwise the local part must be identical and the
-/// domain equal ignoring ASCII case. Case in the local part is not folded:
-/// whether `Bob` and `bob` are one account is the backend's business, and
-/// folding here could widen a rule to an account it does not name.
+/// Does login `user` match list entry `entry` (its domain canonical,
+/// `config::canonical_user_entry`)? `*@domain` matches every login of the
+/// domain; otherwise the local part must be identical and the domains the
+/// same in canonical form (`crate::domain`), so `a@Exämple.org.` matches
+/// `a@xn--exmple-cua.org`. Case in the local part is not folded: whether
+/// `Bob` and `bob` are one account is the backend's business, and folding
+/// here could widen a rule to an account it does not name. A login whose
+/// domain is not valid matches no entry with a domain.
 fn user_matches(entry: &str, user: &str) -> bool {
     if let Some(d) = entry.strip_prefix("*@") {
-        return domain_of(user).is_some_and(|ud| ud.eq_ignore_ascii_case(d));
+        return crate::domain::of_login(user).is_some_and(|ud| ud == d);
     }
     match (entry.rsplit_once('@'), user.rsplit_once('@')) {
-        (Some((el, ed)), Some((ul, ud))) => el == ul && ed.eq_ignore_ascii_case(ud),
+        (Some((el, ed)), Some((ul, _))) => {
+            el == ul && crate::domain::of_login(user).is_some_and(|ud| ud == ed)
+        }
         (None, None) => entry == user,
         _ => false,
     }
@@ -128,7 +126,8 @@ struct ListFile {
     path: String,
     /// `users_file` or `domains_file`: the metric label.
     kind: ListKind,
-    parse: fn(&str) -> Result<(), String>,
+    /// Checks an entry and returns it in its canonical form.
+    parse: fn(&str) -> Result<String, String>,
     state: RwLock<ListState>,
 }
 
@@ -152,22 +151,29 @@ fn stamp(path: &str) -> std::io::Result<(SystemTime, u64, u64)> {
 }
 
 /// Parse a list file's text: one entry per line, blank lines and `#`
-/// comments ignored.
-pub fn parse_list(text: &str, check: fn(&str) -> Result<(), String>) -> Result<Vec<String>> {
+/// comments ignored; each entry as `canonical` returns it (domains in their
+/// canonical form). One invalid entry makes the whole file invalid.
+pub fn parse_list(
+    text: &str,
+    canonical: fn(&str) -> Result<String, String>,
+) -> Result<Vec<String>> {
     let mut out = Vec::new();
     for (n, line) in text.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        check(line).map_err(|e| anyhow!("line {}: {e}", n + 1))?;
-        out.push(line.to_string());
+        out.push(canonical(line).map_err(|e| anyhow!("line {}: {e}", n + 1))?);
     }
     Ok(out)
 }
 
 impl ListFile {
-    fn load(path: &str, kind: ListKind, parse: fn(&str) -> Result<(), String>) -> Result<ListFile> {
+    fn load(
+        path: &str,
+        kind: ListKind,
+        parse: fn(&str) -> Result<String, String>,
+    ) -> Result<ListFile> {
         let st = stamp(path).with_context(|| path.to_string())?;
         let entries = Self::read(path, parse)?;
         Ok(ListFile {
@@ -181,7 +187,7 @@ impl ListFile {
         })
     }
 
-    fn read(path: &str, parse: fn(&str) -> Result<(), String>) -> Result<Vec<String>> {
+    fn read(path: &str, parse: fn(&str) -> Result<String, String>) -> Result<Vec<String>> {
         let text = std::fs::read_to_string(path).with_context(|| path.to_string())?;
         parse_list(&text, parse).with_context(|| path.to_string())
     }
@@ -277,7 +283,10 @@ impl Rule {
     fn endpoint(&self, proto: Protocol, peer: IpAddr, sni: Option<&str>) -> bool {
         crate::auth::policy::is_internal(peer, &self.nets)
             && self.sni.as_ref().is_none_or(|names| {
-                sni.is_some_and(|s| names.iter().any(|n| s.eq_ignore_ascii_case(n)))
+                // `names` are canonical; an SNI that is not a valid name
+                // matches none.
+                sni.and_then(|s| crate::domain::canonical(s).ok())
+                    .is_some_and(|s| names.contains(&s))
             })
             && self.protocols.as_ref().is_none_or(|p| p.contains(&proto))
     }
@@ -335,8 +344,11 @@ const THROTTLE_CAPACITY: usize = 65_536;
 const THROTTLE_EVICT_BATCH: usize = THROTTLE_CAPACITY / 64;
 
 impl Throttle {
+    /// One key per account whatever its spelling: the local part folded to
+    /// lower case, the domain canonical (`domain::account_key`), so the forms
+    /// of one address share one count.
     fn key(user: &str) -> String {
-        user.to_ascii_lowercase()
+        crate::domain::account_key(user)
     }
 
     fn is_throttled(&self, user: &str) -> bool {
@@ -528,13 +540,35 @@ impl Gate {
             rules.push(Rule {
                 name: r.name.clone(),
                 nets: crate::auth::policy::parse_internal_nets(&r.networks)?,
-                sni: r.sni.clone(),
-                users: r.users.clone(),
+                // Canonical, like the names they are compared with.
+                sni: r
+                    .sni
+                    .as_ref()
+                    .map(|names| {
+                        names
+                            .iter()
+                            .map(|n| crate::domain::canonical(n))
+                            .collect::<std::result::Result<Vec<_>, _>>()
+                    })
+                    .transpose()
+                    .map_err(|e| anyhow!("legacy.rules[{}].sni: {e}", r.name))?,
+                users: r
+                    .users
+                    .as_ref()
+                    .map(|users| {
+                        users
+                            .iter()
+                            .map(|u| config::canonical_user_entry(u))
+                            .collect::<std::result::Result<Vec<_>, _>>()
+                    })
+                    .transpose()
+                    .map_err(|e| anyhow!("legacy.rules[{}].users: {e}", r.name))?,
                 users_file: r
                     .users_file
                     .as_deref()
                     .map(|p| {
-                        ListFile::load(p, ListKind::Users, config::check_user_entry).map(Arc::new)
+                        ListFile::load(p, ListKind::Users, config::canonical_user_entry)
+                            .map(Arc::new)
                     })
                     .transpose()
                     .context("legacy users_file")?,
@@ -546,13 +580,17 @@ impl Gate {
             let inline = cfg
                 .allowed_domains
                 .iter()
-                .map(|d| d.to_ascii_lowercase())
-                .collect();
+                .map(|d| {
+                    config::canonical_domain_entry(d)
+                        .map_err(|e| anyhow!("legacy.allowed_domains: {e}"))
+                })
+                .collect::<Result<_>>()?;
             let file = cfg
                 .domains_file
                 .as_deref()
                 .map(|p| {
-                    ListFile::load(p, ListKind::Domains, config::check_domain_entry).map(Arc::new)
+                    ListFile::load(p, ListKind::Domains, config::canonical_domain_entry)
+                        .map(Arc::new)
                 })
                 .transpose()
                 .context("legacy domains_file")?;
@@ -862,14 +900,11 @@ impl Gate {
         };
         // 2. Domain.
         if let Some((inline, file)) = &self.domains {
-            let ok = domain_of(user).is_some_and(|d| {
-                let d = d.to_ascii_lowercase();
+            // Canonical on both sides; a login without a valid domain fails.
+            let ok = crate::domain::of_login(user).is_some_and(|d| {
                 // A domains_file that cannot be used closes the domain gate.
                 file.as_ref().is_none_or(|f| f.usable())
-                    && (inline.contains(&d)
-                        || file
-                            .as_ref()
-                            .is_some_and(|f| f.any(|e| e.eq_ignore_ascii_case(&d))))
+                    && (inline.contains(&d) || file.as_ref().is_some_and(|f| f.any(|e| *e == d)))
             });
             if !ok {
                 return deny(Reason::UnknownDomain);
@@ -1398,7 +1433,7 @@ mod tests {
         assert!(ListFile::load(
             path.to_str().unwrap(),
             ListKind::Users,
-            config::check_user_entry
+            config::canonical_user_entry
         )
         .is_err());
         let _ = std::fs::remove_dir_all(dir);

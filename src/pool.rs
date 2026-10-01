@@ -274,7 +274,8 @@ impl Pool {
         let mut up: Vec<usize> = (0..n).filter(|i| self.members[*i].health.is_up()).collect();
         match (self.strategy, key) {
             (PoolStrategy::Hash, Some(key)) => {
-                let key = key.to_ascii_lowercase();
+                // One key per account, whatever its spelling.
+                let key = crate::domain::account_key(key);
                 up.sort_by_key(|i| {
                     std::cmp::Reverse(fnv(&[
                         key.as_bytes(),

@@ -19,7 +19,10 @@ mod validate;
 
 pub use reload::{plan, Plan};
 pub use schema::*;
-pub use validate::{check_domain_entry, check_service_url, check_user_entry, is_private_net};
+pub use validate::{
+    canonical_domain_entry, canonical_user_entry, check_domain_entry, check_service_url,
+    check_user_entry, is_private_net,
+};
 
 /// A parsed configuration and what validation found. Syntax and schema
 /// errors fail `parse` itself; `errors` holds the semantic problems, all of

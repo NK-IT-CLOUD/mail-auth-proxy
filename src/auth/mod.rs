@@ -665,13 +665,15 @@ pub async fn authorize<B: BackendLogin>(
                 event(user, Reason::AuthzidMismatch, "", "", "");
                 return Outcome::WrongAuthzid;
             }
+            // Domain and server name in canonical form (`crate::domain`).
+            let (domain, sni) = (crate::domain::of_login(&identity), canonical_sni(s));
             let key = route::Key {
-                domain: route::domain_of(&identity),
+                domain: domain.as_deref(),
                 token: Some((&issuer, &audiences)),
-                sni: s.sni,
+                sni: sni.as_deref(),
             };
             let Some(pick) = ctx.router.pick(s.proto, &key) else {
-                no_route(s, key.domain, Some(&issuer));
+                no_route(s, &identity, Some(&issuer));
                 event(&identity, Reason::UnknownDomain, "", "", "");
                 return Outcome::Rejected("no route for the identity's domain".into());
             };
@@ -724,10 +726,11 @@ pub async fn authorize<B: BackendLogin>(
             // The route by the login's domain, before the gate's account
             // check: that belongs to the backend, and a domain no route
             // takes is refused like an unknown domain.
+            let (domain, sni) = (crate::domain::of_login(user), canonical_sni(s));
             let key = route::Key {
-                domain: route::domain_of(user),
+                domain: domain.as_deref(),
                 token: None,
-                sni: s.sni,
+                sni: sni.as_deref(),
             };
             let routed = ctx.router.pick(s.proto, &key).map(|p| {
                 let backend = backends.name(p.index);
@@ -756,7 +759,7 @@ pub async fn authorize<B: BackendLogin>(
                     no_route: missed,
                 } => {
                     if missed {
-                        no_route(s, key.domain, None);
+                        no_route(s, user, None);
                     }
                     event(user, reason, &pwfp, rule, "");
                     let backend = backend_name.filter(|_| for_backend);
@@ -821,12 +824,20 @@ pub async fn authorize<B: BackendLogin>(
 }
 
 /// The log line and metric of a credential no route takes: an unknown
-/// tenant, or a route table that misses a domain. The domain of a password
-/// login is client input and is sanitised.
-fn no_route(s: &Session<'_>, domain: Option<&str>, issuer: Option<&str>) {
+/// tenant, or a route table that misses a domain. The domain is logged as
+/// the login or identity has it (the original spelling, not the canonical
+/// form); for a password login it is client input and is sanitised.
+fn no_route(s: &Session<'_>, login: &str, issuer: Option<&str>) {
     metrics::record_route_miss(s.proto);
-    tracing::warn!(target: crate::obs::target::MAIN, proto = s.proto.label(), domain = %authlog::sanitize(domain.unwrap_or("")),
+    let domain = login.rsplit_once('@').map_or("", |(_, d)| d);
+    tracing::warn!(target: crate::obs::target::MAIN, proto = s.proto.label(), domain = %authlog::sanitize(domain),
         issuer = issuer.unwrap_or(""), peer = %s.peer.ip(), "no route for the login's domain");
+}
+
+/// The server name of the connection in canonical form (`crate::domain`),
+/// for the routes; `None` without SNI or when it is not a valid name.
+fn canonical_sni(s: &Session<'_>) -> Option<String> {
+    s.sni.and_then(|n| crate::domain::canonical(n).ok())
 }
 
 #[cfg(test)]

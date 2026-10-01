@@ -23,7 +23,7 @@ Requirement levels (MUST, SHOULD, MAY) are those of the cited text; an empty Lev
 | 0-RTT data | | RFC 9325 §3.10, RFC 8446 §8 | Yes (disabled) | |
 | No resumption across different SNI | MUST | RFC 6066 §3 | Yes | rustls checks the SNI on resumption |
 | SNI supported | MUST | RFC 9325 §3.7 | Yes | The certificate is chosen by SNI (`tls.cert`, `tls.certificates`); without SNI the default `tls.cert`. After the handshake the name is used by the legacy (password) rules and the OAUTHBEARER `host` check. |
-| Certificate chosen by name: exact DNS name, a wildcard only as the whole leftmost label and for one label, no CN | | RFC 9525 §6.3, §2 (formerly RFC 6125 §6.4.3) | Yes | The accepted names are the subjectAltName DNS names of the configured certificates. An exact name wins over a wildcard; ASCII case-insensitive, a trailing dot ignored. |
+| Certificate chosen by name: exact DNS name, a wildcard only as the whole leftmost label and for one label, no CN | | RFC 9525 §6.3, §2 (formerly RFC 6125 §6.4.3) | Yes | The accepted names are the subjectAltName DNS names of the configured certificates. An exact name wins over a wildcard; names in canonical form (UTS #46 ToASCII, lower case, no trailing dot). |
 | Reject an unrecognised server name | SHOULD | RFC 9325 §3.7, RFC 6066 §3 | Yes | Fatal `unrecognized_name` alert, before a certificate is sent. |
 | ALPN supported; reject a non-matching ALPN | MUST / advised | RFC 9325 §3.8, RFC 7301 §3.2 | Yes | IMAP `imap`, ManageSieve `managesieve` (IANA). A client that offers ALPN without it gets the `no_application_protocol` alert; one that offers none is accepted. SMTP (587 and 465) has no ALPN identifier and selects none; a client that offers a registered ID of another protocol (the IANA registry without the RFC 8701 GREASE values) gets `no_application_protocol` before the ServerHello, one with no ALPN or only unregistered values is accepted. |
 | Implicit TLS for IMAP (port 993) | SHOULD | RFC 8314 §3.2 | Yes | |
@@ -134,13 +134,22 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 | authzid different from authcid | | RFC 4616 §2, RFC 4422 §3.4.1 | Refused | A failed authentication (`NO [AUTHENTICATIONFAILED]`, `535`, `NO`) before the gate, logged as `protocol`. D-SASL-1. |
 | LOGIN not advertised where PLAIN and a plaintext login command are prohibited | MUST NOT | draft-murchison-sasl-login §1, §3 | Yes | SMTP offers LOGIN only together with PLAIN. IMAP offers SASL LOGIN only where the LOGIN command is allowed (one setting, `LOGIN`). ManageSieve never offers LOGIN. |
 | OAUTHBEARER GS2 header, `auth=` key/value pairs; unknown keys ignored | MUST | RFC 7628 §3.1, RFC 5801 §4 | Yes | The flag must be `n` or `y`; `p=` (channel binding) is refused. In `a=`, `=2C` and `=3D` are decoded; any other `=` is malformed. |
-| `host`/`port` checked against known values | MUST | RFC 7628 §3.2 | Partial | `host` must match the TLS server name (SNI), ASCII case-insensitive, a trailing dot ignored; a mismatch is refused like a rejected token (`bad_token`). Without SNI `host` is not checked, `port` never. D-SASL-4. |
+| `host`/`port` checked against known values | MUST | RFC 7628 §3.2 | Partial | `host` must match the TLS server name (SNI) in canonical form (UTS #46 ToASCII, lower case, no trailing dot); a mismatch is refused like a rejected token (`bad_token`). Without SNI `host` is not checked, `port` never. D-SASL-4. |
 | JSON error result on failure (`status`, optional `scope` and `openid-configuration`), then the dummy response `%x01` (XOAUTH2: empty) or an abort | | RFC 7628 §3.2.2-3.2.3; XOAUTH2 "Error response" | Yes | For a token that fails validation ([protocols.md](protocols.md#oauth-error-result)). The result is the same for every such token and names the IdP from the configuration, never from the token. `status` is always `invalid_token`, also for XOAUTH2 (Google sends `"401"`). An `authzid_mismatch` or backend rejection fails at once: `status` has no code for a valid token that is refused. |
 | Empty `auth=` asks for the error result | | RFC 7628 §4.3 | Yes | Answered with the same error result, then the failure. Logged as `protocol`; not a failed login, not counted by the rate limit. |
 | Abort after the error result: `*` → tagged BAD / `501` / `NO` | MUST | RFC 9051 §6.2.2, RFC 4954 §4, RFC 5804 §2.1 | Yes | An undecodable answer gets the same reply; any other answer the final failure |
 | Authorisation identity (`a=`, `user=`) | | RFC 4422 §3.4.1, §3.6 | Yes | Must be empty, the token's identity or its local part. Longer than 255 bytes or with control characters it is malformed. D-SASL-1. |
 | Bearer scheme name case-insensitive | | RFC 7628 §4, RFC 9110 §11.1 | Yes | |
 | TLS required for OAUTHBEARER | MUST | RFC 7628 §3 | Yes | Neither offered nor accepted before TLS |
+
+## 5a. Domain names
+
+| Requirement | Level | Reference | Status | Notes |
+|---|---|---|---|---|
+| Internationalised domain names compared as A-labels | | RFC 5890 §2.3.2, RFC 5891 §5 | Yes | every configured domain and every login, identity, `host` and SNI domain goes through UTS #46 ToASCII before a comparison; U-label and A-label of one name are equal |
+| UTS #46 processing options | | UTS #46 §4, §5 | Yes | nontransitional (`ß`, `ς`, ZWJ/ZWNJ kept: `faß.de` and `fass.de` stay two domains, as in current browsers); UseSTD3ASCIIRules (letters, digits, hyphens: the SMTP domain syntax, RFC 5321 §4.1.2); CheckHyphens only for the first and last position (`--` in positions 3 and 4 occurs in real names); VerifyDNSLength (labels 1-63, at most 253 octets); one trailing root dot dropped first |
+| Domain part case-insensitive | | RFC 5321 §2.4 | Yes | by the lower-case canonical form |
+| Local part case-sensitive | MAY (server) | RFC 5321 §2.4 | Yes | compared as written; the login reaches the backend unchanged |
 
 ## 6. Token validation
 
@@ -264,7 +273,7 @@ Metric names follow the Prometheus naming guidelines: an application prefix (`ma
 
 ### D-SASL-1: authorisation identity
 
-- For OAuth, the backend login is always the identity claim of the validated token. A client-supplied authorisation identity (`a=` in OAUTHBEARER, `user=` in XOAUTH2) must be empty, equal that identity, or be its local part without a domain (compared ASCII case-insensitively). Any other value fails the exchange with `NO [AUTHORIZATIONFAILED]` (RFC 5530) in IMAP, `535` in SMTP or `NO` in ManageSieve.
+- For OAuth, the backend login is always the identity claim of the validated token. A client-supplied authorisation identity (`a=` in OAUTHBEARER, `user=` in XOAUTH2) must be empty, equal that identity (local part ASCII case-insensitive, domain in canonical form), or be its local part without a domain (compared ASCII case-insensitively). Any other value fails the exchange with `NO [AUTHORIZATIONFAILED]` (RFC 5530) in IMAP, `535` in SMTP or `NO` in ManageSieve.
 - Acting as another user (SASL proxy authentication, RFC 5804 §2.1) is not supported.
 
 ### D-SASL-3: an initial response to LOGIN is accepted as the user name

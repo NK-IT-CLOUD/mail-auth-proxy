@@ -184,13 +184,8 @@ impl Config {
                 }
             }
             for d in &iss.identity_domains {
-                if d.is_empty()
-                    || d.contains('@')
-                    || d.chars().any(|c| c.is_whitespace() || c.is_control())
-                {
-                    err(format!(
-                        "{at}.identity_domains: {d:?} is not a domain (no @, whitespace or control characters)"
-                    ));
+                if let Err(e) = canonical_domain_entry(d) {
+                    err(format!("{at}.identity_domains: {e}"));
                 }
             }
             if self.oauth.issuers.len() > 1 && iss.identity_domains.is_empty() {
@@ -247,6 +242,11 @@ impl Config {
                         "password_gate.sni must list the name(s) clients use for password access"
                             .into(),
                     );
+                }
+                for n in g.sni.iter().filter(|n| !n.is_empty()) {
+                    if let Err(e) = canonical_domain_entry(n) {
+                        err(format!("password_gate.sni: {e}"));
+                    }
                 }
                 if g.internal_networks.is_empty() {
                     err("password_gate.internal_networks must list the networks allowed to use passwords".into());
@@ -533,6 +533,11 @@ impl Config {
             if r.sni.iter().chain(&r.audiences).any(String::is_empty) {
                 err(format!("{at}: sni and audiences entries must not be empty"));
             }
+            for n in r.sni.iter().filter(|n| !n.is_empty()) {
+                if let Err(e) = canonical_domain_entry(n) {
+                    err(format!("{at}.sni: {e}"));
+                }
+            }
             let served: Vec<Protocol> = Protocol::ALL
                 .into_iter()
                 .filter(|p| r.backend(*p).is_some())
@@ -562,16 +567,27 @@ impl Config {
                     v.sort();
                     v
                 };
+                // Server names in canonical form (`crate::domain`).
+                let names = |v: &[String]| {
+                    let mut v: Vec<String> = v
+                        .iter()
+                        .map(|x| canonical_domain_entry(x).unwrap_or_else(|_| x.clone()))
+                        .collect();
+                    v.sort();
+                    v
+                };
                 set(&o.issuers) == set(&r.issuers)
-                    && set(&o.sni) == set(&r.sni)
+                    && names(&o.sni) == names(&r.sni)
                     && set(&o.audiences) == set(&r.audiences)
                     && served.iter().all(|p| o.backend(*p).is_some())
             };
             for d in &r.domains {
-                if let Some(o) = self.routes[..i]
-                    .iter()
-                    .find(|o| same(o) && o.domains.iter().any(|od| od.eq_ignore_ascii_case(d)))
-                {
+                if let Some(o) = self.routes[..i].iter().find(|o| {
+                    same(o)
+                        && o.domains
+                            .iter()
+                            .any(|od| od == d || crate::domain::same(od, d))
+                }) {
                     err(format!(
                         "{at}: domain {d:?} is already taken by route {:?} with the same conditions",
                         o.name
@@ -591,7 +607,7 @@ impl Config {
                         && iss
                             .identity_domains
                             .iter()
-                            .any(|x| x.eq_ignore_ascii_case(d))
+                            .any(|x| crate::domain::same(x, d))
                 });
                 if bounded && !reachable {
                     warnings.push(format!(
@@ -808,26 +824,41 @@ fn listens_clash(a: SocketAddr, b: SocketAddr) -> bool {
 /// `user`, or `*@domain`; no whitespace, control characters or other
 /// wildcards.
 pub fn check_user_entry(u: &str) -> Result<(), String> {
+    canonical_user_entry(u).map(|_| ())
+}
+
+/// A user entry with its domain in canonical form (`crate::domain`): the
+/// local part as written, `*@domain`, or a login without a domain.
+pub fn canonical_user_entry(u: &str) -> Result<String, String> {
     let bad = |why: &str| Err(format!("{u:?}: {why}"));
     if u.is_empty() || u.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return bad("empty or contains whitespace/control characters");
     }
-    match u.strip_prefix("*@") {
-        Some(d) => check_domain_entry(d).map_err(|e| format!("{u:?}: {e}")),
-        None if u.contains(['*', '?']) => bad("wildcards are only allowed as *@domain"),
-        None => Ok(()),
+    if let Some(d) = u.strip_prefix("*@") {
+        return canonical_domain_entry(d)
+            .map(|d| format!("*@{d}"))
+            .map_err(|e| format!("{u:?}: {e}"));
+    }
+    if u.contains(['*', '?']) {
+        return bad("wildcards are only allowed as *@domain");
+    }
+    match u.rsplit_once('@') {
+        Some((local, d)) if !local.is_empty() => canonical_domain_entry(d)
+            .map(|d| format!("{local}@{d}"))
+            .map_err(|e| format!("{u:?}: {e}")),
+        Some(_) => bad("empty local part"),
+        None => Ok(u.to_string()),
     }
 }
 
 /// A domain as `allowed_domains` and `domains_file` accept it.
 pub fn check_domain_entry(d: &str) -> Result<(), String> {
-    if d.is_empty()
-        || d.chars()
-            .any(|c| c.is_whitespace() || c.is_control() || "@*?".contains(c))
-    {
-        return Err(format!("{d:?} is not a domain name"));
-    }
-    Ok(())
+    canonical_domain_entry(d).map(|_| ())
+}
+
+/// A domain entry in canonical form (`crate::domain::canonical`).
+pub fn canonical_domain_entry(d: &str) -> Result<String, String> {
+    crate::domain::canonical(d)
 }
 
 impl Legacy {
@@ -887,6 +918,11 @@ impl Legacy {
                 err(format!(
                     "{at}.sni must not be empty or contain an empty name"
                 ));
+            }
+            for n in r.sni.iter().flatten().filter(|n| !n.is_empty()) {
+                if let Err(e) = canonical_domain_entry(n) {
+                    err(format!("{at}.sni: {e}"));
+                }
             }
             match &r.users {
                 Some(v) if v.is_empty() => err(empty("users")),
@@ -1280,7 +1316,7 @@ mod tests {
                 "account_check is not",
             ),
             ("[legacy]\naccount_check = \"ldap\"\n".to_string(), "unknown variant"),
-            ("[legacy]\nallowed_domains = [\"@x\"]\n".to_string(), "not a domain"),
+            ("[legacy]\nallowed_domains = [\"@x\"]\n".to_string(), "not a valid domain name"),
             ("[legacy]\nthrottle = { failures = 0, window_secs = 1 }\n".to_string(), "at least 1"),
             ("[legacy]\nfailure_delay_ms = 60000\n".to_string(), "at most 10000"),
             ("[scope]\ninternal_networks = [\"x\"]\n".to_string(), "scope.internal_networks"),

@@ -116,9 +116,18 @@ impl Entry {
     }
 }
 
-/// A name as SNI compares it: ASCII lowercase, without a trailing dot.
+/// A name as SNI compares it: the canonical form (`crate::domain`), a
+/// wildcard as `*.` and the canonical rest. A name that is not a valid
+/// domain (and so is no name a client can send as SNI) falls back to ASCII
+/// lower case without a trailing dot.
 fn normalize(name: &str) -> String {
-    name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase()
+    if let Some(rest) = name.strip_prefix("*.") {
+        if let Ok(rest) = crate::domain::canonical(rest) {
+            return format!("*.{rest}");
+        }
+    }
+    crate::domain::canonical(name)
+        .unwrap_or_else(|_| name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase())
 }
 
 /// Which of the certificates with `names` serves `sni`. Without SNI the

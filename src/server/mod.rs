@@ -669,7 +669,7 @@ pub fn file_problems(cfg: &config::Config) -> Vec<String> {
                 (
                     format!("legacy.rules[{}].users_file", r.name),
                     f,
-                    config::check_user_entry as fn(&str) -> std::result::Result<(), String>,
+                    config::canonical_user_entry as fn(&str) -> std::result::Result<String, String>,
                 )
             })
         })
@@ -677,7 +677,7 @@ pub fn file_problems(cfg: &config::Config) -> Vec<String> {
             (
                 "legacy.domains_file".to_string(),
                 f,
-                config::check_domain_entry as fn(&str) -> std::result::Result<(), String>,
+                config::canonical_domain_entry as fn(&str) -> std::result::Result<String, String>,
             )
         }));
     for (name, path, check) in lists {

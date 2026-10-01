@@ -23,10 +23,11 @@ impl std::fmt::Debug for SaslCreds {
 }
 
 /// Whether the OAUTHBEARER `host` names `server`, the name the client asked
-/// for in TLS (SNI): ASCII case-insensitive, a trailing dot ignored.
+/// for in TLS (SNI): the same domain in canonical form (`crate::domain`:
+/// case, a trailing dot, U-label or A-label). A `host` that is not a valid
+/// domain name never matches.
 pub fn host_matches(host: &str, server: &str) -> bool {
-    let bare = |n: &str| n.strip_suffix('.').unwrap_or(n).to_string();
-    bare(host).eq_ignore_ascii_case(&bare(server))
+    crate::domain::same(host, server)
 }
 
 /// A SASL client response that is not base64, or a cancel (`*`). IMAP
@@ -261,12 +262,20 @@ pub fn parse_sasl(mechanism: &str, b64_ir: &str) -> Result<SaslCreds> {
 /// with a token whose verified identity is `identity`. Acting as another
 /// user is not supported (RFC 4422 §3.6), so the exchange fails unless the
 /// authzid is empty, names the same identity, or is the identity's local
-/// part without a domain (clients configured with a short username), all
-/// ASCII case-insensitive as mailbox logins are matched. A different full
+/// part without a domain (clients configured with a short username), the
+/// local part ASCII case-insensitive as mailbox logins are matched and the
+/// domain the same in canonical form (`crate::domain`). A different full
 /// address always fails.
 pub fn authzid_allowed(authzid: &str, identity: &str) -> bool {
+    let same_address = || match (authzid.rsplit_once('@'), identity.rsplit_once('@')) {
+        (Some((al, ad)), Some((il, id))) => {
+            al.eq_ignore_ascii_case(il) && crate::domain::same(ad, id)
+        }
+        _ => false,
+    };
     authzid.is_empty()
         || authzid.eq_ignore_ascii_case(identity)
+        || same_address()
         || (!authzid.contains('@')
             && identity
                 .rsplit_once('@')

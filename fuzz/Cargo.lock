@@ -616,6 +616,7 @@ dependencies = [
  "anyhow",
  "aws-lc-rs",
  "base64 0.23.1",
+ "idna",
  "ipnet",
  "jsonwebtoken",
  "reqwest",
