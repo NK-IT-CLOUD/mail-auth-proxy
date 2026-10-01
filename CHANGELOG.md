@@ -36,10 +36,6 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   several backends where one inherits `legacy.account_check = "doveadm"` gives a warning.
   `--check-config` and a reload read each backend's doveadm key and CA file.
 
-### Fixed
-- The startup line `… listener up` showed an empty address for a backend with `addresses`
-  (`backends=["store="]`); it lists the pool's addresses joined by `|`.
-
 ## [0.4.0] - 2026-09-29
 
 ### Added
