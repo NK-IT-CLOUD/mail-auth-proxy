@@ -109,6 +109,28 @@ async fn fails_over_before_the_credential() {
             .count_logs("backend address failed; trying the next"),
         3
     );
+    // One line for the change of state, not one per failure.
+    assert_eq!(h.proxy.count_logs("backend address down"), 1);
+    let down = h
+        .proxy
+        .logs()
+        .into_iter()
+        .find(|l| l.contains("backend address down"))
+        .unwrap();
+    assert!(down.contains(" WARN "), "{down}");
+    let a = h.named("a").addr;
+    assert!(
+        down.contains(&format!("backend=store address={a} stage=\"tls\"")),
+        "{down}"
+    );
+    // The startup line lists the pool's addresses.
+    let b = h.named("b").addr;
+    assert!(
+        h.proxy
+            .log_contains(&format!("backends=[\"store={a}|{b}\"]")),
+        "{:?}",
+        h.proxy.logs()
+    );
 }
 
 /// A temporary failure after the credential (`NO [UNAVAILABLE]`) is an
@@ -175,6 +197,19 @@ async fn all_down_then_back() {
     }
     // `a` failed first, so it is the trial both times, and up again.
     assert_eq!(logins(&h, "a"), 2);
+    assert_eq!(h.proxy.count_logs("backend address down"), 2);
+    let a = h.named("a").addr;
+    let up: Vec<String> = h
+        .proxy
+        .logs()
+        .into_iter()
+        .filter(|l| l.contains("backend address up"))
+        .collect();
+    assert_eq!(up.len(), 1, "{up:?}");
+    assert!(
+        up[0].contains(" INFO ") && up[0].contains(&format!("backend=store address={a}")),
+        "{up:?}"
+    );
     assert_eq!(address_metric(&h, "backend_up", "a", None).await, 1);
     assert_eq!(address_metric(&h, "backend_up", "b", None).await, 0);
 }

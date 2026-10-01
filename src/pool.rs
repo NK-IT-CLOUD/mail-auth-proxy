@@ -148,25 +148,28 @@ impl Health {
         self.errors[stage.idx()].load(Ordering::Relaxed)
     }
 
-    /// An attempt got through the dialog before the credential.
-    pub fn success(&self) {
+    /// An attempt got through the dialog before the credential. True if
+    /// that brought the address up.
+    pub fn success(&self) -> bool {
         let mut s = self.state();
         if s.up {
             s.streak = 0;
+            false
         } else {
             s.streak += 1;
             if s.streak >= RISE {
                 (s.up, s.streak) = (true, 0);
             }
+            s.up
         }
     }
 
     /// An attempt failed at `stage`. Only the stages before the credential
-    /// count towards `FALL`.
-    pub fn failure(&self, stage: Stage) {
+    /// count towards `FALL`. True if that brought the address down.
+    pub fn failure(&self, stage: Stage) -> bool {
         self.errors[stage.idx()].fetch_add(1, Ordering::Relaxed);
         if stage == Stage::AuthTempfail {
-            return;
+            return false;
         }
         let mut s = self.state();
         s.last_failure = Some(Instant::now());
@@ -174,10 +177,12 @@ impl Health {
             s.streak += 1;
             if s.streak >= FALL {
                 (s.up, s.streak) = (false, 0);
+                return true;
             }
         } else {
             s.streak = 0;
         }
+        false
     }
 
     /// Claim the one trial of a down address; `None` while another runs.
@@ -323,14 +328,14 @@ impl Pool {
             tried += 1;
             match attempt(i).await {
                 Ok(v) => {
-                    m.health.success();
+                    self.succeeded(m);
                     if tried > 1 {
                         self.stats.failovers.fetch_add(1, Ordering::Relaxed);
                     }
                     return Ok((v, i));
                 }
                 Err(e) => {
-                    m.health.failure(stage_of(&e));
+                    self.failed(m, &e);
                     if tried < MAX_TRIES && pos + 1 < order.len() {
                         tracing::warn!(target: crate::obs::target::MAIN, backend=%self.id, address=%m.conn.address, error=%format!("{e:#}"), "backend address failed; trying the next");
                     }
@@ -346,9 +351,26 @@ impl Pool {
         }))
     }
 
+    /// A success of `m`; logged when it brings the address up.
+    fn succeeded(&self, m: &Member) {
+        if m.health.success() {
+            tracing::info!(target: crate::obs::target::MAIN, backend=%self.id, address=%m.conn.address, "backend address up");
+        }
+    }
+
+    /// A failure of `m` with `e`; logged when it brings the address down,
+    /// with the stage and the error of that last failure.
+    fn failed(&self, m: &Member, e: &anyhow::Error) {
+        let stage = stage_of(e);
+        if m.health.failure(stage) {
+            tracing::warn!(target: crate::obs::target::MAIN, backend=%self.id, address=%m.conn.address, stage=stage.label(), error=%format!("{e:#}"), "backend address down");
+        }
+    }
+
     /// Member `index` answered a login it had opened without a verdict.
     pub fn tempfail(&self, index: usize) {
         if let Some(m) = self.members.get(index) {
+            // Never a change of state.
             m.health.failure(Stage::AuthTempfail);
         }
     }
@@ -379,10 +401,10 @@ where
             }
         };
         match check(i).await {
-            Ok(()) => m.health.success(),
+            Ok(()) => pool.succeeded(m),
             Err(e) => {
                 tracing::debug!(target: crate::obs::target::MAIN, backend=%pool.id, address=%m.conn.address, error=%format!("{e:#}"), "backend health check failed");
-                m.health.failure(stage_of(&e));
+                pool.failed(m, &e);
             }
         }
     }
@@ -439,15 +461,17 @@ mod tests {
             h.is_up(),
             "a tempfail after the credential is not a down address"
         );
-        h.failure(Stage::Greeting);
+        // Only the changes of state say so.
+        assert!(h.failure(Stage::Greeting), "down");
         assert!(!h.is_up());
-        h.success();
+        assert!(!h.success());
         assert!(!h.is_up());
-        h.failure(Stage::Connect);
-        h.success();
+        assert!(!h.failure(Stage::Connect), "already down");
+        assert!(!h.success());
         assert!(!h.is_up(), "rise needs successes in a row");
-        h.success();
+        assert!(h.success(), "up");
         assert!(h.is_up());
+        assert!(!h.success(), "already up");
         assert_eq!(
             Stage::ALL.map(|s| h.errors(s)),
             [FALL as u64, FALL as u64 - 1, 1, 10]

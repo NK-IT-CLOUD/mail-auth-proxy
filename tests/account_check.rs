@@ -117,6 +117,22 @@ imap = "own"
             ("unknown_account".to_string(), String::new()),
         ]
     );
+    // The startup lines name the backends with a check of their own.
+    let checks: Vec<String> = h
+        .proxy
+        .logs()
+        .into_iter()
+        .filter(|l| l.contains("legacy account check of a backend"))
+        .collect();
+    assert_eq!(checks.len(), 2, "{checks:?}");
+    for (backend, check) in [("backends.own", "Doveadm"), ("backends.stalwart", "None")] {
+        assert!(
+            checks
+                .iter()
+                .any(|l| l.contains(&format!("backend={backend} account_check={check}"))),
+            "{backend}: {checks:?}"
+        );
+    }
     // The backend that inherits one doveadm among several gets a warning.
     assert!(h.proxy.log_contains(
         "config: backends.dovecot: uses legacy.account_check = \"doveadm\" although [imap] has 3 backends"

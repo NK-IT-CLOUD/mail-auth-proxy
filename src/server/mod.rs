@@ -548,6 +548,13 @@ impl Generation {
             let l = &cfg.legacy;
             tracing::info!(target: crate::obs::target::MAIN, domain_gate=l.has_domain_gate(), account_check=?l.account_check,
                 throttle=?l.throttle, failure_delay_ms=l.failure_delay_ms, "legacy password gate");
+            // The backends that check accounts their own way.
+            for (key, b) in backend_tables(cfg) {
+                if let Some(a) = b.account_check_at(&key) {
+                    tracing::info!(target: crate::obs::target::MAIN, backend=%key, account_check=?a.check,
+                        doveadm_url=a.url.unwrap_or(""), "legacy account check of a backend");
+                }
+            }
         }
         if self.shared.ratelimit.is_enabled() {
             let r = &cfg.auth_ratelimit;
@@ -605,11 +612,12 @@ fn proto_of(p: Protocol) -> metrics::Proto {
     }
 }
 
-/// `name=address` of each backend of `protocol`, for the startup log.
+/// `name=address` of each backend of `protocol` (a pool's addresses joined
+/// by `|`), for the startup log.
 fn backend_names(cfg: &config::Config, protocol: Protocol) -> Vec<String> {
     cfg.backends_of(protocol)
         .iter()
-        .map(|u| format!("{}={}", u.name, u.backend.address))
+        .map(|u| format!("{}={}", u.name, u.backend.address_list().join("|")))
         .collect()
 }
 

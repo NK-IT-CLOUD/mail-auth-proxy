@@ -7,6 +7,10 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Log lines when a backend address changes state: `WARN backend address down` (with the
+  stage and error of the failure that took it down) and `INFO backend address up`, once
+  per change. At startup, `legacy account check of a backend` names each backend with an
+  `account_check` of its own.
 - Backend pools: `addresses` (up to 16) instead of `address`, with `strategy = "failover"`
   (default: the first address that is up), `"hash"` (a rendezvous hash of the identity or
   login keeps a user on one address) or `"round_robin"`. A login moves to the next address
@@ -29,6 +33,10 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   backend is checked that way; a backend without its own uses `[legacy]`'s. A protocol with
   several backends where one inherits `legacy.account_check = "doveadm"` gives a warning.
   `--check-config` and a reload read each backend's doveadm key and CA file.
+
+### Fixed
+- The startup line `… listener up` showed an empty address for a backend with `addresses`
+  (`backends=["store="]`); it lists the pool's addresses joined by `|`.
 
 ## [0.4.0] - 2026-09-29
 
