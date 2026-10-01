@@ -6,6 +6,13 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-02
+
+### Fixed
+- The lockfile pins `yoke-derive` 0.8.4: 0.8.3, a build-time dependency through `idna` and
+  `url`, was yanked from crates.io after 0.5.0 was tagged. No advisory names it, and the
+  binary is the same as 0.5.0.
+
 ## [0.5.0] - 2026-10-01
 
 ### Added
@@ -507,7 +514,8 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - Initial public release.
 
-[Unreleased]: https://github.com/NK-IT-CLOUD/mail-auth-proxy/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/NK-IT-CLOUD/mail-auth-proxy/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/NK-IT-CLOUD/mail-auth-proxy/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/NK-IT-CLOUD/mail-auth-proxy/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/NK-IT-CLOUD/mail-auth-proxy/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/NK-IT-CLOUD/mail-auth-proxy/compare/v0.2.1...v0.3.0
