@@ -104,7 +104,7 @@ file you downloaded).
 
 Edit `/etc/mail-auth-proxy/config.toml`. The shipped file is commented and OAuth-only;
 every key is described in [docs/configuration.md](docs/configuration.md). A minimal
-configuration:
+configuration for reading and sending mail, IMAP and SMTP submission:
 
 ```toml
 config_version = 2
@@ -120,6 +120,10 @@ key = "/etc/mail-auth-proxy/tls/privkey.pem"
 listen = "0.0.0.0:993"
 backend = { address = "192.0.2.10:10993", verify_name = "imap.example.org", client_ip = "proxy_v2" }
 
+[submission]
+listen = "0.0.0.0:587"
+backend = { address = "192.0.2.10:587", verify_name = "smtp.example.org", client_ip = "xclient" }
+
 [[oauth.issuers]]
 issuer = "https://sso.example.org/realms/mail"
 jwks_url = "https://sso.example.org/realms/mail/protocol/openid-connect/certs"
@@ -127,7 +131,11 @@ audiences = ["mail"]
 token_type = "keycloak"
 ```
 
-Add `[submission]` and `[sieve]` for SMTP submission and ManageSieve. Password logins
+The backends need `haproxy = yes` on the Dovecot listener (`client_ip = "proxy_v2"`) and the
+proxy's address in Postfix's `smtpd_authorized_xclient_hosts` (`client_ip = "xclient"`); see
+[docs/backend-dovecot-postfix.md](docs/backend-dovecot-postfix.md). Add
+`submission.implicit_tls_listen` for port 465 and `[sieve]` for ManageSieve (server-side
+filters). Password logins
 (`[[legacy.rules]]`) stay off until you add a rule; read
 [SECURITY.md](SECURITY.md#offering-legacy-passwords-to-the-internet) first.
 

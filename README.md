@@ -143,7 +143,8 @@ configuration and the systemd unit; see [INSTALL.md](INSTALL.md#release-archive-
 
 </details>
 
-**2. Configure** `/etc/mail-auth-proxy/config.toml`. A minimal OAuth-only setup for IMAP:
+**2. Configure** `/etc/mail-auth-proxy/config.toml`. A minimal OAuth-only setup for reading
+and sending mail, IMAP and SMTP submission:
 
 ```toml
 config_version = 2
@@ -160,6 +161,11 @@ listen = "0.0.0.0:993"
 # client_ip = "proxy_v2" needs a Dovecot listener with haproxy = yes; without it every login fails
 backend = { address = "192.0.2.10:10993", verify_name = "imap.example.org", client_ip = "proxy_v2" }
 
+[submission]
+listen = "0.0.0.0:587"
+# client_ip = "xclient" needs the proxy's address in Postfix's smtpd_authorized_xclient_hosts
+backend = { address = "192.0.2.10:587", verify_name = "smtp.example.org", client_ip = "xclient" }
+
 [[oauth.issuers]]
 issuer = "https://sso.example.org/realms/mail"
 jwks_url = "https://sso.example.org/realms/mail/protocol/openid-connect/certs"
@@ -167,7 +173,8 @@ audiences = ["mail"]
 token_type = "keycloak"
 ```
 
-Add `[submission]` and `[sieve]` for SMTP submission and ManageSieve. Every key is described
+Add `submission.implicit_tls_listen` for port 465 and `[sieve]` for ManageSieve
+(server-side filters). Every key is described
 in [docs/configuration.md](docs/configuration.md); the shipped file
 ([examples/config.example.toml](examples/config.example.toml)) shows all sections. The
 service runs as the system user `mail-auth-proxy`, so configuration,
@@ -179,7 +186,7 @@ certificate and key must be `root:mail-auth-proxy`, mode `0640`
 ```bash
 sudo mail-auth-proxy --check-config /etc/mail-auth-proxy/config.toml   # lists every problem at once
 sudo systemctl enable --now mail-auth-proxy
-journalctl -u mail-auth-proxy -n 20                                     # expect "imap listener up"
+journalctl -u mail-auth-proxy -n 20                                     # expect "imap listener up" and "submission listener up"
 ```
 
 Log in with a mail client and look for `authresult result="ok"` in the journal. After a
