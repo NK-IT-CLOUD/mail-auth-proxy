@@ -33,8 +33,10 @@ Warnings (settings that are allowed but weaken something) are logged as `config:
 The file is strict. Startup fails, and `--check-config` reports, when:
 
 - a key is unknown or misspelled, or `config_version = 2` is missing;
-- a required value is missing or empty, a listener is not `ip:port`, a backend is not
-  `host:port` or its certificate name is invalid;
+- a required value is missing or empty, a listener is not `ip:port`, a backend address is
+  not `host:port` or its certificate name is invalid;
+- a backend sets neither `address` nor `addresses`, or both, lists more than 16
+  `addresses` or one of them twice, or sets `health_check_secs` outside 1-3600;
 - a file path is set to `""`: `tls.cert`, `tls.key`, `tls.certificates[].cert`/`.key`, a backend `ca_file`, `users_file`,
   `domains_file`, `doveadm_key_file` or `doveadm_ca_file` (`<key> is empty`;
   `--check-config` reports it once, without a file error on top);
@@ -46,7 +48,8 @@ The file is strict. Startup fails, and `--check-config` reports, when:
 - `server.hostname` is not a host name (see the key below);
 - the same certificate file is configured twice (`tls.cert` and `tls.certificates[].cert`
   together): it names the certificate in the metrics and the reload log;
-- a file path (`tls.cert`, `tls.key`, `tls.certificates[]`, `*.backend.ca_file`, `legacy.domains_file`,
+- a file path (`tls.cert`, `tls.key`, `tls.certificates[]`, a backend's `ca_file`,
+  `doveadm_key_file` and `doveadm_ca_file`, `legacy.domains_file`,
   `legacy.doveadm_key_file`, `legacy.doveadm_ca_file`, `legacy.rules[].users_file`) is
   empty or not absolute: a relative path would depend on the working directory;
 - a JWKS URL or `doveadm_url` is not `https://` (plain `http://` is allowed only for
@@ -121,7 +124,8 @@ What runs across configurations is kept: open connections count against the new 
 failed-login counts and blocks go on under the new `[auth_ratelimit]` settings (a source
 the new settings exempt is free at once), the legacy throttle keeps its counts, a backend
 that stays (same name and settings) keeps its cached capabilities and its learned
-refusal timing, and an issuer that stays (same `issuer` and
+refusal timing, a backend that keeps its name keeps its counters and the health of each
+address it keeps, and an issuer that stays (same `issuer` and
 `jwks_url`) keeps its keys, read under its new rules. The JWKS of a new issuer is fetched
 by the reload.
 
@@ -189,7 +193,7 @@ key over (`yes`) or it needs a restart ([Reload](#reload)).
 | backend `.verify_name` | string | host of each address | yes | name verified on the backend certificate |
 | backend `.ca_file` | path | system store | yes | PEM CAs the backend certificate must chain to; replaces the system store for this backend |
 | backend `.tls` | `starttls` \| `implicit` | `implicit` for IMAP, `starttls` for submission and ManageSieve | yes | how the proxy secures its connection to the backend. `starttls`: the plaintext greeting, then STARTTLS (IMAP RFC 9051 §6.2.1, SMTP RFC 3207, ManageSieve RFC 5804 §2.2); what the backend offered before TLS is discarded and asked again over TLS. `implicit`: TLS from the first byte (RFC 8314). Either way the certificate is verified. The EHLO and capability probes take the same way |
-| backend `.auth_forward` | `xoauth2` \| `oauthbearer` | `xoauth2` | yes | the SASL mechanism a validated token is forwarded with, whatever the client used. `oauthbearer` (RFC 7628): the verified identity as GS2 authzid, the backend's `verify_name` (or host of `address`) as `host` and its port as `port`. Passwords always go as PLAIN |
+| backend `.auth_forward` | `xoauth2` \| `oauthbearer` | `xoauth2` | yes | the SASL mechanism a validated token is forwarded with, whatever the client used. `oauthbearer` (RFC 7628): the verified identity as GS2 authzid, the backend's `verify_name` (or the host of the address it connects to) as `host` and that address's port as `port`. Passwords always go as PLAIN |
 | backend `.client_ip` | `proxy_v2` \| `xclient` \| `none` | from the short forms, else `none` | yes | how the backend learns the client address: a PROXY protocol v2 header before anything else (the backend listener must require it; the proxy's own probe connections send a LOCAL header), the SMTP XCLIENT command (submission only, sent when the backend advertises it), or nothing. With `none` the backend sees the proxy's address for every client: its per-address rate limits, bans and logs treat all clients as one, and a ban there locks everyone out; warning. A submission backend that advertises XCLIENT to the proxy while `client_ip` is not `xclient` is a misconfiguration: every login is an outage (454) until it is set or the proxy is removed from `smtpd_authorized_xclient_hosts`, because the client could otherwise send its own XCLIENT after login |
 | backend `.proxy_protocol` | bool | `false` | yes | short form of `client_ip = "proxy_v2"`; `--print-config` shows `client_ip` |
 | backend `.account_check` | `none` \| `doveadm` | that of `[legacy]` | yes | the legacy gate's account check for passwords routed to this backend: none, or a doveadm userdb lookup with this backend's `doveadm_url`, `doveadm_key_file` and `doveadm_ca_file` (the same rules as the `legacy.doveadm_*` keys), one for all the backend's `addresses`. With several backends behind a protocol, one that inherits `legacy.account_check = "doveadm"` gives a warning: that doveadm would judge the other mail systems' accounts too |

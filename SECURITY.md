@@ -66,7 +66,9 @@ relays bytes. It never holds a master password or any other credential of its ow
    - a `[[legacy.rules]]` entry must match the source network (required), the SNI (if
      set), protocol, mechanism and user;
    - the login's domain must be allowed;
-   - the account must exist (doveadm lookup);
+   - a route must take the login's domain;
+   - the account must exist (doveadm lookup, by the account check of the backend the
+     login goes to or of `[legacy]`);
    - the account must not be throttled.
 
    Without rules every endpoint is OAuth-only. SNI is chosen by the client and can be

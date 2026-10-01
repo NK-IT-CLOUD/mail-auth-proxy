@@ -79,6 +79,8 @@ accepts a password only where a rule allows it.
   8314), ManageSieve on 4190 (STARTTLS).
 - A profile per backend: STARTTLS or implicit TLS, the client address via PROXY protocol
   v2 or XCLIENT, the token forwarded as XOAUTH2 or OAUTHBEARER (RFC 7628).
+- Several mail systems behind one endpoint: routes choose the backend by the domain of
+  the identity or login; a backend can be a pool of addresses with failover and health checks.
 - Backend TLS is always verified; there is no switch to turn it off.
 
 **Operations**
@@ -203,7 +205,7 @@ checks and the source layout are in [CONTRIBUTING.md](CONTRIBUTING.md).
 Every login attempt writes one `authresult` line to the journal:
 
 ```
-WARN authlog: authresult result="fail" proto="imap" scope="external" mech=PLAIN user=a@gone.test peer=198.51.100.7 reason="unknown_domain" pwfp="5d0f1c7a92b3e416" rule="partner"
+WARN authlog: authresult result="fail" proto="imap" scope="external" mech=PLAIN user=a@gone.test peer=198.51.100.7 reason="unknown_domain" pwfp="5d0f1c7a92b3e416" rule="partner" listener="imap" backend=""
 ```
 
 Its fields and reason values are a stable interface for log parsers (CrowdSec, Wazuh and
@@ -236,7 +238,7 @@ authentication, so keep it on loopback or a management network.
 
 The complete list with labels, including `mail_auth_proxy_build_info`,
 `process_start_time_seconds`, the JWKS refresh failures and skipped keys, the legacy-gate and the other
-rate-limit counters, is in
+rate-limit counters and the per-backend health and failover metrics, is in
 [docs/operations.md](docs/operations.md#prometheus-metrics).
 
 </details>

@@ -6,9 +6,9 @@ The proxy terminates client TLS for three protocols and runs each protocol's dia
 
 | Protocol | Client side | Backend side |
 |---|---|---|
-| IMAP | implicit TLS on `imap.listen` | `imap.backend`: implicit TLS (default) or STARTTLS |
-| SMTP submission | plaintext + STARTTLS on `submission.listen`; optional implicit TLS on `submission.implicit_tls_listen` | `submission.backend`: STARTTLS (default) or implicit TLS |
-| ManageSieve | plaintext + STARTTLS on `sieve.listen` | `sieve.backend`: STARTTLS (default) or implicit TLS |
+| IMAP | implicit TLS on `imap.listen` | `imap.backend` or the routes' backends: implicit TLS (default) or STARTTLS |
+| SMTP submission | plaintext + STARTTLS on `submission.listen`; optional implicit TLS on `submission.implicit_tls_listen` | `submission.backend` or the routes' backends: STARTTLS (default) or implicit TLS |
+| ManageSieve | plaintext + STARTTLS on `sieve.listen` | `sieve.backend` or the routes' backends: STARTTLS (default) or implicit TLS |
 
 Each backend has a profile ([configuration.md](configuration.md#keys)): `tls` as in the table, `client_ip` (a PROXY protocol v2 header, XCLIENT on submission, or nothing) and `auth_forward` (a token goes as XOAUTH2 or OAUTHBEARER). The profile belongs to the backend, not to the protocol, and every key of it is reloadable.
 
@@ -30,7 +30,7 @@ client ──TLS──▶ mail-auth-proxy ────────────�
                  7. relay the backend's verdict; on success relay bytes until either side closes
 ```
 
-Each connection is one tokio task. It takes the configuration in use when it is accepted and keeps it to its end ([configuration reload](#configuration-reload)). Connections share only the JWKS key set, the server certificates, the ManageSieve capability and SMTP EHLO caches of each backend, the legacy gate's caches and counters, the connection limits, the failed-login counters and the metrics. Trust boundaries and the threat model are in [SECURITY.md](../SECURITY.md#trust-boundaries).
+Each connection is one tokio task. It takes the configuration in use when it is accepted and keeps it to its end ([configuration reload](#configuration-reload)). Connections share only the JWKS key set, the server certificates, the ManageSieve capability and SMTP EHLO caches of each backend, the health of each backend address, the legacy gate's caches and counters, the connection limits, the failed-login counters and the metrics. Trust boundaries and the threat model are in [SECURITY.md](../SECURITY.md#trust-boundaries).
 
 ## Startup
 
@@ -49,9 +49,10 @@ State that belongs to the process rather than to a configuration is shared by th
 - the rate limit's sources, counts and blocks (`AuthRateLimit::reconfigured`); a block counted under an earlier `ipv6_source_prefix` holds until it expires;
 - the legacy throttle's counts and account turns, and the learned refusal timing (`Gate::carry_over`);
 - the SMTP EHLO and ManageSieve capability caches of a backend whose settings are unchanged;
+- the counters of a backend that keeps its name, and the health of each address it keeps;
 - the last JWKS of each issuer: an issuer that stays gets its keys from it under its new rules without a fetch (`Validator::reconfigured`).
 
-The JWKS refresh and the rate limit's sweep run on the generation in use. An old generation lives as long as a connection holds it; the list file reloader of its gate ends with it. The metrics' `issuer` and `cert` label sets follow the generation in use.
+The JWKS refresh and the rate limit's sweep run on the generation in use. An old generation lives as long as a connection holds it; the list file reloader of its gate ends with it, and its active health checks end when it is replaced. The metrics' `issuer`, `cert`, `backend` and `address` label sets follow the generation in use.
 
 ## Client TLS
 
@@ -108,7 +109,7 @@ The size cap and the protocol-error rule close an enumeration oracle. A backend 
 
 The size check, steps 1 to 4 and a wrong password all give the client the protocol's wrong-password reply, and their timing is made alike:
 
-- A refusal by the gate is answered after the larger of `legacy.failure_delay_ms` (default 2000, Dovecot's default `auth_failure_delay`) and the median latency of the last 32 rejections of the backend the login goes to (capped at 10 s), counted from the credential. The latencies are learned per backend, so a refusal matches a wrong password at the backend the routes chose. A refusal in the steps before the account check (size, rule, domain, no route) waits for the backend of the protocol with the largest median: with one pool for several backends, a refusal at a slow backend would come as early as the mixed median, sooner than a wrong password there.
+- A refusal by the gate is answered after the larger of `legacy.failure_delay_ms` (default 2000, Dovecot's default `auth_failure_delay`) and the median latency of the last 32 rejections of the backend the login goes to (capped at 10 s), counted from the credential. The latencies are learned per backend, so a refusal matches a wrong password at the backend the routes chose. A refusal in the steps before the account check (size, rule, domain, no route) waits for the backend of the protocol with the largest median: with one set of samples for several backends, a refusal at a slow backend would come as early as the mixed median, sooner than a wrong password there.
 - A backend rejection is answered no earlier than `failure_delay_ms` after the credential.
 - Both get the same random jitter: up to a quarter of that time, at least 50 ms, at most 1 s.
 - An outage on the password path (account check or backend unavailable) is answered with retry-later no earlier than a refusal, with the same jitter. Outages only reach accounts that passed the earlier steps, so an instant answer would identify them.
@@ -229,7 +230,7 @@ A backend's `client_ip` says how it learns the client address.
 
 - `proxy_v2` (any backend; short form `proxy_protocol = true`): the proxy writes a binary PROXY v2 header (command `PROXY`, `TCP4` or `TCP6`) as the first bytes of that backend connection, before the greeting and TLS.
   - The source is the client address and the destination is the local address the client connected to. An IPv4-mapped pair (from a dual-stack listener) is sent as `TCP4`.
-  - The proxy's own connections, the ManageSieve capability probe ([protocols: ManageSieve after TLS](protocols.md#managesieve-after-tls)) and the SMTP EHLO probe, send a PROXY v2 `LOCAL` header (no addresses).
+  - The proxy's own connections, the ManageSieve capability probe ([protocols: ManageSieve after TLS](protocols.md#managesieve-after-tls)), the SMTP EHLO probe and the active health checks (`health_check_secs`), send a PROXY v2 `LOCAL` header (no addresses).
   - The backend listener must require the header (Dovecot `haproxy = yes`, Postfix `smtpd_upstream_proxy_protocol = haproxy`); switch both settings together.
 - `none`: nothing. The backend sees the proxy's address for every client, so its own per-address rate limits, bans (fail2ban on the backend host, a server's built-in blocking of failing addresses) and logs treat all clients as one: one abusive client can get every user blocked there. The proxy's own rate limit still sees the real addresses. Validation warns about it.
 - `xclient` (submission only; short form `submission.xclient = true`): the proxy sends `XCLIENT [HELO=<client EHLO name>] [PROTO=ESMTP|SMTP] [PORT=<client port>] NAME=[UNAVAILABLE] ADDR=<ipv4>` (or `ADDR=IPV6:<ipv6>`) after the backend's post-TLS EHLO, HELO, PROTO and PORT only where the backend lists them in its `XCLIENT` line, but only if the backend advertises `XCLIENT`; otherwise the step is skipped silently. With any other `client_ip`, a backend that advertises `XCLIENT` to the proxy is an outage and no credential is sent. The same applies when the `EHLO` after the proxy's `XCLIENT` still lists it, because the client's own address would then be authorized for it.

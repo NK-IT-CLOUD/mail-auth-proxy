@@ -23,7 +23,7 @@ the client used `OAUTHBEARER`) or the same password (always as `PLAIN`). The bac
 therefore needs:
 
 1. TLS on every listener the proxy uses, with a certificate for the name the proxy
-   verifies (`verify_name`, or the host part of `address`). The proxy verifies it against
+   verifies (`verify_name`, or the host part of each address). The proxy verifies it against
    the system trust store or the backend's `ca_file`; verification cannot be turned off.
 2. An `oauth2` passdb that validates the token **itself**. The proxy's check is a filter
    in front of the backend, not a replacement for it.
@@ -98,9 +98,9 @@ upgraded with `STARTTLS`; that path is **not verified** against Dovecot.
 `haproxy = yes` on the listener must be switched
 together: a header sent to a listener that does not expect it, or a listener that expects
 one and does not get it, makes every login fail with a retry-later reply
-(`mail_auth_proxy_backend_errors_total` rises). The ManageSieve capability probe the proxy runs
-on its own behalf sends a PROXY v2 `LOCAL` header, which Dovecot accepts on the same
-listener.
+(`mail_auth_proxy_backend_errors_total` rises). The ManageSieve capability probe and the
+active health checks (`health_check_secs`) the proxy runs on its own behalf send a PROXY
+v2 `LOCAL` header, which Dovecot accepts on the same listener.
 
 ### OAuth2 passdb with local JWKS validation
 
@@ -179,6 +179,10 @@ doveadm_url = "https://imap.example.org:8080/doveadm/v1"
 doveadm_key_file = "/etc/mail-auth-proxy/doveadm.key"   # root:mail-auth-proxy 0640
 # doveadm_ca_file = "/etc/mail-auth-proxy/doveadm-ca.pem"
 ```
+
+With several mail systems behind the proxy, set `account_check` and the `doveadm_*` keys
+on each backend instead: a backend's own check replaces the one of `[legacy]` for the
+logins routed to it ([configuration](configuration.md#keys)).
 
 Dovecot warns never to expose the doveadm API to untrusted networks: allow the port only
 from the proxy's address at the network level.

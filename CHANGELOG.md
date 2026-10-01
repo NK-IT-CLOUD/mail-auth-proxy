@@ -13,7 +13,8 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   only while no credential has been sent (connect, PROXY header, TLS, greeting, STARTTLS,
   EHLO, capabilities; at most 3 addresses); a temporary failure after the credential is an
   outage of that login, never retried elsewhere. Outages stay outages: retry-later, no
-  `authresult` line.
+  `authresult` line. A move to the next address logs
+  `WARN … backend address failed; trying the next` with `backend=` and `address=`.
 - Health per address: 3 failures in a row mark it down, 2 successes up again, from the
   logins and probes and, with `health_check_secs`, from active checks (the dialog up to the
   greeting, no credential). Down addresses come last and take one login or check at a time.
@@ -27,6 +28,7 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   own `doveadm_url`, `doveadm_key_file` and `doveadm_ca_file`. A password routed to the
   backend is checked that way; a backend without its own uses `[legacy]`'s. A protocol with
   several backends where one inherits `legacy.account_check = "doveadm"` gives a warning.
+  `--check-config` and a reload read each backend's doveadm key and CA file.
 
 ## [0.4.0] - 2026-09-29
 

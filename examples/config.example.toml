@@ -25,7 +25,7 @@ key = "/path/to/privkey.pem"                  # readable by group mail-auth-prox
 
 # ── Protocols ────────────────────────────────────────────────────────────────
 # Every backend connection is TLS-verified: against `verify_name` (default: the
-# host part of `address`) with the system trust store, or only the CAs in
+# host part of each address) with the system trust store, or only the CAs in
 # `ca_file`. Each backend has a profile:
 #   tls          = "implicit" | "starttls"      default: implicit for IMAP, starttls otherwise
 #   client_ip    = "proxy_v2" | "xclient" | "none"   how the backend learns the client
@@ -64,10 +64,15 @@ capability_cache_secs = 600
 #
 # [backends.partner-imap]
 # address = "192.0.2.20:993"
-# # or a pool: addresses = ["192.0.2.20:993", "192.0.2.21:993"],
-# # strategy = "failover" | "hash" | "round_robin", health_check_secs = 10
+# # or a pool of servers with the same mailboxes, instead of address:
+# # addresses = ["192.0.2.20:993", "192.0.2.21:993"]
+# # strategy = "failover"                 # failover | hash | round_robin
+# # health_check_secs = 10                # optional active checks
 # verify_name = "imap.partner.example"
 # client_ip = "proxy_v2"
+# # account_check = "doveadm"             # optional: this backend's own legacy account
+# # doveadm_url = "https://imap.partner.example:8080/doveadm/v1"   # check, instead of
+# # doveadm_key_file = "/path/to/partner-doveadm.key"             # that of [legacy]
 #
 # [[routes]]
 # name = "partner"

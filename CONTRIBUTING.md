@@ -38,6 +38,8 @@ A single crate with a library (`src/lib.rs`) and a thin binary (`src/main.rs`).
 | `src/server/` | startup, listeners and accept loop, configuration reload (`reload.rs`), TLS material, signals, systemd notification |
 | `src/limits.rs` | connection limits at accept |
 | `src/ratelimit.rs` | the failed-login rate limit (`[auth_ratelimit]`) |
+| `src/route.rs` | the routes: which backend of a protocol a credential goes to (`[[routes]]`) |
+| `src/pool.rs` | backend pools: address health, the order of addresses for a login, failover before the credential, active health check rounds |
 | `src/proto/imap/`, `smtp/`, `sieve/` | per protocol: pre-auth dialog (`preauth.rs`), session handler (`mod.rs`), backend login (`backend.rs`); SMTP EHLO extensions from the backend probe (`smtp/ehlo.rs`) |
 | `src/auth/token.rs` | JWKS fetching and refresh, local JWT validation |
 | `src/auth/legacy.rs`, `account.rs` | the legacy (password) gate, doveadm account check |
@@ -106,6 +108,7 @@ cargo install cargo-fuzz --locked
 | `smtp` | `proto/smtp/preauth.rs` (AUTH), `proto/smtp/backend.rs` (replies, RFC 5321 §4.2) | every refusal is answered; reply line limit |
 | `token` | `auth/token.rs`: unverified `iss`, header and payload decoding, claim checks | no token without a valid signature passes; the identity is one plain address; error texts carry no control characters |
 | `config` | `config::parse`, `config::plan` (the reload comparison) | a valid configuration printed with `--print-config` parses again, is valid and compares as unchanged; two configurations separated by a line `#---` compare symmetrically, with changes exactly when their printed forms differ |
+| `backend_auth` | `auth/sasl.rs`: the backend's OAUTHBEARER error result (RFC 7628 §3.2.2) and the forwarded OAUTHBEARER response; `proto/sieve/backend.rs`: the ManageSieve challenge string (RFC 5804 §4) | a status that reaches a log line is a short plain word; nothing read past the challenge; a literal challenge at most 4096 octets; build/parse roundtrip of the forwarded response |
 | `tls_not_after` | `server/tls.rs`: the DER walk to a certificate's `notAfter` (RFC 5280 §4.1) | on raw bytes and as the time value in a certificate skeleton: never a time past year 9999, every well-formed time from 1970 on parses |
 
 Run a target from `fuzz/`. New inputs go to the first directory; keep it outside the
