@@ -502,7 +502,7 @@ async fn sieve_gate_matrix() {
                 } else {
                     assert_eq!(
                         c.line().await,
-                        "NO \"password authentication not available on this endpoint\"",
+                        "NO (AUTH-TOO-WEAK) \"password authentication not available on this endpoint\"",
                         "{}",
                         cell.id()
                     );

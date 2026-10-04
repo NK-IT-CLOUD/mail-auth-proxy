@@ -8,6 +8,17 @@ use zeroize::{Zeroize as _, Zeroizing};
 /// Longest accepted protocol line.
 pub(crate) const MAX_LINE: usize = 16384;
 
+/// True if `tag` is a valid IMAP tag (RFC 9051 §9: one or more
+/// `astring-char` except `+`). A server answers a line with an invalid
+/// tag untagged.
+pub(crate) fn is_imap_tag(tag: &[u8]) -> bool {
+    !tag.is_empty()
+        && tag.iter().all(|b| {
+            b.is_ascii_graphic()
+                && !matches!(b, b'(' | b')' | b'{' | b'"' | b'\\' | b'%' | b'*' | b'+')
+        })
+}
+
 /// True if the command verb of `line` (its first space-separated word) is
 /// `verb`, ignoring case. `STARTTLSX` is not `STARTTLS`.
 pub fn verb_is(line: &str, verb: &str) -> bool {

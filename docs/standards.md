@@ -57,7 +57,8 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 | ID command answered `* ID NIL` | MUST | RFC 2971 §3.1-3.2 | Yes | |
 | `ID` listed in CAPABILITY | | RFC 2971 §3 | Yes | |
 | Untagged BAD when the tag cannot be determined | | RFC 9051 §7.1.3 | Yes | |
-| Commands not valid in this state → BAD or NO | | RFC 3501 §3 | Yes (NO) | Then the connection closes |
+| Unknown commands, and commands not valid in this state → BAD | | RFC 9051 §7.1.3, RFC 3501 §3 | Yes | Then the connection closes |
+| Tag syntax (`astring-char` except `+`) | | RFC 9051 §9 | Yes | A line with an invalid tag gets the untagged BAD and closes |
 | Pre-authentication inactivity timeout may be short | | RFC 9051 §5.4 | Yes | Default 30 s idle, 60 s total. See D-GEN-2. |
 | Post-authentication autologout ≥ 30 min | MUST | RFC 9051 §5.4 | Depends on configuration | No proxy timer after login by default; the backend decides. `session.idle_limit_secs` and `session.max_session_secs` below 1800 give a warning (section 7, D-GEN-3) |
 | STARTTLS on cleartext ports | MUST | RFC 9051 §6.1.1 | N/A | No cleartext IMAP port |
@@ -113,6 +114,7 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 | Unsupported mechanism → NO | | RFC 5804 §2.1 | Yes | Before any challenge |
 | TRYLATER on temporary failure | | RFC 5804 §1.3 | Yes | |
 | SCRAM-SHA-1 and PLAIN over TLS | MUST | RFC 5804 §2.1 | Partial | PLAIN only where a legacy rule allows it; no SCRAM. D-AUTH-1. |
+| `AUTH-TOO-WEAK` when policy forbids the mechanism | | RFC 5804 §1.3 | Yes | PLAIN on a connection that does not offer it. A refusal by the legacy gate (user, domain, account, throttle) gets the plain `NO` of a wrong password |
 | SASL proxy authentication (authzid ≠ authcid) | SHOULD | RFC 5804 §2.1 | No | D-SASL-1 |
 | Pre-authentication timeout may be short | | RFC 5804 §1.2 | Yes | |
 | Quoted strings ≤ 1024 octets | | RFC 5804 §4 (erratum 2655) | Yes | Client role: the backend login sends a longer initial response as a literal `{n+}`. Server role: the OAuth error result beyond 1024 octets is sent as a literal. |

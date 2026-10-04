@@ -335,7 +335,7 @@ pub async fn handle(
                         None if password && !pw_mechs.plain => {
                             client_tls
                                 .write_all(
-                                    b"NO \"password authentication not available on this endpoint\"\r\n",
+                                    b"NO (AUTH-TOO-WEAK) \"password authentication not available on this endpoint\"\r\n",
                                 )
                                 .await?;
                             return Err(anyhow::Error::new(auth::Withheld {
@@ -462,7 +462,7 @@ pub async fn handle(
                     return Ok(());
                 }
                 auth::Outcome::Blocked => (
-                    "NO \"password authentication not available on this endpoint\"",
+                    "NO (AUTH-TOO-WEAK) \"password authentication not available on this endpoint\"",
                     refused(format!(
                         "password auth blocked on OAuth-only endpoint (scope={scope})"
                     )),

@@ -17,7 +17,7 @@ On connect, the proxy completes the TLS handshake (inside the pre-auth budget) a
 * OK [CAPABILITY IMAP4rev1 SASL-IR ID AUTH=XOAUTH2 AUTH=OAUTHBEARER AUTH=PLAIN AUTH=LOGIN] <hostname> ready   (PLAIN and LOGIN offered by a legacy rule)
 ```
 
-A line is split as `<tag> SP <command> [SP <rest>]`. Commands are case-insensitive, and the tag is any non-empty token.
+A line is split as `<tag> SP <command> [SP <rest>]`. Commands are case-insensitive. The tag follows RFC 9051 §9: printable ASCII without `(`, `)`, `{`, `%`, `*`, `"`, `\` and `+`.
 
 | Client sends | Proxy replies | Connection |
 |---|---|---|
@@ -34,8 +34,8 @@ A line is split as `<tag> SP <command> [SP <rest>]`. Commands are case-insensiti
 | `t AUTHENTICATE <mech> [<ir>]` with a supported mech | SASL exchange, [below](#imap-sasl-exchange) | |
 | `t AUTHENTICATE` (no mech) | `t BAD AUTHENTICATE needs a mechanism` | stays open; an attempt |
 | `t AUTHENTICATE CRAM-MD5` (any other mech) | `t NO unsupported SASL mechanism` | stays open; an attempt |
-| any other command, including `STARTTLS`, `ENABLE`, `SELECT` | `t NO command not supported before authentication` | closed |
-| a line without tag or command, or an empty line | `* BAD expected: tag command` | closed |
+| any other command, including `STARTTLS`, `ENABLE`, `SELECT` | `t BAD command not supported before authentication` | closed |
+| a line without tag or command, an empty line, or a tag outside the grammar above (e.g. `*`, `+`) | `* BAD expected: tag command` | closed |
 | an 8th non-final command | its reply, then `* BYE too many commands before authentication` | closed |
 
 On an OAuth-only endpoint the capabilities include `LOGINDISABLED`. A `LOGIN` command sent anyway is parsed so the attempt can be logged, then rejected ([decision](#imap-decision-and-backend-login)).
@@ -351,7 +351,7 @@ Before `AUTHENTICATE`, `CAPABILITY` (the capability list again, then `OK "Capabi
 | `AUTHENTICATE "MECH" {n+}` CRLF `<n bytes>` CRLF | literal IR, n ≤ 65536. Only `{n+}` (RFC 5804 §4): `{n}`, `{n++}`, text after the header or after the octets are refused. |
 | `AUTHENTICATE "MECH"` | proxy sends the empty challenge `""` and reads the response as a string: quoted, a literal `{n+}`, or a bare line (RFC 5804 §2.1). |
 | mech not in `XOAUTH2`, `OAUTHBEARER`, `PLAIN` (e.g. `LOGIN`) | `NO "Authentication mechanism not supported"`, before any challenge |
-| `AUTHENTICATE "PLAIN"` without IR where the connection does not offer PLAIN | `NO "password authentication not available on this endpoint"`, without a challenge |
+| `AUTHENTICATE "PLAIN"` without IR where the connection does not offer PLAIN | `NO (AUTH-TOO-WEAK) "password authentication not available on this endpoint"`, without a challenge |
 | anything else (another command, unquoted mech, bad literal, literal > 64 KiB) | `NO "Invalid AUTHENTICATE"` (closed) |
 | `"*"` / `*` as the response, a response that is not base64 or holds no valid credential (the cases listed for [IMAP](#imap-sasl-exchange)) | `NO "Invalid authentication response"`; a malformed string (bad literal, text after the quoted string) closes the connection |
 | an OAuth response with an empty `auth` value (discovery, RFC 7628 §4.3) | the [OAuth error result](#oauth-error-result), then `NO "Authentication failed"`; `authresult` `protocol`, not a failed login |
@@ -362,7 +362,7 @@ Before `AUTHENTICATE`, `CAPABILITY` (the capability list again, then `OK "Capabi
 |---|---|---|
 | token invalid, or an OAUTHBEARER `host` that is not the SNI name | `"<error result>"`; after the client's answer `NO "Authentication failed"` ([OAuth error result](#oauth-error-result)) | `bad_token` |
 | token valid, but `user=` / `a=` names another identity | `NO "Authorization failed"` | `authzid_mismatch` |
-| PLAIN and the connection does not offer it | `NO "password authentication not available on this endpoint"` | `blocked_endpoint`: with `pwfp` when the initial response carried the password, otherwise without |
+| PLAIN and the connection does not offer it | `NO (AUTH-TOO-WEAK) "password authentication not available on this endpoint"` | `blocked_endpoint`: with `pwfp` when the initial response carried the password, otherwise without |
 | PLAIN refused by the legacy gate (including a password over 1024 bytes) | `NO "Authentication failed"`, after `failure_delay_ms` (see below) | `blocked_endpoint`, `unknown_domain`, `unknown_account`, `throttled`, `oversize` |
 | account check unavailable | `NO (TRYLATER) "Service temporarily unavailable"` | none (counted in `mail_auth_proxy_backend_errors_total`) |
 | the pre-auth budget runs out during token validation, the account check or the backend login | `NO (TRYLATER) "Service temporarily unavailable"` | none (counted in `mail_auth_proxy_backend_errors_total`) |
@@ -419,7 +419,7 @@ sequenceDiagram
             end
         else password (PLAIN)
             alt mechanism not offered here (blocked_endpoint)
-                P-->>C: NO "password authentication not available on this endpoint"
+                P-->>C: NO (AUTH-TOO-WEAK) "password authentication not available on this endpoint"
             else refused: rule, domain gate, route (2b), account check of the backend, throttle
                 P-->>C: NO "Authentication failed" (padded)
             end

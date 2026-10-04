@@ -87,7 +87,13 @@ pub async fn read_client_auth<S: AsyncRead + AsyncWrite + Unpin>(
         };
         let mut parts = line.splitn(3, ' ');
         let tag = parts.next().unwrap_or("").to_string();
-        let Some(cmd) = parts.next().filter(|c| !tag.is_empty() && !c.is_empty()) else {
+        // A tag outside the RFC 9051 grammar (`*`, `+`, a quote) is not
+        // echoed: the reply would read as an untagged response or a
+        // continuation.
+        let Some(cmd) = parts
+            .next()
+            .filter(|c| crate::wire::line::is_imap_tag(tag.as_bytes()) && !c.is_empty())
+        else {
             stream.write_all(b"* BAD expected: tag command\r\n").await?;
             return Err(anyhow!("line without tag and command"));
         };
@@ -226,10 +232,12 @@ pub async fn read_client_auth<S: AsyncRead + AsyncWrite + Unpin>(
                     host,
                 }));
             }
+            // RFC 9051 §7.1.3: BAD for a command the server does not know
+            // (or, RFC 9051 §3, one not valid in this state).
             _ => {
                 stream
                     .write_all(
-                        format!("{tag} NO command not supported before authentication\r\n")
+                        format!("{tag} BAD command not supported before authentication\r\n")
                             .as_bytes(),
                     )
                     .await?;
@@ -715,7 +723,9 @@ mod tests {
         let _ = client.read(&mut buf).await.unwrap(); // greeting
         client.write_all(b"F1 SELECT INBOX\r\n").await.unwrap();
         let n = client.read(&mut buf).await.unwrap();
-        assert!(std::str::from_utf8(&buf[..n]).unwrap().starts_with("F1 NO"));
+        assert!(std::str::from_utf8(&buf[..n])
+            .unwrap()
+            .starts_with("F1 BAD"));
         assert!(t.await.unwrap().is_err());
     }
 
@@ -923,6 +933,45 @@ mod tests {
         assert!(t.await.unwrap().is_err());
         let n = client.read(&mut buf).await.unwrap();
         assert!(std::str::from_utf8(&buf[..n]).unwrap().starts_with("* BAD"));
+    }
+
+    /// A tag outside the RFC 9051 grammar is never echoed: `*` would make
+    /// the reply untagged, `+` a continuation. The line gets an untagged BAD
+    /// and ends the connection, like one without a tag.
+    #[tokio::test]
+    async fn invalid_tag_gets_untagged_bad() {
+        for input in [
+            &b"* CAPABILITY\r\n"[..],
+            b"+ CAPABILITY\r\n",
+            b"a\"b NOOP\r\n",
+            b"(a) NOOP\r\n",
+            b"a{1 NOOP\r\n",
+            b"a% NOOP\r\n",
+            b"a\\b NOOP\r\n",
+        ] {
+            let (r, out) = login_dialog(MechSet::default(), input).await;
+            assert!(r.is_err(), "{input:?}");
+            assert_eq!(out, "* BAD expected: tag command\r\n", "{input:?}");
+        }
+        // `]` is an astring-char (resp-specials) and a valid tag.
+        let (r, out) = login_dialog(MechSet::default(), b"a] LOGOUT\r\n").await;
+        assert!(r.unwrap().is_none());
+        assert!(out.ends_with("a] OK LOGOUT completed\r\n"), "{out}");
+    }
+
+    /// RFC 9051 §7.1.3: a command the server does not know, or one not
+    /// valid before authentication, gets a tagged BAD.
+    #[tokio::test]
+    async fn unsupported_command_gets_bad() {
+        for cmd in ["SELECT INBOX", "STARTTLS", "ENABLE IMAP4rev2", "XYZZY"] {
+            let (r, out) =
+                login_dialog(MechSet::default(), format!("a {cmd}\r\n").as_bytes()).await;
+            assert!(r.is_err(), "{cmd}");
+            assert_eq!(
+                out, "a BAD command not supported before authentication\r\n",
+                "{cmd}"
+            );
+        }
     }
 
     /// `AUTHENTICATE LOGIN <b64user>`: only the password is asked for.

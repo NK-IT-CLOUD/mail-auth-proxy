@@ -6,6 +6,14 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- IMAP: a command not supported before authentication gets `BAD` instead of `NO`
+  (RFC 9051 §7.1.3), and a line whose tag is outside the RFC 9051 grammar (`*`, `+`, a
+  quote) gets the untagged `* BAD expected: tag command` instead of a reply with that tag.
+  Both close the connection, as before.
+- ManageSieve: PLAIN on a connection that does not offer it gets
+  `NO (AUTH-TOO-WEAK) "…"` (RFC 5804 §1.3). Refusals by the legacy gate are unchanged.
+
 ## [0.5.1] - 2026-10-02
 
 ### Fixed

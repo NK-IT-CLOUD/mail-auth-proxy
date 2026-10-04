@@ -65,7 +65,10 @@ fn classify(kind: Kind, reply: &str) -> Answer {
         Kind::Smtp if reply == "535 5.7.8 Authentication credentials invalid" => Answer::Failed,
         Kind::Smtp if reply == "454 4.7.0 Temporary authentication failure" => Answer::Unavailable,
         Kind::Sieve if is("OK") => Answer::Ok,
-        Kind::Sieve if reply == "NO \"password authentication not available on this endpoint\"" => {
+        Kind::Sieve
+            if reply
+                == "NO (AUTH-TOO-WEAK) \"password authentication not available on this endpoint\"" =>
+        {
             Answer::NotHere
         }
         Kind::Sieve if reply == "NO \"Authentication failed\"" => Answer::Failed,

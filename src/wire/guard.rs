@@ -977,11 +977,7 @@ impl Guard {
     /// one that is not a valid tag (RFC 9051 §9: `astring-char` except `+`),
     /// which a server answers untagged.
     fn tag_of_blocked(&self) -> Vec<u8> {
-        let valid = |b: &u8| {
-            b.is_ascii_graphic()
-                && !matches!(b, b'(' | b')' | b'{' | b'"' | b'\\' | b'%' | b'*' | b'+')
-        };
-        if !self.tag.is_empty() && self.tag.iter().all(valid) {
+        if crate::wire::line::is_imap_tag(&self.tag) {
             self.tag.clone()
         } else {
             b"*".to_vec()

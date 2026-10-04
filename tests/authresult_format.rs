@@ -70,7 +70,7 @@ async fn golden_authresult_lines() {
     c.send("a SELECT INBOX").await;
     assert_eq!(
         c.line().await,
-        "a NO command not supported before authentication"
+        "a BAD command not supported before authentication"
     );
     h.proxy.wait_authresults(5).await;
 

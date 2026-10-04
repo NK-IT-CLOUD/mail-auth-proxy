@@ -185,7 +185,10 @@ async fn oauth_only_endpoint_never_prompts_for_a_password() {
         let want = match kind {
             Kind::Imap => "a NO password authentication not available on this endpoint",
             Kind::Smtp => "504 5.5.4 password authentication not available on this endpoint",
-            Kind::Sieve => "NO \"password authentication not available on this endpoint\"",
+            // RFC 5804 §1.3: the mechanism is refused by site policy.
+            Kind::Sieve => {
+                "NO (AUTH-TOO-WEAK) \"password authentication not available on this endpoint\""
+            }
         };
         assert_eq!(c.line().await, want, "{cmd}");
         let ars = h.proxy.wait_authresults(n + 1).await;

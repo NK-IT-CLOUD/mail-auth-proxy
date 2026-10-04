@@ -7,7 +7,8 @@
 //! before the TLS handshake; Dovecot needs `haproxy = yes` on that listener.
 //! Writing it is `wire/connect.rs`.
 //!
-//! Spec: <https://www.haproxy.org/download/2.9/doc/proxy-protocol.txt> §2.2.
+//! Spec: <https://github.com/haproxy/haproxy/blob/master/doc/proxy-protocol.txt>
+//! (revision 2020/03/05) §2.2.
 
 use std::net::{IpAddr, SocketAddr};
 
