@@ -734,7 +734,7 @@ users = ["*@example.test", "*@gone.test"]
             ""
         };
         format!(
-            r#"WARN authlog: authresult result="fail" proto="imap" scope="external" mech=PLAIN user={user} peer=127.0.0.1 reason="{reason}" pwfp="<fp>" rule="{rule}" listener="imap" backend="{backend}""#
+            r#"WARN authlog: authresult result="fail" proto="imap" scope="external" mech=PLAIN user={user} peer=127.0.0.1 reason="{reason}" pwfp="<fp>" rule="{rule}" listener="imap" backend="{backend}" tls="TLSv1.3/TLS13_AES_256_GCM_SHA384""#
         )
     };
     assert_eq!(

@@ -122,7 +122,7 @@ async fn oauth_authzid_naming_another_user_fails() {
     // The tokens themselves were valid.
     assert_eq!(
         h.proxy
-            .metric("mail_auth_proxy_token_validate_total{result=\"fail\"}")
+            .metric("mail_auth_proxy_token_validations_total{result=\"fail\"}")
             .await,
         0
     );

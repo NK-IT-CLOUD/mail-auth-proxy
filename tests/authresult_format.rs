@@ -2,8 +2,8 @@
 //! binary emits is produced here once and pinned byte for byte after the
 //! timestamp; every line must also match the CrowdSec grok pattern. The
 //! legacy-gate reasons are pinned in `legacy_gate.rs`. New fields (`rule`,
-//! `listener`) are only appended at the end, so existing patterns keep
-//! matching. (The harness checks the grok pattern for every authresult line
+//! `listener`, `backend`, `tls`) are only appended at the end, so existing
+//! patterns keep matching. (The harness checks the grok pattern for every authresult line
 //! of every test when the proxy is dropped.)
 
 mod common;
@@ -93,11 +93,11 @@ async fn golden_authresult_lines() {
     assert_eq!(
         got,
         [
-            r#"INFO authlog: authresult result="ok" proto="imap" scope="external" mech=xoauth2 user=alice@example.test peer=127.0.0.2 reason="ok" pwfp="" rule="" listener="imap" backend="imap""#,
-            r#"WARN authlog: authresult result="fail" proto="smtp" scope="external" mech=XOAUTH2 user=evil??result??ok??user?root?peer?10.0.0.1?x peer=127.0.0.2 reason="bad_token" pwfp="" rule="" listener="submission" backend="""#,
-            r#"WARN authlog: authresult result="fail" proto="sieve" scope="external" mech=PLAIN user=bob@example.test peer=127.0.0.2 reason="blocked_endpoint" pwfp="<fp>" rule="" listener="sieve" backend="""#,
-            r#"WARN authlog: authresult result="fail" proto="imap" scope="internal" mech=PLAIN user=reject@example.test peer=127.0.0.1 reason="backend_reject" pwfp="<fp>" rule="password_gate" listener="imap" backend="imap""#,
-            r#"WARN authlog: authresult result="fail" proto="imap" scope="external" mech=other user= peer=127.0.0.2 reason="protocol" pwfp="" rule="" listener="imap" backend="""#,
+            r#"INFO authlog: authresult result="ok" proto="imap" scope="external" mech=xoauth2 user=alice@example.test peer=127.0.0.2 reason="ok" pwfp="" rule="" listener="imap" backend="imap" tls="TLSv1.3/TLS13_AES_256_GCM_SHA384""#,
+            r#"WARN authlog: authresult result="fail" proto="smtp" scope="external" mech=XOAUTH2 user=evil??result??ok??user?root?peer?10.0.0.1?x peer=127.0.0.2 reason="bad_token" pwfp="" rule="" listener="submission" backend="" tls="TLSv1.3/TLS13_AES_256_GCM_SHA384""#,
+            r#"WARN authlog: authresult result="fail" proto="sieve" scope="external" mech=PLAIN user=bob@example.test peer=127.0.0.2 reason="blocked_endpoint" pwfp="<fp>" rule="" listener="sieve" backend="" tls="TLSv1.3/TLS13_AES_256_GCM_SHA384""#,
+            r#"WARN authlog: authresult result="fail" proto="imap" scope="internal" mech=PLAIN user=reject@example.test peer=127.0.0.1 reason="backend_reject" pwfp="<fp>" rule="password_gate" listener="imap" backend="imap" tls="TLSv1.3/TLS13_AES_256_GCM_SHA384""#,
+            r#"WARN authlog: authresult result="fail" proto="imap" scope="external" mech=other user= peer=127.0.0.2 reason="protocol" pwfp="" rule="" listener="imap" backend="" tls="TLSv1.3/TLS13_AES_256_GCM_SHA384""#,
         ]
     );
 
@@ -123,6 +123,18 @@ async fn golden_authresult_lines() {
         ]
     );
     assert_eq!(fields[4][4], "", "empty user");
+    // The optional trailing fields: listener, backend, tls (each optional
+    // part is a group of its own around the field's group).
+    let tail: Vec<String> = grok
+        .captures(&lines[0])
+        .map(|c| [13, 15, 17].map(|i| c[i].to_string()).to_vec())
+        .unwrap();
+    assert_eq!(
+        tail,
+        ["imap", "imap", "TLSv1.3/TLS13_AES_256_GCM_SHA384"],
+        "{}",
+        lines[0]
+    );
     // One authresult per line: the hostile user did not forge a second one.
     assert!(lines.iter().all(|l| l.matches("result=").count() == 1));
 

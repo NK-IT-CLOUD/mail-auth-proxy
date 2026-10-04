@@ -77,7 +77,7 @@ async fn rejections(kind: Kind) {
     for (i, (case, token, detail)) in cases(&h.idp).into_iter().enumerate() {
         let fails = h
             .proxy
-            .metric("mail_auth_proxy_token_validate_total{result=\"fail\"}")
+            .metric("mail_auth_proxy_token_validations_total{result=\"fail\"}")
             .await;
         let (mut c, result, reply) = h
             .auth_rejected(
@@ -125,7 +125,7 @@ async fn rejections(kind: Kind) {
         );
         assert_eq!(
             h.proxy
-                .metric("mail_auth_proxy_token_validate_total{result=\"fail\"}")
+                .metric("mail_auth_proxy_token_validations_total{result=\"fail\"}")
                 .await,
             fails + 1,
             "{proto}: {case}"
@@ -214,7 +214,7 @@ async fn oversize_token_is_bad_token() {
     assert!(h.sieve_be.sessions().is_empty());
     assert_eq!(
         h.proxy
-            .metric("mail_auth_proxy_token_validate_total{result=\"fail\"}")
+            .metric("mail_auth_proxy_token_validations_total{result=\"fail\"}")
             .await,
         1
     );

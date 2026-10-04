@@ -7,7 +7,8 @@
 //! (internal/external), mech, user, peer (source IP), reason, pwfp, rule (the
 //! legacy rule that decided, empty otherwise), listener (`imap`,
 //! `submission`, `submissions`, `sieve`), backend (the backend the
-//! credential was sent to, empty otherwise). New fields are only ever
+//! credential was sent to, empty otherwise), tls (protocol version and
+//! cipher suite of the client's TLS session). New fields are only ever
 //! appended at the end.
 //!
 //! - The attempted password is never logged. Only a truncated HMAC-SHA256
@@ -83,6 +84,38 @@ pub fn sanitize(s: &str) -> String {
         .take(64)
         .map(|c| {
             if c.is_ascii_alphanumeric() || "@._-+".contains(c) {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+/// The `tls` value: protocol version and cipher suite the client's TLS
+/// session negotiated, e.g. `TLSv1.3/TLS13_AES_256_GCM_SHA384`. Empty while no
+/// handshake has completed.
+pub fn tls_params(conn: &rustls::CommonState) -> String {
+    let version = match conn.protocol_version() {
+        Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3".to_string(),
+        Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2".to_string(),
+        Some(other) => format!("{other:?}"),
+        None => return String::new(),
+    };
+    let suite = conn
+        .negotiated_cipher_suite()
+        .map(|s| format!("{:?}", s.suite()))
+        .unwrap_or_default();
+    tls_field(&format!("{version}/{suite}"))
+}
+
+/// Keep only the characters of a version and suite name (`/` separates
+/// them); anything else becomes `?`, capped like `sanitize`.
+fn tls_field(s: &str) -> String {
+    s.chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-/".contains(c) {
                 c
             } else {
                 '?'
@@ -167,6 +200,8 @@ pub struct AuthEvent<'a> {
     /// The backend the credential was sent to (its name), or empty when it
     /// was not sent.
     pub backend: &'a str,
+    /// `tls_params` of the client's TLS session.
+    pub tls: &'a str,
 }
 
 impl AuthEvent<'_> {
@@ -188,12 +223,14 @@ impl AuthEvent<'_> {
         let listener = self.listener.label();
         // A configured name; sanitised anyway, the field is parsed.
         let backend = sanitize(self.backend);
+        // Built by `tls_params`; filtered anyway, the field is parsed.
+        let tls = tls_field(self.tls);
         if self.reason == Reason::Ok {
             tracing::info!(target: "authlog",
-                result = "ok", proto, scope, mech = %mech, user = %user, peer = %peer, reason, pwfp, rule = rule.as_str(), listener, backend = backend.as_str(), "authresult");
+                result = "ok", proto, scope, mech = %mech, user = %user, peer = %peer, reason, pwfp, rule = rule.as_str(), listener, backend = backend.as_str(), tls = tls.as_str(), "authresult");
         } else {
             tracing::warn!(target: "authlog",
-                result = "fail", proto, scope, mech = %mech, user = %user, peer = %peer, reason, pwfp, rule = rule.as_str(), listener, backend = backend.as_str(), "authresult");
+                result = "fail", proto, scope, mech = %mech, user = %user, peer = %peer, reason, pwfp, rule = rule.as_str(), listener, backend = backend.as_str(), tls = tls.as_str(), "authresult");
         }
     }
 }
@@ -287,11 +324,28 @@ mod tests {
                 rule: "",
                 listener: Listener::Imap,
                 backend: "",
+                tls: "TLSv1.3/TLS13_AES_128_GCM_SHA256",
             }
             .record();
         });
         let line = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         assert!(line.contains(" peer=192.0.2.7 "), "{line}");
+        assert!(
+            line.trim_end()
+                .ends_with(r#"backend="" tls="TLSv1.3/TLS13_AES_128_GCM_SHA256""#),
+            "tls is the last field: {line}"
+        );
+    }
+
+    /// The `tls` field cannot carry a quote, a space or a newline.
+    #[test]
+    fn tls_field_keeps_only_name_characters() {
+        assert_eq!(
+            tls_field("TLSv1.3/TLS13_AES_256_GCM_SHA384"),
+            "TLSv1.3/TLS13_AES_256_GCM_SHA384"
+        );
+        assert_eq!(tls_field("Unknown(0x1301)\" x"), "Unknown?0x1301???x");
+        assert_eq!(tls_field(&"x".repeat(200)).len(), 64);
     }
 
     #[test]

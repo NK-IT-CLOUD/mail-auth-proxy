@@ -665,12 +665,12 @@ fn render() -> String {
         }
     }
 
-    o.push_str("# HELP mail_auth_proxy_token_validate_total Local JWT validation outcomes (no remote introspection).\n");
-    o.push_str("# TYPE mail_auth_proxy_token_validate_total counter\n");
+    o.push_str("# HELP mail_auth_proxy_token_validations_total Local JWT validation outcomes (no remote introspection).\n");
+    o.push_str("# TYPE mail_auth_proxy_token_validations_total counter\n");
     for (r, rlabel) in ["ok", "fail"].iter().enumerate() {
         let v = TOKEN_VALIDATE[r].load(Ordering::Relaxed);
         o.push_str(&format!(
-            "mail_auth_proxy_token_validate_total{{result=\"{rlabel}\"}} {v}\n"
+            "mail_auth_proxy_token_validations_total{{result=\"{rlabel}\"}} {v}\n"
         ));
     }
 
@@ -774,13 +774,13 @@ fn render() -> String {
     }
 
     o.push_str(
-        "# HELP mail_auth_proxy_upstream_forward_total Sessions spliced through to a backend.\n",
+        "# HELP mail_auth_proxy_upstream_forwards_total Sessions spliced through to a backend.\n",
     );
-    o.push_str("# TYPE mail_auth_proxy_upstream_forward_total counter\n");
+    o.push_str("# TYPE mail_auth_proxy_upstream_forwards_total counter\n");
     for (p, plabel) in PROTO_LABELS.iter().enumerate() {
         let v = UPSTREAM_FORWARD[p].load(Ordering::Relaxed);
         o.push_str(&format!(
-            "mail_auth_proxy_upstream_forward_total{{proto=\"{plabel}\"}} {v}\n"
+            "mail_auth_proxy_upstream_forwards_total{{proto=\"{plabel}\"}} {v}\n"
         ));
     }
 
@@ -1365,7 +1365,9 @@ mod tests {
         // Series we just incremented are present and non-zero
         assert!(out.contains("mail_auth_proxy_auth_attempts_total{proto=\"imap\",scope=\"internal\",mechanism=\"xoauth2\",result=\"ok\"} 1"));
         assert!(out.contains("mail_auth_proxy_auth_attempts_total{proto=\"smtp\",scope=\"external\",mechanism=\"oauthbearer\",result=\"fail\"} 1"));
-        assert!(out.contains("mail_auth_proxy_upstream_forward_total{proto=\"sieve\"} 1"));
+        assert!(out.contains("mail_auth_proxy_upstream_forwards_total{proto=\"sieve\"} 1"));
+        assert!(out.contains("# TYPE mail_auth_proxy_token_validations_total counter"));
+        assert!(out.contains("mail_auth_proxy_token_validations_total{result=\"ok\"}"));
         assert!(out.contains("mail_auth_proxy_route_misses_total{proto=\"smtp\"} 1"));
         assert!(out.contains("mail_auth_proxy_active_connections{proto=\"imap\"} 1"));
         assert!(out.contains("mail_auth_proxy_build_info{version="));

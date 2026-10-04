@@ -222,6 +222,7 @@ pub async fn handle(
             // rules as IMAP/SMTP. External clients and forged-SNI attackers stay
             // OAuth-only unless a rule names their network.
             let sni = client_tls.get_ref().1.server_name().map(|s| s.to_string());
+            let tls = crate::obs::authlog::tls_params(client_tls.get_ref().1);
             let pw_mechs = crate::auth::legacy::MechSet {
                 plain: ctx.password_mechs(Proto::Sieve, sni.as_deref(), peer).plain,
                 login: false,
@@ -233,6 +234,7 @@ pub async fn handle(
                 internal,
                 scope,
                 sni: sni.as_deref(),
+                tls: &tls,
                 pw_mechs,
                 preauth_until,
             };

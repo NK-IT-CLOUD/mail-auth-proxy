@@ -6,7 +6,19 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- `authresult` line: new last field `tls="<version>/<suite>"`, the protocol version and
+  cipher suite of the client's TLS session (e.g. `TLSv1.3/TLS13_AES_256_GCM_SHA384`).
+  Patterns anchored on the earlier fields keep matching. The CrowdSec parser in
+  `contrib/crowdsec` now also extracts `listener`, `backend` and `tls` (optional, so lines
+  of older releases still parse).
+
 ### Changed
+- **Breaking:** two metrics renamed to plural nouns like the other counters, without an
+  alias: `mail_auth_proxy_token_validate_total` → `mail_auth_proxy_token_validations_total`,
+  `mail_auth_proxy_upstream_forward_total` → `mail_auth_proxy_upstream_forwards_total`.
+  Dashboards, alerts and recording rules that use the old names must be updated with the
+  upgrade.
 - IMAP: a command not supported before authentication gets `BAD` instead of `NO`
   (RFC 9051 §7.1.3), and a line whose tag is outside the RFC 9051 grammar (`*`, `+`, a
   quote) gets the untagged `* BAD expected: tag command` instead of a reply with that tag.

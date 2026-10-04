@@ -60,6 +60,7 @@ pub async fn handle(
         // Source IP + SNI (client-requested name) decide which password
         // mechanisms the legacy gate offers on this connection; none → OAuth-only.
         let sni = client.get_ref().1.server_name().map(|s| s.to_string());
+        let tls = crate::obs::authlog::tls_params(client.get_ref().1);
         let pw_mechs = ctx.password_mechs(metrics::Proto::Imap, sni.as_deref(), peer);
         let session = auth::Session {
             proto: metrics::Proto::Imap,
@@ -68,6 +69,7 @@ pub async fn handle(
             internal,
             scope,
             sni: sni.as_deref(),
+            tls: &tls,
             pw_mechs,
             preauth_until,
         };

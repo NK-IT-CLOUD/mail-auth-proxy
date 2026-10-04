@@ -1700,10 +1700,10 @@ pub fn grok_regex() -> regex::Regex {
 
 /// Strict parser for the full line as the binary writes it. Group 10
 /// is the `rule` field, appended after `pwfp`, group 11 `listener`, group
-/// 12 `backend`.
+/// 12 `backend`, group 13 `tls`.
 fn line_regex() -> regex::Regex {
     regex::Regex::new(
-        r#"^\S+Z +(INFO|WARN) authlog: authresult result="([^"]*)" proto="([^"]*)" scope="([^"]*)" mech=(\S*) user=(\S*) peer=(\S+) reason="([^"]*)" pwfp="([^"]*)" rule="([^"]*)" listener="(imap|submission|submissions|sieve)" backend="([A-Za-z0-9._-]*)"$"#,
+        r#"^\S+Z +(INFO|WARN) authlog: authresult result="([^"]*)" proto="([^"]*)" scope="([^"]*)" mech=(\S*) user=(\S*) peer=(\S+) reason="([^"]*)" pwfp="([^"]*)" rule="([^"]*)" listener="(imap|submission|submissions|sieve)" backend="([A-Za-z0-9._-]*)" tls="(TLSv1\.[23]/[A-Z0-9_]+)"$"#,
     )
     .unwrap()
 }

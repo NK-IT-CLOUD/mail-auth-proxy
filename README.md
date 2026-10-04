@@ -214,7 +214,7 @@ checks and the source layout are in [CONTRIBUTING.md](CONTRIBUTING.md).
 Every login attempt writes one `authresult` line to the journal:
 
 ```
-WARN authlog: authresult result="fail" proto="imap" scope="external" mech=PLAIN user=a@gone.test peer=198.51.100.7 reason="unknown_domain" pwfp="5d0f1c7a92b3e416" rule="partner" listener="imap" backend=""
+WARN authlog: authresult result="fail" proto="imap" scope="external" mech=PLAIN user=a@gone.test peer=198.51.100.7 reason="unknown_domain" pwfp="5d0f1c7a92b3e416" rule="partner" listener="imap" backend="" tls="TLSv1.3/TLS13_AES_256_GCM_SHA384"
 ```
 
 Its fields and reason values are a stable interface for log parsers (CrowdSec, Wazuh and
@@ -233,14 +233,14 @@ authentication, so keep it on loopback or a management network.
 | `mail_auth_proxy_auth_attempts_total` | evaluated credentials by protocol, scope, mechanism and result |
 | `mail_auth_proxy_auth_refusals_total` | refused credentials by `authresult` reason |
 | `mail_auth_proxy_preauth_aborts_total` | connections that ended before a credential |
-| `mail_auth_proxy_token_validate_total` | local JWT validations by result |
+| `mail_auth_proxy_token_validations_total` | local JWT validations by result |
 | `mail_auth_proxy_connections_total` | connections admitted past the limits |
 | `mail_auth_proxy_connections_rejected_total` | connections closed at accept by a limit |
 | `mail_auth_proxy_ratelimit_blocks_total` | connections closed at accept because the source is blocked after failed logins |
 | `mail_auth_proxy_ratelimit_active_blocks` | sources blocked now |
 | `mail_auth_proxy_active_connections` | admitted connections currently open |
 | `mail_auth_proxy_backend_errors_total` | backend or account-check outages while a client waited |
-| `mail_auth_proxy_upstream_forward_total` | sessions spliced to a backend |
+| `mail_auth_proxy_upstream_forwards_total` | sessions spliced to a backend |
 | `mail_auth_proxy_backend_login_duration_seconds` | histogram of successful backend logins |
 | `mail_auth_proxy_jwks_last_success_timestamp_seconds` | last JWKS fetch with usable keys, per issuer |
 | `mail_auth_proxy_tls_cert_expiry_timestamp_seconds` | expiry of each certificate in use (label `cert`) |

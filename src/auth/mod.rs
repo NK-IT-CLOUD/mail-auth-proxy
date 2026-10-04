@@ -237,6 +237,9 @@ pub struct Session<'a> {
     pub scope: &'static str,
     /// The TLS server name the client asked for.
     pub sni: Option<&'a str>,
+    /// Protocol version and cipher suite of the client's TLS session
+    /// (`authlog::tls_params`), for the `authresult` line.
+    pub tls: &'a str,
     /// The password mechanisms the legacy gate offers on this connection
     /// (network + SNI + protocol).
     pub pw_mechs: legacy::MechSet,
@@ -295,6 +298,7 @@ fn record(
         rule,
         listener: s.listener,
         backend,
+        tls: s.tls,
     }
     .record();
     metrics::record_auth(s.proto, s.listener, s.internal, mech, reason == Reason::Ok);
@@ -368,6 +372,7 @@ pub fn discovery(s: &Session<'_>, d: &sasl::Discovery) {
         rule: "",
         listener: s.listener,
         backend: "",
+        tls: s.tls,
     }
     .record();
 }
@@ -485,6 +490,7 @@ fn no_credential(s: &Session<'_>) {
         rule: "",
         listener: s.listener,
         backend: "",
+        tls: s.tls,
     }
     .record();
 }

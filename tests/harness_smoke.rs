@@ -76,7 +76,7 @@ async fn proxy_starts_and_relays_each_protocol() {
     for kind in Kind::ALL {
         let p = kind.label();
         assert_eq!(
-            m[&format!("mail_auth_proxy_upstream_forward_total{{proto=\"{p}\"}}")],
+            m[&format!("mail_auth_proxy_upstream_forwards_total{{proto=\"{p}\"}}")],
             1
         );
         assert_eq!(

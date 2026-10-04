@@ -247,6 +247,7 @@ async fn serve(
         // SNI and source address decide which password mechanisms the legacy
         // rules offer; none means OAuth only.
         let sni = client_tls.get_ref().1.server_name().map(|s| s.to_string());
+        let tls = crate::obs::authlog::tls_params(client_tls.get_ref().1);
         let pw_mechs = ctx.password_mechs(Proto::Smtp, sni.as_deref(), peer);
         let session = auth::Session {
             proto: Proto::Smtp,
@@ -255,6 +256,7 @@ async fn serve(
             internal,
             scope,
             sni: sni.as_deref(),
+            tls: &tls,
             pw_mechs,
             preauth_until,
         };

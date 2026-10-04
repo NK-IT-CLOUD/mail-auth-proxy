@@ -132,7 +132,7 @@ async fn active_connections_return_to_zero_on_client_abort() {
         let want = if kind == Kind::Imap { 1 } else { 2 };
         assert_eq!(m[&aborts], want, "{p}");
         assert_eq!(
-            m[&format!("mail_auth_proxy_upstream_forward_total{{proto=\"{p}\"}}")],
+            m[&format!("mail_auth_proxy_upstream_forwards_total{{proto=\"{p}\"}}")],
             1,
             "{p}"
         );

@@ -30,7 +30,7 @@ Requirement levels (MUST, SHOULD, MAY) are those of the cited text; an empty Lev
 | Implicit TLS for submission (port 465) | SHOULD | RFC 8314 §3.3, RFC 9325 §3.2 | Yes | `submission.implicit_tls_listen`, next to STARTTLS on 587 (`submission.listen`, required). |
 | Plaintext is never accepted for authentication | MUST | RFC 9325 §3.2 | Yes | Fixed policy, not configurable |
 | TLS close_notify before closing | SHOULD | RFC 8314 §3.4 | Yes | On every TLS session the proxy ends: after a refusal, an outage, a timeout, LOGOUT or QUIT, and when the relay ends. Within 2 s, then the connection closes regardless. |
-| Log TLS parameters with authentication records | SHOULD | RFC 8314 §4 | No | |
+| Log TLS parameters with authentication records | SHOULD | RFC 8314 §4 | Yes | `tls` field of the `authresult` line: protocol version and cipher suite ([operations](operations.md#the-authresult-line)). |
 | Backend certificate verified against a configured name; cannot be disabled | MUST | RFC 8314 §5.3 / RFC 7817 (client role) | Yes | |
 
 ## 2. IMAP (implicit TLS)
@@ -214,7 +214,7 @@ Metric names follow the Prometheus naming guidelines: an application prefix (`ma
 | `mail_auth_proxy_auth_attempts_total{proto,scope,mechanism,result}` | counter |
 | `mail_auth_proxy_auth_refusals_total{proto,reason}` | counter |
 | `mail_auth_proxy_preauth_aborts_total{proto,scope}` | counter |
-| `mail_auth_proxy_token_validate_total{result}` | counter |
+| `mail_auth_proxy_token_validations_total{result}` | counter |
 | `mail_auth_proxy_connections_total{proto}` | counter |
 | `mail_auth_proxy_listener_connections_total{listener}` | counter |
 | `mail_auth_proxy_listener_auth_attempts_total{listener,result}` | counter |
@@ -227,7 +227,7 @@ Metric names follow the Prometheus naming guidelines: an application prefix (`ma
 | `mail_auth_proxy_ratelimit_active_blocks` | gauge |
 | `mail_auth_proxy_ratelimit_evictions_total` | counter |
 | `mail_auth_proxy_active_connections{proto}` | gauge |
-| `mail_auth_proxy_upstream_forward_total{proto}` | counter |
+| `mail_auth_proxy_upstream_forwards_total{proto}` | counter |
 | `mail_auth_proxy_route_misses_total{proto}` | counter |
 | `mail_auth_proxy_backend_up{backend,address}` | gauge |
 | `mail_auth_proxy_backend_address_errors_total{backend,address,stage}` | counter |
