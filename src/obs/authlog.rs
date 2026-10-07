@@ -96,17 +96,31 @@ pub fn sanitize(s: &str) -> String {
 /// session negotiated, e.g. `TLSv1.3/TLS13_AES_256_GCM_SHA384`. Empty while no
 /// handshake has completed.
 pub fn tls_params(conn: &rustls::CommonState) -> String {
-    let version = match conn.protocol_version() {
-        Some(rustls::ProtocolVersion::TLSv1_3) => "TLSv1.3".to_string(),
-        Some(rustls::ProtocolVersion::TLSv1_2) => "TLSv1.2".to_string(),
-        Some(other) => format!("{other:?}"),
-        None => return String::new(),
+    let Some(version) = conn.protocol_version() else {
+        return String::new();
     };
     let suite = conn
         .negotiated_cipher_suite()
-        .map(|s| format!("{:?}", s.suite()))
+        .map(|s| suite_name(s.suite()))
         .unwrap_or_default();
-    tls_field(&format!("{version}/{suite}"))
+    tls_field(&format!("{}/{suite}", version_name(version)))
+}
+
+/// `TLSv1.3`, `TLSv1.2`; another version as its code point, e.g. `0x0302`.
+fn version_name(version: rustls::ProtocolVersion) -> String {
+    match version {
+        rustls::ProtocolVersion::TLSv1_3 => "TLSv1.3".to_string(),
+        rustls::ProtocolVersion::TLSv1_2 => "TLSv1.2".to_string(),
+        other => format!("0x{:04x}", u16::from(other)),
+    }
+}
+
+/// The name rustls gives the suite (`as_str`, part of its API, unlike the
+/// `Debug` output); a suite without a name as its code point, e.g. `0x1301`.
+fn suite_name(suite: rustls::CipherSuite) -> String {
+    suite
+        .as_str()
+        .map_or_else(|| format!("0x{:04x}", u16::from(suite)), str::to_string)
 }
 
 /// Keep only the characters of a version and suite name (`/` separates
@@ -346,6 +360,33 @@ mod tests {
         );
         assert_eq!(tls_field("Unknown(0x1301)\" x"), "Unknown?0x1301???x");
         assert_eq!(tls_field(&"x".repeat(200)).len(), 64);
+    }
+
+    /// Names come from the rustls name API; a code point without a name is
+    /// written as hex, never as `Debug` output such as `CipherSuite(0x1234)`.
+    #[test]
+    fn tls_names_are_stable() {
+        assert_eq!(
+            suite_name(rustls::CipherSuite::from(0x1302u16)),
+            "TLS13_AES_256_GCM_SHA384"
+        );
+        assert_eq!(
+            suite_name(rustls::CipherSuite::from(0xc02fu16)),
+            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
+        );
+        assert_eq!(suite_name(rustls::CipherSuite::from(0x1234u16)), "0x1234");
+        assert_eq!(
+            version_name(rustls::ProtocolVersion::from(0x0304u16)),
+            "TLSv1.3"
+        );
+        assert_eq!(
+            version_name(rustls::ProtocolVersion::from(0x0303u16)),
+            "TLSv1.2"
+        );
+        assert_eq!(
+            version_name(rustls::ProtocolVersion::from(0x0302u16)),
+            "0x0302"
+        );
     }
 
     #[test]

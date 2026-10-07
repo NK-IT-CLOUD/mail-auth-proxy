@@ -147,7 +147,7 @@ sequenceDiagram
                 end
             end
         end
-        Note over P: authresult line: result proto scope mech user peer reason pwfp rule listener backend
+        Note over P: authresult line: result proto scope mech user peer reason pwfp rule listener backend tls
     end
     Note over C,P: the connection closes after the last refused attempt
 ```
@@ -298,7 +298,7 @@ sequenceDiagram
                 end
             end
         end
-        Note over P: authresult line: result proto scope mech user peer reason pwfp rule listener backend
+        Note over P: authresult line: result proto scope mech user peer reason pwfp rule listener backend tls
     end
     Note over C,P: the reply to the last refused attempt is followed by 421 and the close
 ```
@@ -441,7 +441,7 @@ sequenceDiagram
                 end
             end
         end
-        Note over P: authresult line: result proto scope mech user peer reason pwfp rule listener backend
+        Note over P: authresult line: result proto scope mech user peer reason pwfp rule listener backend tls
     end
     Note over C,P: the connection closes after the last refused attempt
 ```
