@@ -28,6 +28,11 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - ManageSieve: PLAIN on a connection that does not offer it gets
   `NO (AUTH-TOO-WEAK) "…"` (RFC 5804 §1.3). Refusals by the legacy gate are unchanged.
 
+### Fixed
+- A transport error on a TLS connection, such as a reset by the client or the backend, is
+  an error again instead of a clean end of stream: the lockfile pins `tokio-rustls` 0.26.6.
+  0.26.5, in the lockfile since 0.4.0, reported such errors as end of file.
+
 ## [0.5.1] - 2026-10-02
 
 ### Fixed
