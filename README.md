@@ -8,6 +8,7 @@
 [![Release](https://img.shields.io/github/v/release/NK-IT-CLOUD/mail-auth-proxy)](https://github.com/NK-IT-CLOUD/mail-auth-proxy/releases)
 [![MSRV](https://img.shields.io/badge/rust-1.88%2B-blue)](CONTRIBUTING.md#building-and-testing)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2FNK-IT-CLOUD%2Fmail-auth-proxy.svg?type=shield)](https://app.fossa.com/projects/git%2Bgithub.com%2FNK-IT-CLOUD%2Fmail-auth-proxy?ref=badge_shield)
 
 [Install](INSTALL.md) ·
 [Configuration](docs/configuration.md) ·
