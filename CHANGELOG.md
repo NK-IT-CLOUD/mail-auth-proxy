@@ -6,7 +6,7 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.6.0] - 2026-10-04
+## [0.6.0] - 2026-10-14
 
 ### Added
 - `authresult` line: new last field `tls="<version>/<suite>"`, the protocol version and
