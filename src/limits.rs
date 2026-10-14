@@ -54,11 +54,19 @@ struct Counts {
 impl Counts {
     /// Take one of `max` slots of `counter` (`preauth_total` or `total`).
     fn hold(self: &Arc<Self>, preauth: bool, max: usize) -> Option<Held> {
-        self.counter(preauth)
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < max).then_some(n + 1)
-            })
-            .ok()?;
+        // The loop `fetch_update` runs: it is deprecated from Rust 1.99 and
+        // `try_update` is stable only from 1.95, above the MSRV.
+        let counter = self.counter(preauth);
+        let mut n = counter.load(Ordering::Acquire);
+        loop {
+            if n >= max {
+                return None;
+            }
+            match counter.compare_exchange_weak(n, n + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(current) => n = current,
+            }
+        }
         Some(Held {
             counts: self.clone(),
             preauth,
@@ -291,6 +299,30 @@ mod tests {
         assert!(wider.admit(ip("192.0.2.2")).is_some());
         drop(a);
         assert_eq!(old.counts.total.load(Ordering::Relaxed), 2, "c and d");
+    }
+
+    /// Threads racing for the slots never take more than the limit.
+    #[test]
+    fn slot_limit_holds_under_contention() {
+        let l = Limits::new(64, 1000, 64);
+        let admitted: Vec<Vec<ConnPermit>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8u8)
+                .map(|t| {
+                    let l = &l;
+                    s.spawn(move || {
+                        (0..32u8)
+                            .filter_map(|i| l.admit(IpAddr::from([10, t, 0, i])))
+                            .collect()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let n: usize = admitted.iter().map(Vec::len).sum();
+        assert_eq!(n, 32, "pre-auth takes at most half of the 64 slots");
+        assert_eq!(l.counts.total.load(Ordering::Relaxed), 32);
+        drop(admitted);
+        assert_eq!(l.counts.total.load(Ordering::Relaxed), 0);
     }
 
     #[test]
