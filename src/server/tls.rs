@@ -43,14 +43,23 @@ struct Served {
 impl CertStore {
     /// Load every pair of `tls` (the default first). Any unusable pair fails.
     pub(crate) fn load(tls: &crate::config::Tls) -> Result<CertStore> {
+        Self::load_pairs(tls.pairs().map(|(_, cert, key)| (cert, key)))
+    }
+
+    /// A store of one certificate and key, the default (the metrics
+    /// endpoint).
+    pub(crate) fn single(cert: &str, key: &str) -> Result<CertStore> {
+        Self::load_pairs(std::iter::once((cert, key)))
+    }
+
+    fn load_pairs<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> Result<CertStore> {
         let provider = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .crypto_provider()
             .clone();
-        let entries = tls
-            .pairs()
+        let entries = pairs
             .enumerate()
-            .map(|(i, (_, cert, key))| {
+            .map(|(i, (cert, key))| {
                 let served = load_served(cert, key, i == 0, &provider)?;
                 Ok(Entry {
                     cert: cert.to_string(),
@@ -386,6 +395,11 @@ pub(crate) struct Acceptor {
 }
 
 impl Acceptor {
+    /// The certificates this acceptor serves.
+    pub(crate) fn store(&self) -> &Arc<CertStore> {
+        &self.store
+    }
+
     /// The TLS handshake on `io`. A client whose SNI names none of the
     /// certificates is refused with `unrecognized_name` before any
     /// certificate is sent (RFC 6066 §3; RFC 9325 §3.7: the server SHOULD

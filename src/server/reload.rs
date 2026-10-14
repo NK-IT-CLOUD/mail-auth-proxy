@@ -8,10 +8,12 @@
 //! with until it ends. Nothing is closed. When anything fails, the
 //! configuration in use stays as it is.
 //!
-//! Every SIGHUP also re-reads the certificate files and refreshes the JWKS:
-//! a successful reload loads the certificates anew; after a failed one each
-//! certificate of the configuration in use is re-read on its own (renewed
-//! files are served even while the configuration file is broken).
+//! Every SIGHUP also re-reads the certificate files, the metrics endpoint's
+//! certificate and bearer token, and refreshes the JWKS: a successful reload
+//! loads them anew; after a failed one each certificate and the token of the
+//! configuration in use is re-read on its own (renewed files are served even
+//! while the configuration file is broken), and one that fails keeps what it
+//! had.
 
 use super::{check, tls, Generation};
 use crate::config;
@@ -20,18 +22,22 @@ use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use tokio::sync::{watch, Notify};
 
+/// The metrics endpoint's `Access`, when the endpoint runs.
+type MetricsAccess = Option<watch::Sender<Arc<metrics::Access>>>;
+
 /// Reload on every notification of `wanted`, one at a time; notifications
 /// during a reload make one more.
 pub(super) async fn run(
     path: String,
     current: watch::Sender<Arc<Generation>>,
+    metrics_access: MetricsAccess,
     wanted: Arc<Notify>,
 ) {
     // The JWKS refresh of the last SIGHUP, if one ran; at most one at a time.
     let mut jwks_refresh: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         wanted.notified().await;
-        match reload(&path, &current).await {
+        match reload(&path, &current, &metrics_access).await {
             Ok(()) => metrics::record_config_reload(true),
             Err(e) => {
                 metrics::record_config_reload(false);
@@ -39,8 +45,11 @@ pub(super) async fn run(
                 let error = crate::obs::authlog::escape(&format!("{e:#}"));
                 tracing::error!(target: crate::obs::target::MAIN, path=%path, error=%error,
                     "reload: configuration not loaded; the one in use stays");
-                let certs = current.borrow().certs.clone();
-                reload_certificates(&certs);
+                let in_use = current.borrow().clone();
+                reload_certificates(&in_use.certs);
+                if let Some(access) = &metrics_access {
+                    reload_metrics_files(&in_use.config.metrics, access);
+                }
             }
         }
         let validator = current.borrow().shared.validator.clone();
@@ -49,7 +58,11 @@ pub(super) async fn run(
 }
 
 /// Read, check and take over the configuration at `path`.
-async fn reload(path: &str, current: &watch::Sender<Arc<Generation>>) -> Result<()> {
+async fn reload(
+    path: &str,
+    current: &watch::Sender<Arc<Generation>>,
+    metrics_access: &MetricsAccess,
+) -> Result<()> {
     let loaded = config::load(path)?;
     let (problems, warnings) = check(&loaded);
     for w in &warnings {
@@ -67,6 +80,11 @@ async fn reload(path: &str, current: &watch::Sender<Arc<Generation>>) -> Result<
         ));
     }
     let (new, fetched) = Generation::build(loaded.config, Some(&old)).await?;
+    // The endpoint (`metrics.enabled`) is the same in both (`plan`).
+    let access = match metrics_access {
+        Some(_) => Some(super::metrics_access(&new.config.metrics)?),
+        None => None,
+    };
     let replaced = old.clone();
     drop(old);
     // The metric label sets follow the configuration in use.
@@ -79,6 +97,16 @@ async fn reload(path: &str, current: &watch::Sender<Arc<Generation>>) -> Result<
     }
     for (_, cert, _) in new.config.tls.pairs() {
         tracing::info!(target: crate::obs::target::MAIN, cert=%cert, "reload: certificate loaded");
+    }
+    if let (Some(tx), Some(access)) = (metrics_access, access) {
+        let m = &new.config.metrics;
+        if let Some((cert, _)) = m.tls_pair() {
+            tracing::info!(target: crate::obs::target::MAIN, cert=%cert, "reload: metrics certificate loaded");
+        }
+        if let Some(file) = &m.bearer_token_file {
+            tracing::info!(target: crate::obs::target::MAIN, file=%file, "reload: metrics bearer token loaded");
+        }
+        tx.send_replace(Arc::new(access));
     }
     new.announce();
     new.start();
@@ -100,6 +128,40 @@ fn reload_certificates(certs: &tls::CertStore) {
             Err(e) => {
                 tracing::error!(target: crate::obs::target::MAIN, cert=%cert, error=%format!("{e:#}"), "reload: certificate unusable; keeping the current one")
             }
+        }
+    }
+}
+
+/// Re-read the metrics endpoint's certificate and token of the
+/// configuration in use (`m`), each on its own: one that fails keeps what it
+/// had.
+fn reload_metrics_files(m: &config::Metrics, access: &watch::Sender<Arc<metrics::Access>>) {
+    let in_use = access.borrow().clone();
+    if let Some(tls) = &in_use.tls {
+        for (cert, r) in tls.store().reload() {
+            match r {
+                Ok(()) => {
+                    tracing::info!(target: crate::obs::target::MAIN, cert=%cert, "reload: metrics certificate loaded")
+                }
+                Err(e) => {
+                    tracing::error!(target: crate::obs::target::MAIN, cert=%cert, error=%format!("{e:#}"), "reload: metrics certificate unusable; keeping the current one")
+                }
+            }
+        }
+    }
+    let Some(file) = &m.bearer_token_file else {
+        return;
+    };
+    match metrics::read_token(file) {
+        Ok(token) => {
+            access.send_replace(Arc::new(metrics::Access {
+                tls: in_use.tls.clone(),
+                token: Some(token),
+            }));
+            tracing::info!(target: crate::obs::target::MAIN, file=%file, "reload: metrics bearer token loaded");
+        }
+        Err(e) => {
+            tracing::error!(target: crate::obs::target::MAIN, file=%file, error=%format!("{e:#}"), "reload: metrics bearer token unusable; keeping the current one")
         }
     }
 }

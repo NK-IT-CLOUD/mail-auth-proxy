@@ -179,7 +179,11 @@ keepalive_count = 5                        # 600 + 5 x 60 s of silence
 
 [metrics]                                  # optional feature, off by default
 enabled = false
-# listen = "127.0.0.1:9102"                # required when enabled; no authentication
+# listen = "127.0.0.1:9102"                # required when enabled
+# Off loopback, serve HTTPS and require a bearer token (both files re-read on SIGHUP):
+# tls_cert = "/etc/mail-auth-proxy/metrics-fullchain.pem"
+# tls_key = "/etc/mail-auth-proxy/metrics-privkey.pem"
+# bearer_token_file = "/etc/mail-auth-proxy/metrics.token"   # >= 32 chars, e.g. openssl rand -base64 32
 
 [auth_ratelimit]                           # on by default
 enabled = true

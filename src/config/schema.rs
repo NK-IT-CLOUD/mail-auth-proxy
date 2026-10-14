@@ -909,12 +909,27 @@ pub struct Metrics {
     /// e.g. `127.0.0.1:9102`; required when enabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<String>,
+    /// PEM certificate chain and private key: the endpoint speaks HTTPS.
+    /// Both or neither; re-read on every reload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_cert: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_key: Option<String>,
+    /// File with the token every scrape must send as
+    /// `Authorization: Bearer`; re-read on every reload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer_token_file: Option<String>,
 }
 
 impl Metrics {
     /// `enabled` with its default applied.
     pub fn is_enabled(&self) -> bool {
         self.enabled.unwrap_or(self.listen.is_some())
+    }
+
+    /// The certificate and key files when both are set.
+    pub fn tls_pair(&self) -> Option<(&str, &str)> {
+        self.tls_cert.as_deref().zip(self.tls_key.as_deref())
     }
 }
 

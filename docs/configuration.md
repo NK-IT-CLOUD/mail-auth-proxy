@@ -38,7 +38,8 @@ The file is strict. Startup fails, and `--check-config` reports, when:
 - a backend sets neither `address` nor `addresses`, or both, lists more than 16
   `addresses` or one of them twice, or sets `health_check_secs` outside 1-3600;
 - a file path is set to `""`: `tls.cert`, `tls.key`, `tls.certificates[].cert`/`.key`, a backend `ca_file`, `users_file`,
-  `domains_file`, `doveadm_key_file` or `doveadm_ca_file` (`<key> is empty`;
+  `domains_file`, `doveadm_key_file`, `doveadm_ca_file`, `metrics.tls_cert`,
+  `metrics.tls_key` or `metrics.bearer_token_file` (`<key> is empty`;
   `--check-config` reports it once, without a file error on top);
 - two listeners (the metrics endpoint included, when enabled) take the same port on the
   same address, or one of them on a wildcard address that covers the other: `0.0.0.0`
@@ -50,8 +51,9 @@ The file is strict. Startup fails, and `--check-config` reports, when:
   together): it names the certificate in the metrics and the reload log;
 - a file path (`tls.cert`, `tls.key`, `tls.certificates[]`, a backend's `ca_file`,
   `doveadm_key_file` and `doveadm_ca_file`, `legacy.domains_file`,
-  `legacy.doveadm_key_file`, `legacy.doveadm_ca_file`, `legacy.rules[].users_file`) is
-  empty or not absolute: a relative path would depend on the working directory;
+  `legacy.doveadm_key_file`, `legacy.doveadm_ca_file`, `legacy.rules[].users_file`,
+  `metrics.tls_cert`, `metrics.tls_key`, `metrics.bearer_token_file`) is empty or not
+  absolute: a relative path would depend on the working directory;
 - a JWKS URL or `doveadm_url` is not `https://` (plain `http://` is allowed only for
   `localhost`, `127.0.0.1` and `::1`), or `doveadm_url` contains `user:password@`;
 - a legacy rule has no `networks`, an empty list, a duplicate or invalid name, or public
@@ -92,7 +94,12 @@ The file is strict. Startup fails, and `--check-config` reports, when:
 - `doveadm_*` keys are set without `account_check = "doveadm"`, or are missing with it;
 - `auth_ratelimit.failures`, `window_secs` or `block_secs` is 0, `window_secs` or
   `block_secs` is above 86400, `max_block_secs` is below `block_secs` or above 604800, or
-  an `exempt_networks` entry is not a CIDR.
+  an `exempt_networks` entry is not a CIDR;
+- only one of `metrics.tls_cert` and `metrics.tls_key` is set, or the enabled metrics
+  endpoint has a `bearer_token_file` and a `listen` address that is not loopback, but no
+  TLS: the token would cross the network in cleartext. With `--check-config`, at startup
+  and on reload, the files of an enabled metrics endpoint must be usable as well: the certificate and
+  key load as a pair, and the token file holds a valid token (see the keys).
 
 Startup also fails when a JWKS is unreachable or has no usable key, or a listener cannot
 bind. A reload fails the same way for the JWKS of an issuer it adds ([Reload](#reload)).
@@ -107,6 +114,9 @@ a socket at startup:
   changed), `sieve.listen`;
 - whether `[submission]` and `[sieve]` exist (a listener more or less);
 - `metrics.enabled` and, while it is on, `metrics.listen`.
+
+`metrics.tls_cert`, `metrics.tls_key` and `metrics.bearer_token_file` are reloadable: a
+reload can add, change or remove them, and every reload reads their files anew.
 
 A file that changes one of them is refused as a whole with
 `changed <key>: needs a restart`; restart the service for it. A file that does not parse,
@@ -242,7 +252,10 @@ key over (`yes`) or it needs a restart ([Reload](#reload)).
 | `timeouts.idle_secs` | integer | 30 | yes | silence on any single read; 1-3600 |
 | `timeouts.connect_secs` | integer | 10 | yes | backend connect, TLS handshake, PROXY header; 1-3600 |
 | `metrics.enabled` | bool | `false`; `true` if only `listen` is set | restart | serve the Prometheus endpoint |
-| `metrics.listen` | `ip:port` | required when enabled | restart | Prometheus endpoint, no authentication (warning if not loopback); must not clash with a mail listener |
+| `metrics.listen` | `ip:port` | required when enabled | restart | Prometheus endpoint; must not clash with a mail listener. Not on loopback: a warning without `bearer_token_file`, an error with it but without TLS |
+| `metrics.tls_cert` | path | unset | yes (re-read on every reload) | PEM certificate chain: the endpoint speaks HTTPS only, with the TLS versions and cipher suites of the mail listeners and ALPN `http/1.1`. A client that sends SNI must ask for a DNS name of the certificate. Needs `tls_key` |
+| `metrics.tls_key` | path | unset | yes (re-read on every reload) | PEM private key of `tls_cert`; needs `tls_cert` |
+| `metrics.bearer_token_file` | path | unset | yes (re-read on every reload) | file with the token every scrape must send as `Authorization: Bearer <token>`; anything else is answered `401` with `WWW-Authenticate: Bearer`. Surrounding whitespace is trimmed; the rest must be at least 32 printable ASCII characters without spaces (e.g. `openssl rand -base64 32`). Keep it readable only by the service. Without TLS only on a loopback `listen` |
 | `auth_ratelimit.enabled` | bool | `true` | yes | block sources with too many failed logins ([architecture.md](architecture.md#failed-login-rate-limit)) |
 | `auth_ratelimit.failures` | integer | 20 | yes | counted failures of one source (IPv4 address, IPv6 network of `limits.ipv6_source_prefix`, by default /64) that start a block; ≥ 1. A repeated identical credential counts once |
 | `auth_ratelimit.window_secs` | integer | 600 | yes | window in which the failures are counted, from the first one; 1-86400 |

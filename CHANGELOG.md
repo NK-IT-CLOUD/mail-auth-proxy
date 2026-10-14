@@ -6,6 +6,22 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Metrics endpoint over HTTPS with a bearer token: `metrics.tls_cert` and `metrics.tls_key`
+  serve `/metrics` over TLS only, `metrics.bearer_token_file` makes every scrape send
+  `Authorization: Bearer <token>` (otherwise `401`), so Prometheus can scrape with
+  `scheme: https` and `authorization.credentials_file`. Both files are read again on every
+  `SIGHUP`, so a renewed certificate or a rotated token takes effect with
+  `systemctl reload`. A token on an address other than loopback without TLS is a
+  configuration error; an endpoint off loopback without a token still gets the warning.
+
+### Changed
+- Metrics endpoint: idle connections no longer take the 4 scrape slots. Up to 64
+  connections wait for their request (TLS handshake and request head within 5 s instead
+  of 10 s); only a request that gets the metrics takes a scrape slot. A connection
+  accepted before a reload that changed the endpoint's TLS or token is closed without an
+  answer.
+
 ## [0.6.0] - 2026-10-14
 
 ### Added

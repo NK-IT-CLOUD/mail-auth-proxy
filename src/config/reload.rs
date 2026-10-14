@@ -18,7 +18,8 @@ pub struct Plan {
 /// Restart-only: the listener addresses (`imap.listen`, `submission.listen`,
 /// `submission.implicit_tls_listen`, `sieve.listen`), whether `[submission]`
 /// and `[sieve]` exist (a listener more or less), and the metrics endpoint (`metrics.enabled`,
-/// `metrics.listen`). Everything else is taken over by a reload.
+/// `metrics.listen`). Everything else is taken over by a reload, the metrics
+/// endpoint's TLS and bearer token files included.
 pub fn plan(old: &Config, new: &Config) -> Plan {
     let mut restart_required = Vec::new();
     if old.imap.listen != new.imap.listen {
@@ -159,6 +160,21 @@ mod tests {
         assert!(plan_for(&off, &off.replace("9102", "9103"))
             .restart_required
             .is_empty());
+        // TLS and the bearer token are files a reload reads anew, so a
+        // reload may also add, move or remove them.
+        let secured = base.replace(
+            "[metrics]\n",
+            "[metrics]\ntls_cert = \"/m.pem\"\ntls_key = \"/m.key\"\nbearer_token_file = \"/m.token\"\n",
+        );
+        for (old, new) in [
+            (&base, &secured),
+            (&secured, &base),
+            (&secured, &secured.replace("/m.", "/n.")),
+        ] {
+            let p = plan_for(old, new);
+            assert!(p.restart_required.is_empty(), "{p:?}");
+            assert_eq!(p.changed, ["metrics"]);
+        }
     }
 
     /// The backend profile keys are reloadable; the implicit-TLS submission

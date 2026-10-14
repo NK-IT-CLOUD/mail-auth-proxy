@@ -226,8 +226,10 @@ so an outage cannot turn into bans of legitimate users.
 <details>
 <summary>Prometheus metrics</summary>
 
-Off by default; enable with `enabled = true` and a `listen` address in `[metrics]`. The endpoint has no
-authentication, so keep it on loopback or a management network.
+Off by default; enable with `enabled = true` and a `listen` address in `[metrics]`. Without
+`tls_cert`/`tls_key` and `bearer_token_file` the endpoint is plain HTTP without
+authentication, so keep it on loopback or a management network; with them, Prometheus
+scrapes it over HTTPS with a bearer token.
 
 | Metric | What it counts |
 |---|---|

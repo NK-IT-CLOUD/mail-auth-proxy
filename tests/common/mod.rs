@@ -1521,6 +1521,9 @@ pub struct Opts {
     pub legacy: Option<String>,
     /// Serve `/metrics` (`[metrics] enabled`).
     pub metrics: bool,
+    /// TOML lines added to `[metrics]` (`tls_cert`, `tls_key`,
+    /// `bearer_token_file`).
+    pub metrics_extra: String,
     /// `RUST_LOG` of the proxy.
     pub rust_log: &'static str,
     /// `NOTIFY_SOCKET` of the proxy (systemd notification).
@@ -1628,6 +1631,7 @@ impl Default for Opts {
             idle_secs: 10,
             legacy: None,
             metrics: true,
+            metrics_extra: String::new(),
             rust_log: "info",
             notify_socket: None,
             smtp_xclient: true,
@@ -1884,9 +1888,15 @@ connect_secs = 3
                 .map(|s| format!("[session]\n{s}\n"))
                 .unwrap_or_default(),
             metrics = if opts.metrics {
-                format!("[metrics]\nlisten = \"{METRICS_IP}:0\"")
+                format!(
+                    "[metrics]\nlisten = \"{METRICS_IP}:0\"\n{}",
+                    opts.metrics_extra
+                )
             } else {
-                format!("[metrics]\nenabled = false\nlisten = \"{METRICS_IP}:0\"")
+                format!(
+                    "[metrics]\nenabled = false\nlisten = \"{METRICS_IP}:0\"\n{}",
+                    opts.metrics_extra
+                )
             },
             ratelimit = opts
                 .ratelimit

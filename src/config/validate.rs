@@ -325,12 +325,31 @@ impl Config {
             }
         }
         self.auth_ratelimit.check(&mut err, warnings);
-        match (&self.metrics.listen, self.metrics.is_enabled()) {
+        let metrics = &self.metrics;
+        check_path("metrics.tls_cert", metrics.tls_cert.as_deref(), &mut err);
+        check_path("metrics.tls_key", metrics.tls_key.as_deref(), &mut err);
+        check_path(
+            "metrics.bearer_token_file",
+            metrics.bearer_token_file.as_deref(),
+            &mut err,
+        );
+        if metrics.tls_cert.is_some() != metrics.tls_key.is_some() {
+            err("metrics.tls_cert and metrics.tls_key must be set together".into());
+        }
+        let tls = metrics.tls_pair().is_some();
+        let bearer = metrics.bearer_token_file.is_some();
+        match (&metrics.listen, metrics.is_enabled()) {
             (None, true) => err("metrics.listen is required when metrics.enabled = true".into()),
             (Some(m), enabled) => match m.parse::<std::net::SocketAddr>() {
-                Ok(a) if enabled && !a.ip().is_loopback() => warnings.push(format!(
-                    "metrics.listen = {m:?} is reachable from the network and has no authentication"
-                )),
+                Ok(a) if enabled && !a.ip().is_loopback() => match (tls, bearer) {
+                    (false, true) => err(format!(
+                        "metrics.bearer_token_file needs metrics.tls_cert and metrics.tls_key when metrics.listen = {m:?} is not on loopback: the token would cross the network in cleartext"
+                    )),
+                    (_, false) => warnings.push(format!(
+                        "metrics.listen = {m:?} is reachable from the network and has no authentication"
+                    )),
+                    (true, true) => {}
+                },
                 Ok(_) => {}
                 Err(_) => err(format!("metrics.listen = {m:?} must be ip:port")),
             },
@@ -1239,6 +1258,88 @@ mod tests {
         let l = with("enabled = true\nlisten = \"0.0.0.0:9102\"\n");
         assert!(l.warnings.iter().any(|w| w.contains("no authentication")));
         assert!(!with("").config.metrics.is_enabled());
+    }
+
+    /// A bearer token crosses the network only inside TLS; an endpoint
+    /// reachable from the network without a token is warned about, with or
+    /// without TLS; loopback needs neither.
+    #[test]
+    fn metrics_tls_and_bearer_token() {
+        const TLS: &str = "tls_cert = \"/m.pem\"\ntls_key = \"/m.key\"\n";
+        const BEARER: &str = "bearer_token_file = \"/m.token\"\n";
+        let with = |listen: &str, keys: &str| {
+            crate::config::parse(&format!("{V2}[metrics]\nlisten = \"{listen}\"\n{keys}")).unwrap()
+        };
+        let cleartext = "would cross the network in cleartext";
+
+        let l = with("0.0.0.0:9102", BEARER);
+        assert!(
+            l.errors.iter().any(|e| e.contains(cleartext)),
+            "{:?}",
+            l.errors
+        );
+        let l = with("[2001:db8::1]:9102", BEARER);
+        assert!(
+            l.errors.iter().any(|e| e.contains(cleartext)),
+            "{:?}",
+            l.errors
+        );
+        let l = with("0.0.0.0:9102", TLS);
+        assert!(l.errors.is_empty(), "{:?}", l.errors);
+        assert!(l.warnings.iter().any(|w| w.contains("no authentication")));
+        let l = with("0.0.0.0:9102", &format!("{TLS}{BEARER}"));
+        assert!(
+            l.errors.is_empty() && l.warnings.is_empty(),
+            "{:?} {:?}",
+            l.errors,
+            l.warnings
+        );
+        assert_eq!(l.config.metrics.tls_pair(), Some(("/m.pem", "/m.key")));
+        for (listen, keys) in [
+            ("127.0.0.1:9102", BEARER),
+            ("[::1]:9102", BEARER),
+            ("127.0.0.1:9102", TLS),
+        ] {
+            let l = with(listen, keys);
+            assert!(
+                l.errors.is_empty() && l.warnings.is_empty(),
+                "{listen} {keys}: {:?} {:?}",
+                l.errors,
+                l.warnings
+            );
+        }
+        // A disabled endpoint is not judged by its address.
+        let l = with("0.0.0.0:9102", &format!("enabled = false\n{BEARER}"));
+        assert!(
+            l.errors.is_empty() && l.warnings.is_empty(),
+            "{:?} {:?}",
+            l.errors,
+            l.warnings
+        );
+
+        // Certificate and key go together; every path is absolute.
+        let e = errors_with("[metrics]\nlisten = \"127.0.0.1:9102\"\ntls_cert = \"/m.pem\"\n");
+        assert!(e.contains("metrics.tls_cert and metrics.tls_key"), "{e}");
+        let e = errors_with("[metrics]\nlisten = \"127.0.0.1:9102\"\ntls_key = \"/m.key\"\n");
+        assert!(e.contains("metrics.tls_cert and metrics.tls_key"), "{e}");
+        let e = errors_with(&format!(
+            "[metrics]\nlisten = \"127.0.0.1:9102\"\n{}",
+            "tls_cert = \"m.pem\"\ntls_key = \"\"\nbearer_token_file = \"m.token\"\n"
+        ));
+        assert!(
+            e.contains("metrics.tls_cert = \"m.pem\" must be an absolute path"),
+            "{e}"
+        );
+        assert!(e.contains("metrics.tls_key is empty"), "{e}");
+        assert!(
+            e.contains("metrics.bearer_token_file = \"m.token\" must be an absolute path"),
+            "{e}"
+        );
+        // A key no format 2 file had stays unknown elsewhere.
+        assert!(
+            errors_with("[metrics]\nlisten = \"127.0.0.1:9102\"\ntoken = \"x\"\n")
+                .starts_with("parse:")
+        );
     }
 
     /// Public networks without a user restriction need `public = true`;

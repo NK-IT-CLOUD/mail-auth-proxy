@@ -197,7 +197,9 @@ relays the session (IMAP and ManageSieve through a command guard, invariant 4). 
   audience, issuer and identity opens that mailbox.
 - **`token_type = "any"`** also accepts ID tokens that carry an accepted audience; use it
   only for IdPs that mark access tokens neither way.
-- **Metrics** have no authentication; bind them to loopback or a management network.
+- **Metrics** have no authentication unless `metrics.bearer_token_file` is set, and are
+  plain HTTP unless `metrics.tls_cert` is set. Bind them to loopback or a management
+  network, or set both (a token without TLS is refused on any address but loopback).
 - **Shared source addresses.** The failed-login rate limit counts per address (IPv6 per
   network of `limits.ipv6_source_prefix`, by default /64). Everyone behind one NAT,
   webmail server or IPv6 network shares that count, so one guesser there can block the

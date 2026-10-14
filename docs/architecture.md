@@ -343,7 +343,8 @@ To keep observing attacks on a legacy rule open to public networks, as a honeypo
 | `oauth.refresh_secs` | 300 s | periodic JWKS refresh of all URLs |
 | `sieve.capability_cache_secs` | 600 s | backend post-TLS capabilities |
 | `submission.capability_cache_secs` | 600 s | backend post-TLS EHLO extensions |
-| metrics scrape (fixed) | 10 s, 4 at a time | the whole request head, and the response, each; a fifth connection is closed at accept |
+| metrics request (fixed) | 5 s, 64 at a time | the TLS handshake (`metrics.tls_cert`) and the whole request head together, then any answer other than the metrics; a 65th connection is closed at accept |
+| metrics scrape (fixed) | 10 s, 4 at a time | the metrics response, for a request that passed the token check; with all 4 busy it is closed unanswered |
 | backend auth reply (fixed) | at most 32 lines | IMAP `P1` reply; each line within the idle timeout |
 | `session.keepalive_idle_secs`, `_interval_secs`, `_count` | 600 s, 60 s, 5 | TCP keepalive of every client and backend connection, from accept or connect ([after authentication](#after-authentication)) |
 | `session.idle_limit_secs` | off | after login: no byte in either direction |

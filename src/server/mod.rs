@@ -637,19 +637,39 @@ pub fn file_problems(cfg: &config::Config) -> Vec<String> {
     let mut out = Vec::new();
     // Each file on its own first, so a missing cert does not hide a missing
     // key; then each pair on its own, so one bad pair does not hide another.
-    for (i, (at, cert, key)) in cfg.tls.pairs().enumerate() {
+    let mut pair = |at: &str, [(cert_key, cert), (key_key, key)]: [(String, &str); 2], default| {
         let mut readable = true;
-        for (name, path) in [("cert", cert), ("key", key)] {
+        for (name, path) in [(cert_key, cert), (key_key, key)] {
             if path.is_empty() {
                 readable = false;
             } else if let Err(e) = std::fs::metadata(path).and_then(|_| std::fs::File::open(path)) {
-                out.push(format!("{at}.{name}: {path}: {e}"));
+                out.push(format!("{name}: {path}: {e}"));
                 readable = false;
             }
         }
         if readable {
-            if let Err(e) = tls::check_pair(cert, key, i == 0) {
+            if let Err(e) = tls::check_pair(cert, key, default) {
                 out.push(format!("{at}: {e:#}"));
+            }
+        }
+    };
+    for (i, (at, cert, key)) in cfg.tls.pairs().enumerate() {
+        let names = [(format!("{at}.cert"), cert), (format!("{at}.key"), key)];
+        pair(&at, names, i == 0);
+    }
+    // The metrics endpoint's files, when it runs.
+    let m = &cfg.metrics;
+    if m.is_enabled() {
+        if let Some((cert, key)) = m.tls_pair() {
+            let names = [
+                ("metrics.tls_cert".to_string(), cert),
+                ("metrics.tls_key".to_string(), key),
+            ];
+            pair("metrics", names, true);
+        }
+        if let Some(f) = m.bearer_token_file.as_deref().filter(|p| !p.is_empty()) {
+            if let Err(e) = metrics::read_token(f) {
+                out.push(format!("metrics.bearer_token_file: {f}: {e:#}"));
             }
         }
     }
@@ -738,6 +758,25 @@ fn tls_warnings(cfg: &config::Config, store: &tls::CertStore) -> Vec<String> {
     out
 }
 
+/// The metrics endpoint's TLS and bearer token as `m` names them, the files
+/// read now.
+fn metrics_access(m: &config::Metrics) -> Result<metrics::Access> {
+    let tls = match m.tls_pair() {
+        Some((cert, key)) => {
+            let store = Arc::new(tls::CertStore::single(cert, key)?);
+            Some(tls::acceptor(&store, Some(b"http/1.1")))
+        }
+        None => None,
+    };
+    let token = match m.bearer_token_file.as_deref() {
+        Some(f) => Some(
+            metrics::read_token(f).with_context(|| format!("metrics.bearer_token_file: {f}"))?,
+        ),
+        None => None,
+    };
+    Ok(metrics::Access { tls, token })
+}
+
 /// How long a shutdown waits for open sessions to end before it closes them.
 const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -783,12 +822,16 @@ pub async fn run(path: String, cfg: config::Config) -> Result<()> {
 
     // Optional Prometheus /metrics endpoint. Runs in its own task and owns its
     // errors — a bind failure here must never take down the mail listeners.
+    // Its TLS and token are read now (`check` has seen them) and on reload.
     let m = &generation.config.metrics;
-    if let Some(addr) = m.listen.clone().filter(|_| m.is_enabled()) {
-        tokio::spawn(async move {
-            metrics::serve(addr).await;
-        });
-    }
+    let metrics_access = match m.listen.clone().filter(|_| m.is_enabled()) {
+        Some(addr) => {
+            let (access, rx) = tokio::sync::watch::channel(Arc::new(metrics_access(m)?));
+            tokio::spawn(metrics::serve(addr, rx));
+            Some(access)
+        }
+        None => None,
+    };
 
     // The generation in use: each accept takes it, a reload replaces it.
     let (current, _) = tokio::sync::watch::channel(generation.clone());
@@ -874,7 +917,7 @@ pub async fn run(path: String, cfg: config::Config) -> Result<()> {
 
     // SIGHUPs that arrive during a reload are folded into one more reload.
     let wanted = Arc::new(tokio::sync::Notify::new());
-    tokio::spawn(reload::run(path, current, wanted.clone()));
+    tokio::spawn(reload::run(path, current, metrics_access, wanted.clone()));
     loop {
         tokio::select! {
             _ = hangup.recv() => wanted.notify_one(),

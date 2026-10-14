@@ -7,13 +7,16 @@
 //!   operations; nothing here can fail an auth or drop a connection.
 //! - The endpoint runs in its own task; a bind failure is logged and the mail
 //!   listeners keep serving (see `serve`).
+//! - Optional TLS (the listeners' certificate handling, `server::tls`) and a
+//!   bearer token, both in an `Access` that a reload replaces.
 
 use super::authlog::Reason;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 
 #[derive(Clone, Copy)]
 pub enum Proto {
@@ -915,11 +918,51 @@ pub fn render_for_tests() -> String {
     render()
 }
 
-/// Serve `/metrics` over a minimal HTTP/1.1 responder on `addr`.
+/// The bearer token every scrape must present. Never printed or logged.
+pub struct Token(zeroize::Zeroizing<Vec<u8>>);
+
+impl std::fmt::Debug for Token {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Token(..)")
+    }
+}
+
+/// Shortest token accepted: 32 bytes, a random 192-bit value in base64.
+const MIN_TOKEN_LEN: usize = 32;
+
+/// Read the token file at `path`: its content without surrounding
+/// whitespace (a trailing newline), at least `MIN_TOKEN_LEN` printable
+/// ASCII characters without spaces, as an HTTP client sends it. The error
+/// does not contain the file's content.
+pub fn read_token(path: &str) -> anyhow::Result<Token> {
+    let raw = zeroize::Zeroizing::new(std::fs::read(path)?);
+    let token = raw.trim_ascii();
+    if token.is_empty() {
+        anyhow::bail!("the token is empty");
+    }
+    if !token.iter().all(|b| b.is_ascii_graphic()) {
+        anyhow::bail!("the token must be printable ASCII without spaces");
+    }
+    if token.len() < MIN_TOKEN_LEN {
+        anyhow::bail!("the token must be at least {MIN_TOKEN_LEN} bytes long");
+    }
+    Ok(Token(zeroize::Zeroizing::new(token.to_vec())))
+}
+
+/// How the endpoint is reached: over TLS or plain HTTP, with a bearer token
+/// or without. Each connection takes the one in use when it is accepted; a
+/// reload replaces it.
+pub struct Access {
+    pub(crate) tls: Option<crate::server::tls::Acceptor>,
+    pub(crate) token: Option<Token>,
+}
+
+/// Serve `/metrics` over a minimal HTTP/1.1 responder on `addr`, over TLS
+/// and with a bearer token as the `Access` in `access` says.
 ///
 /// This owns all of its errors: a bind failure is logged and the task returns,
 /// leaving the mail listeners untouched. Per-connection errors are ignored.
-pub async fn serve(addr: String) {
+pub async fn serve(addr: String, access: watch::Receiver<Arc<Access>>) {
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
         Err(e) => {
@@ -927,36 +970,53 @@ pub async fn serve(addr: String) {
             return;
         }
     };
-    tracing::info!(target: crate::obs::target::METRICS, %addr, "metrics endpoint up");
-    serve_on(listener).await;
+    {
+        let a = access.borrow();
+        tracing::info!(target: crate::obs::target::METRICS, %addr, tls = a.tls.is_some(), bearer_token = a.token.is_some(), "metrics endpoint up");
+    }
+    serve_on(listener, access).await;
 }
 
-/// Scrapes served at the same time. Prometheus scrapes a target one request
-/// at a time, so this covers a redundant pair and a manual check; more
-/// connections are closed at accept, unanswered and unlogged, so neither a
-/// connection flood nor a scanner grows tasks, memory or the journal.
+/// Connections admitted at a time until their request is judged: the TLS
+/// handshake, the request head, and any answer other than the metrics (401,
+/// 404, …). More connections are closed at accept, unanswered and unlogged,
+/// so neither a connection flood nor a scanner grows tasks, memory or the
+/// journal. Larger than `MAX_SCRAPES` and with a shorter deadline, so idle or
+/// unauthenticated connections do not keep a scrape out unless they hold
+/// every one of these slots all the time.
+const MAX_PENDING: usize = 64;
+
+/// Metrics responses at a time, only for requests that passed the token
+/// check (every `GET /metrics` without a token). Prometheus scrapes a
+/// target one request at a time, so this covers a redundant pair and a
+/// manual check; a request beyond it is closed unanswered.
 const MAX_SCRAPES: usize = 4;
 
 /// Largest request head read; a longer one is answered 431.
 const MAX_REQUEST_HEAD: usize = 4096;
 
-/// Deadline for the whole request head, and separately for the response. A
-/// client that sends its request a byte at a time (or never drains the
-/// response) loses its connection after this, whatever it does meanwhile.
-const SCRAPE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Deadline for the TLS handshake and the whole request head together, and
+/// separately for writing an answer other than the metrics. A client that
+/// sends its request a byte at a time loses its connection after this,
+/// whatever it does meanwhile.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-async fn serve_on(listener: TcpListener) {
-    let slots = Arc::new(Semaphore::new(MAX_SCRAPES));
+/// Deadline for writing the metrics, for a client that never drains them.
+const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn serve_on(listener: TcpListener, access: watch::Receiver<Arc<Access>>) {
+    let pending = Arc::new(Semaphore::new(MAX_PENDING));
+    let scrapes = Arc::new(Semaphore::new(MAX_SCRAPES));
     loop {
         match listener.accept().await {
             Ok((sock, _)) => {
-                let Ok(slot) = slots.clone().try_acquire_owned() else {
+                let Ok(slot) = pending.clone().try_acquire_owned() else {
                     drop(sock);
                     continue;
                 };
+                let (access, scrapes) = (access.clone(), scrapes.clone());
                 tokio::spawn(async move {
-                    let _slot = slot;
-                    let _ = handle_scrape(sock).await;
+                    let _ = handle_scrape(sock, access, slot, &scrapes).await;
                 });
             }
             Err(e) => {
@@ -974,34 +1034,106 @@ fn timed_out(what: &str) -> std::io::Error {
     )
 }
 
-async fn handle_scrape(mut sock: TcpStream) -> std::io::Result<()> {
-    let mut head = Vec::with_capacity(512);
-    let complete = match tokio::time::timeout(SCRAPE_TIMEOUT, read_head(&mut sock, &mut head)).await
-    {
-        Ok(r) => r?,
-        Err(_) => return Err(timed_out("read")),
+/// One scrape on `sock` under the settings `current` holds at accept: the
+/// TLS handshake if they have TLS, then one request and its response. A
+/// failed handshake ends the connection unanswered. `pending` is the
+/// connection's admission slot.
+async fn handle_scrape(
+    sock: TcpStream,
+    current: watch::Receiver<Arc<Access>>,
+    pending: OwnedSemaphorePermit,
+    scrapes: &Semaphore,
+) -> std::io::Result<()> {
+    let access = current.borrow().clone();
+    let until = Instant::now() + REQUEST_TIMEOUT;
+    let conn = Conn {
+        access: &access,
+        current: &current,
+        pending,
+        scrapes,
     };
-    let resp = if complete {
-        respond(&head)
-    } else {
-        reply(
-            "431 Request Header Fields Too Large",
-            "",
-            "request head too large\n",
-        )
-    };
-    match tokio::time::timeout(SCRAPE_TIMEOUT, sock.write_all(resp.as_bytes())).await {
-        Ok(r) => r?,
-        Err(_) => return Err(timed_out("write")),
+    match &access.tls {
+        None => conn.scrape(sock, until).await,
+        Some(tls) => {
+            let sock = match tokio::time::timeout_at(until, tls.accept(sock)).await {
+                Ok(r) => r?,
+                Err(_) => return Err(timed_out("handshake")),
+            };
+            conn.scrape(sock, until).await
+        }
     }
-    let _ = sock.shutdown().await;
-    Ok(())
+}
+
+/// A connection after accept: the settings it was accepted with, the ones
+/// in use now, and its slots.
+struct Conn<'a> {
+    access: &'a Arc<Access>,
+    current: &'a watch::Receiver<Arc<Access>>,
+    pending: OwnedSemaphorePermit,
+    scrapes: &'a Semaphore,
+}
+
+impl Conn<'_> {
+    /// Read the request head by `until` and answer it. Only a request that
+    /// passed the token check takes a scrape slot, and gives its admission
+    /// slot back for it.
+    async fn scrape<S>(self, mut sock: S, until: Instant) -> std::io::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut head = Vec::with_capacity(512);
+        let complete = match tokio::time::timeout_at(until, read_head(&mut sock, &mut head)).await {
+            Ok(r) => r?,
+            Err(_) => return Err(timed_out("read")),
+        };
+        // A reload since the accept replaced the TLS mode or the token this
+        // connection was judged by: it gets no answer at all.
+        if !Arc::ptr_eq(self.access, &self.current.borrow()) {
+            return Err(std::io::Error::other(
+                "metrics settings replaced by a reload",
+            ));
+        }
+        let pending = self.pending;
+        let (resp, deadline, _slot) =
+            match complete.then(|| judge(&head, self.access.token.as_ref())) {
+                None => (
+                    reply(
+                        "431 Request Header Fields Too Large",
+                        "",
+                        "request head too large\n",
+                    ),
+                    REQUEST_TIMEOUT,
+                    None,
+                ),
+                Some(Err(answer)) => (answer, REQUEST_TIMEOUT, None),
+                Some(Ok(())) => {
+                    let Ok(slot) = self.scrapes.try_acquire() else {
+                        return Err(std::io::Error::other("metrics scrape slots busy"));
+                    };
+                    drop(pending);
+                    (exposition(), RESPONSE_TIMEOUT, Some(slot))
+                }
+            };
+        let write = async {
+            sock.write_all(resp.as_bytes()).await?;
+            // Over TLS this sends close_notify, which needs the deadline too.
+            let _ = sock.shutdown().await;
+            Ok(())
+        };
+        match tokio::time::timeout(deadline, write).await {
+            Ok(r) => r,
+            Err(_) => Err(timed_out("write")),
+        }
+    }
 }
 
 /// Read the request head into `head`, up to the empty line that ends it.
 /// `false` when it grows past `MAX_REQUEST_HEAD` first; an EOF before the
 /// end is an error (nothing is answered).
-async fn read_head(sock: &mut TcpStream, head: &mut Vec<u8>) -> std::io::Result<bool> {
+async fn read_head<S: AsyncRead + Unpin>(
+    sock: &mut S,
+    head: &mut Vec<u8>,
+) -> std::io::Result<bool> {
     let mut buf = [0u8; 1024];
     loop {
         let n = sock.read(&mut buf).await?;
@@ -1019,32 +1151,52 @@ async fn read_head(sock: &mut TcpStream, head: &mut Vec<u8>) -> std::io::Result<
     }
 }
 
-/// The response to a complete request head: the exposition text for
-/// `GET /metrics` (with or without a query), 404 for any other path, 405 for
-/// another method on `/metrics`, 400 for a request line that is not HTTP/1.x.
-fn respond(head: &[u8]) -> String {
+/// The response to a complete request head (`judge`, else the metrics).
+#[cfg(test)]
+fn respond(head: &[u8], token: Option<&Token>) -> String {
+    judge(head, token).err().unwrap_or_else(exposition)
+}
+
+/// Judge a complete request head: `Ok` for a request that gets the
+/// exposition text (`GET /metrics`, with or without a query), else the
+/// answer: 400 for a request line that is not HTTP/1.x; with a `token`, 401
+/// for a request without it (`authorized`), whatever its path; 404 for any
+/// other path, 405 for another method on `/metrics`.
+fn judge(head: &[u8], token: Option<&Token>) -> Result<(), String> {
     let line = head.split(|&b| b == b'\n').next().unwrap_or_default();
     let line = line.strip_suffix(b"\r").unwrap_or(line);
     let mut parts = line.split(|&b| b == b' ');
     let (Some(method), Some(target), Some(version), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
     else {
-        return reply("400 Bad Request", "", "bad request\n");
+        return Err(reply("400 Bad Request", "", "bad request\n"));
     };
     if version != b"HTTP/1.1" && version != b"HTTP/1.0" {
-        return reply("400 Bad Request", "", "bad request\n");
+        return Err(reply("400 Bad Request", "", "bad request\n"));
+    }
+    if token.is_some_and(|t| !authorized(head, t)) {
+        return Err(reply(
+            "401 Unauthorized",
+            "WWW-Authenticate: Bearer\r\n",
+            "unauthorized\n",
+        ));
     }
     let path = target.split(|&b| b == b'?').next().unwrap_or_default();
     if path != b"/metrics" {
-        return reply("404 Not Found", "", "not found\n");
+        return Err(reply("404 Not Found", "", "not found\n"));
     }
     if method != b"GET" {
-        return reply(
+        return Err(reply(
             "405 Method Not Allowed",
             "Allow: GET\r\n",
             "method not allowed\n",
-        );
+        ));
     }
+    Ok(())
+}
+
+/// The 200 response with the exposition text.
+fn exposition() -> String {
     let body = render();
     format!(
         "HTTP/1.1 200 OK\r\n\
@@ -1053,6 +1205,51 @@ fn respond(head: &[u8]) -> String {
          Connection: close\r\n\r\n{body}",
         body.len()
     )
+}
+
+/// Whether the request head has exactly one `Authorization` header, and it
+/// carries `token` with the scheme `Bearer` (RFC 6750 §2.1; the scheme in any
+/// case, RFC 9110 §11.1). Only the header lines count: what follows the
+/// empty line that ends them (read in the same chunk) is not looked at.
+fn authorized(head: &[u8], token: &Token) -> bool {
+    let mut credentials = None;
+    for line in head.split(|&b| b == b'\n').skip(1) {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line
+            .iter()
+            .position(|&b| b == b':')
+            .map(|i| (&line[..i], &line[i + 1..]))
+        else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case(b"authorization") {
+            if credentials.is_some() {
+                return false;
+            }
+            credentials = Some(value.trim_ascii());
+        }
+    }
+    let Some((scheme, presented)) = credentials.and_then(|c| {
+        c.iter()
+            .position(|&b| b == b' ')
+            .map(|i| (&c[..i], c[i..].trim_ascii_start()))
+    }) else {
+        return false;
+    };
+    scheme.eq_ignore_ascii_case(b"bearer") && ct_eq(presented, &token.0)
+}
+
+/// `a == b` in a time that depends on the lengths only, not on where they
+/// differ. The length of the token is not secret.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let diff = a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y));
+    std::hint::black_box(diff) == 0
 }
 
 /// A plain-text error response; `extra` is further header lines.
@@ -1087,7 +1284,7 @@ mod tests {
 
     #[test]
     fn routes_only_get_metrics() {
-        let ok = respond(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
+        let ok = respond(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n", None);
         let (s, h, body) = parse_response(&ok);
         assert_eq!(s, "HTTP/1.1 200 OK");
         assert!(h.contains(&"Content-Type: text/plain; version=0.0.4; charset=utf-8"));
@@ -1098,7 +1295,7 @@ mod tests {
             b"GET /metrics HTTP/1.0\r\n\r\n",
             b"GET /metrics HTTP/1.1\n\n",
         ] {
-            assert_eq!(parse_response(&respond(req)).0, "HTTP/1.1 200 OK");
+            assert_eq!(parse_response(&respond(req, None)).0, "HTTP/1.1 200 OK");
         }
 
         let cases: [(&[u8], &str); 9] = [
@@ -1128,7 +1325,7 @@ mod tests {
             ),
         ];
         for (req, want) in cases {
-            let resp = respond(req);
+            let resp = respond(req, None);
             let (status, headers, body) = parse_response(&resp);
             assert_eq!(status, want, "{}", String::from_utf8_lossy(req));
             // Error bodies are fixed texts: nothing of the request or the
@@ -1140,6 +1337,239 @@ mod tests {
                 "{resp}"
             );
         }
+    }
+
+    const TOKEN: &str = "0123456789abcdef0123456789ABCDEF-_.~+/=";
+
+    fn token() -> Token {
+        Token(zeroize::Zeroizing::new(TOKEN.as_bytes().to_vec()))
+    }
+
+    /// With a token, a request is answered only with `Authorization: Bearer
+    /// <token>` (the scheme in any case, RFC 9110 §11.1); anything else is
+    /// 401 with `WWW-Authenticate: Bearer` and a fixed body, whatever the
+    /// path. A request line that does not parse stays 400.
+    #[test]
+    fn bearer_token_is_required() {
+        let t = token();
+        let req = |auth: &str| format!("GET /metrics HTTP/1.1\r\nHost: x\r\n{auth}\r\n");
+        for ok in [
+            format!("Authorization: Bearer {TOKEN}\r\n"),
+            format!("authorization: bearer {TOKEN}\r\n"),
+            format!("AUTHORIZATION:BEARER   {TOKEN}  \r\n"),
+            format!("Authorization: Bearer {TOKEN}\n"),
+        ] {
+            let resp = respond(req(&ok).as_bytes(), Some(&t));
+            assert_eq!(parse_response(&resp).0, "HTTP/1.1 200 OK", "{ok}");
+        }
+        let wrong_last = format!("{}X", &TOKEN[..TOKEN.len() - 1]);
+        let wrong_first = format!("X{}", &TOKEN[1..]);
+        for bad in [
+            String::new(),
+            "Authorization: Bearer\r\n".into(),
+            "Authorization: Bearer \r\n".into(),
+            format!("Authorization: Bearer {wrong_last}\r\n"),
+            format!("Authorization: Bearer {wrong_first}\r\n"),
+            format!("Authorization: Bearer {}\r\n", &TOKEN[..TOKEN.len() - 1]),
+            format!("Authorization: Bearer {TOKEN}x\r\n"),
+            format!("Authorization: Bearer {TOKEN} x\r\n"),
+            format!("Authorization: Basic {TOKEN}\r\n"),
+            format!("Authorization: Bearer{TOKEN}\r\n"),
+            format!("Authorization: {TOKEN}\r\n"),
+            format!("Authorization : Bearer {TOKEN}\r\n"),
+            format!("X-Authorization: Bearer {TOKEN}\r\n"),
+            format!("Proxy-Authorization: Bearer {TOKEN}\r\n"),
+            // Two headers are ambiguous, even if one carries the token.
+            format!("Authorization: Bearer {TOKEN}\r\nAuthorization: Bearer x\r\n"),
+            format!("Authorization: Bearer x\r\nAuthorization: Bearer {TOKEN}\r\n"),
+        ] {
+            let resp = respond(req(&bad).as_bytes(), Some(&t));
+            let (status, headers, body) = parse_response(&resp);
+            assert_eq!(status, "HTTP/1.1 401 Unauthorized", "{bad}");
+            assert!(headers.contains(&"WWW-Authenticate: Bearer"), "{resp}");
+            assert_eq!(body, "unauthorized\n");
+        }
+        // Nor is a header line after the end of the head.
+        let resp = respond(
+            format!("GET /metrics HTTP/1.1\r\n\r\nAuthorization: Bearer {TOKEN}\r\n\r\n")
+                .as_bytes(),
+            Some(&t),
+        );
+        assert_eq!(parse_response(&resp).0, "HTTP/1.1 401 Unauthorized");
+        let resp = respond(
+            format!("GET /metrics HTTP/1.1\r\nAuthorization: Bearer {TOKEN}\r\n\r\nAuthorization: Bearer x\r\n\r\n")
+                .as_bytes(),
+            Some(&t),
+        );
+        assert_eq!(parse_response(&resp).0, "HTTP/1.1 200 OK");
+        // The token in the request line is no credential.
+        let resp = respond(
+            format!("GET /metrics?access_token={TOKEN} HTTP/1.1\r\n\r\n").as_bytes(),
+            Some(&t),
+        );
+        assert_eq!(parse_response(&resp).0, "HTTP/1.1 401 Unauthorized");
+        // Without the token nothing tells the paths apart.
+        for path in ["/", "/metricsx"] {
+            let resp = respond(format!("GET {path} HTTP/1.1\r\n\r\n").as_bytes(), Some(&t));
+            assert_eq!(parse_response(&resp).0, "HTTP/1.1 401 Unauthorized");
+        }
+        let resp = respond(b"POST /metrics HTTP/1.1\r\n\r\n", Some(&t));
+        assert_eq!(parse_response(&resp).0, "HTTP/1.1 401 Unauthorized");
+        // With the token they behave as without a token configured.
+        let auth = format!("Authorization: Bearer {TOKEN}\r\n\r\n");
+        for (req, want) in [
+            ("GET / HTTP/1.1", "HTTP/1.1 404 Not Found"),
+            ("POST /metrics HTTP/1.1", "HTTP/1.1 405 Method Not Allowed"),
+        ] {
+            let resp = respond(format!("{req}\r\n{auth}").as_bytes(), Some(&t));
+            assert_eq!(parse_response(&resp).0, want);
+        }
+        let resp = respond(b"GET /metrics\r\n\r\n", Some(&t));
+        assert_eq!(parse_response(&resp).0, "HTTP/1.1 400 Bad Request");
+    }
+
+    /// Serve one connection whose client side writes `req` and then reads
+    /// everything; the response bytes. `buf` is the pipe's buffer size.
+    async fn conn_answer(
+        req: &[u8],
+        access: &Arc<Access>,
+        current: &watch::Receiver<Arc<Access>>,
+        pending: &Arc<Semaphore>,
+        scrapes: &Semaphore,
+    ) -> Vec<u8> {
+        let (mut client, server) = tokio::io::duplex(1 << 20);
+        client.write_all(req).await.unwrap();
+        let conn = Conn {
+            access,
+            current,
+            pending: pending.clone().try_acquire_owned().unwrap(),
+            scrapes,
+        };
+        let _ = conn.scrape(server, Instant::now() + REQUEST_TIMEOUT).await;
+        let mut out = Vec::new();
+        client.read_to_end(&mut out).await.unwrap();
+        out
+    }
+
+    /// The admission slot covers a connection until its request is judged;
+    /// only a request that passed the token check takes a scrape slot, and
+    /// it gives the admission slot back. With every scrape slot busy, such a
+    /// request is closed unanswered, while refusals are still answered.
+    #[tokio::test]
+    async fn only_judged_requests_take_a_scrape_slot() {
+        let access = Arc::new(Access {
+            tls: None,
+            token: Some(token()),
+        });
+        let (_tx, current) = watch::channel(access.clone());
+        let pending = Arc::new(Semaphore::new(1));
+        let ok = format!("GET /metrics HTTP/1.1\r\nAuthorization: Bearer {TOKEN}\r\n\r\n");
+        let bad = b"GET /metrics HTTP/1.1\r\n\r\n";
+
+        let busy = Semaphore::new(0);
+        let out = conn_answer(bad, &access, &current, &pending, &busy).await;
+        assert!(out.starts_with(b"HTTP/1.1 401 "));
+        let out = conn_answer(ok.as_bytes(), &access, &current, &pending, &busy).await;
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+
+        let scrapes = Semaphore::new(1);
+        let out = conn_answer(ok.as_bytes(), &access, &current, &pending, &scrapes).await;
+        assert!(out.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert_eq!(
+            (pending.available_permits(), scrapes.available_permits()),
+            (1, 1)
+        );
+
+        // While the metrics are written (to a client that reads slowly),
+        // the connection holds a scrape slot and no admission slot.
+        let (mut client, server) = tokio::io::duplex(64);
+        let conn = Conn {
+            access: &access,
+            current: &current,
+            pending: pending.clone().try_acquire_owned().unwrap(),
+            scrapes: &scrapes,
+        };
+        let mut first = [0u8; 16];
+        let (r, ()) = tokio::join!(
+            conn.scrape(server, Instant::now() + REQUEST_TIMEOUT),
+            async {
+                client.write_all(ok.as_bytes()).await.unwrap();
+                client.read_exact(&mut first).await.unwrap();
+                assert_eq!(
+                    (pending.available_permits(), scrapes.available_permits()),
+                    (1, 0)
+                );
+                let mut rest = Vec::new();
+                client.read_to_end(&mut rest).await.unwrap();
+            }
+        );
+        r.unwrap();
+        assert_eq!(&first, b"HTTP/1.1 200 OK\r");
+    }
+
+    /// A connection accepted under settings a reload has replaced gets no
+    /// answer, whatever it sends.
+    #[tokio::test]
+    async fn replaced_settings_get_no_answer() {
+        let old = Arc::new(Access {
+            tls: None,
+            token: None,
+        });
+        let (tx, current) = watch::channel(old.clone());
+        let pending = Arc::new(Semaphore::new(1));
+        let scrapes = Semaphore::new(1);
+        let req = b"GET /metrics HTTP/1.1\r\n\r\n";
+        let out = conn_answer(req, &old, &current, &pending, &scrapes).await;
+        assert!(out.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        tx.send_replace(Arc::new(Access {
+            tls: None,
+            token: None,
+        }));
+        for req in [&req[..], b"GET / HTTP/1.1\r\n\r\n", b"bad\r\n\r\n"] {
+            let out = conn_answer(req, &old, &current, &pending, &scrapes).await;
+            assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+        }
+    }
+
+    #[test]
+    fn constant_time_compare() {
+        assert!(ct_eq(b"", b""));
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"));
+        assert!(!ct_eq(b"abc", b"xbc"));
+        assert!(!ct_eq(b"abc", b"ab"));
+        assert!(!ct_eq(b"ab", b"abc"));
+    }
+
+    /// The token file: surrounding whitespace is trimmed; what is left must
+    /// be at least 32 printable ASCII characters without spaces. Errors
+    /// never show the content.
+    #[test]
+    fn token_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |body: &[u8]| {
+            let p = dir.path().join("token");
+            std::fs::write(&p, body).unwrap();
+            p.display().to_string()
+        };
+        let t = read_token(&file(format!(" \n{TOKEN}\r\n\n").as_bytes())).unwrap();
+        assert_eq!(&t.0[..], TOKEN.as_bytes());
+        assert_eq!(format!("{t:?}"), "Token(..)");
+        let secret = "s3cr3t-s3cr3t-s3cr3t-s3cr3t-s3c"; // 31 bytes
+        for (body, want) in [
+            (String::new(), "empty"),
+            (" \n\t\n".into(), "empty"),
+            (secret.into(), "at least 32"),
+            (format!("{secret}\n{secret}"), "printable ASCII"),
+            (format!("{secret} {secret}"), "printable ASCII"),
+            (format!("{secret}\u{e9}{secret}"), "printable ASCII"),
+        ] {
+            let e = format!("{:#}", read_token(&file(body.as_bytes())).unwrap_err());
+            assert!(e.contains(want), "{body:?}: {e}");
+            assert!(!e.contains("s3cr3t"), "{e}");
+        }
+        let missing = dir.path().join("missing").display().to_string();
+        assert!(read_token(&missing).is_err());
     }
 
     #[test]
