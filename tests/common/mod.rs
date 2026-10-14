@@ -517,6 +517,10 @@ enum Verdict {
 /// backend with an auth failure delay.
 pub const SLOW_REJECT: Duration = Duration::from_millis(800);
 
+/// How long the mock takes before accepting a `slowok…` login, like a
+/// backend under load.
+pub const SLOW_OK: Duration = Duration::from_secs(2);
+
 /// How long the mock hangs before answering a `stall…` login.
 pub const STALL: Duration = Duration::from_secs(30);
 
@@ -524,6 +528,9 @@ pub const STALL: Duration = Duration::from_secs(30);
 async fn verdict_after(login: &str) -> Verdict {
     if login.starts_with("slowreject") {
         tokio::time::sleep(SLOW_REJECT).await;
+    }
+    if login.starts_with("slowok") {
+        tokio::time::sleep(SLOW_OK).await;
     }
     if login.starts_with("stall") {
         // A backend that hangs after the credential.

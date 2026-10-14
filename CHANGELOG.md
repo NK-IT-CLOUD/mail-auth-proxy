@@ -14,6 +14,15 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `SIGHUP`, so a renewed certificate or a rotated token takes effect with
   `systemctl reload`. A token on an address other than loopback without TLS is a
   configuration error; an endpoint off loopback without a token still gets the warning.
+- `[session]` `end_at_token_expiry` (default `false`) ends a session that logged in with
+  OAuth at its token's `exp` plus `token_expiry_grace_secs` (default 300, 0-86400), so
+  an account disabled in the IdP does not stay logged in until the client disconnects.
+  The end is absolute: a session that starts after it (a token accepted within
+  `oauth.leeway_secs`, a slow backend) is closed right after the login, and a grace below
+  the leeway gives a warning.
+  The session is closed like one ended by `max_session_secs`; with both set, the earlier
+  deadline applies. Password sessions are not affected. New `reason="token_expired"` in
+  `mail_auth_proxy_sessions_ended_total` and in the `session closed by limit` log line.
 
 ### Changed
 - Metrics endpoint: idle connections no longer take the 4 scrape slots. Up to 64

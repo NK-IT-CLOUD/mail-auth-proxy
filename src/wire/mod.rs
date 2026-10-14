@@ -39,6 +39,9 @@ pub struct Tuning {
     pub session_idle: Option<Duration>,
     /// After login: end the session this long after the login.
     pub max_session: Option<Duration>,
+    /// After a login with a token: end the session this long after the
+    /// token's `exp`. `None`: the token's `exp` does not end a session.
+    pub token_expiry_grace: Option<Duration>,
 }
 
 /// The configuration defaults, for unit tests and fuzz targets.
@@ -58,6 +61,7 @@ impl Default for Tuning {
             },
             session_idle: None,
             max_session: None,
+            token_expiry_grace: None,
         }
     }
 }

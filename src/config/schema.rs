@@ -1019,6 +1019,15 @@ pub struct Session {
     /// Off when absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_session_secs: Option<u64>,
+    /// End a session that logged in with a token at the token's `exp` plus
+    /// `token_expiry_grace_secs`, a time of the system clock. Password
+    /// sessions have no `exp` and are not affected.
+    #[serde(default)]
+    pub end_at_token_expiry: bool,
+    /// Time after the token's `exp` before `end_at_token_expiry` ends the
+    /// session.
+    #[serde(default = "default_token_expiry_grace_secs")]
+    pub token_expiry_grace_secs: u64,
 }
 
 impl Default for Session {
@@ -1029,8 +1038,17 @@ impl Default for Session {
             keepalive_count: default_keepalive_count(),
             idle_limit_secs: None,
             max_session_secs: None,
+            end_at_token_expiry: false,
+            token_expiry_grace_secs: default_token_expiry_grace_secs(),
         }
     }
+}
+
+/// 5 minutes: clock skew and a client's own refresh timing do not cut a
+/// session right at `exp`, and the open sessions of a disabled account still
+/// end soon after its last token runs out.
+fn default_token_expiry_grace_secs() -> u64 {
+    300
 }
 
 /// 10 minutes of silence, then 5 probes a minute apart: a dead peer (a phone

@@ -19,7 +19,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::Notify;
 use tokio::time::Instant;
@@ -28,26 +28,75 @@ const CLIENT: u8 = 1;
 const BACKEND: u8 = 2;
 
 /// Relay bytes both ways until either side closes or a `[session]` limit
-/// ends the session; record why it ended. A peer that disconnects without a
-/// TLS close_notify ends the relay with an error; that is the normal end of
-/// many sessions, so it counts as that peer's close and is not worth a
-/// warning.
-pub async fn splice<A, B>(client: &mut A, backend: &mut B, proto: Proto, tuning: &Tuning)
-where
+/// ends the session; record why it ended. `token_exp`: the `exp` (Unix
+/// seconds) of the token the client logged in with, `None` for a password.
+/// A peer that disconnects without a TLS close_notify ends the relay with an
+/// error; that is the normal end of many sessions, so it counts as that
+/// peer's close and is not worth a warning.
+pub async fn splice<A, B>(
+    client: &mut A,
+    backend: &mut B,
+    proto: Proto,
+    tuning: &Tuning,
+    token_exp: Option<u64>,
+) where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
     let start = Instant::now();
+    let token_end = tuning
+        .token_expiry_grace
+        .zip(token_exp)
+        .and_then(|(grace, exp)| token_end(exp, grace));
     let dialect = match proto {
         Proto::Imap => Some(Dialect::Imap),
         Proto::Sieve => Some(Dialect::Sieve),
         Proto::Smtp => None,
     };
-    let end = relay(client, backend, tuning, dialect).await;
+    let end = relay(
+        client,
+        backend,
+        tuning,
+        token_end,
+        &SystemTime::now,
+        dialect,
+    )
+    .await;
     metrics::record_session_end(proto, end);
-    if matches!(end, SessionEnd::IdleLimit | SessionEnd::MaxSession) {
+    if is_limit(end) {
         tracing::info!(target: crate::obs::target::RELAY, proto = proto.label(), reason = end.label(),
             secs = start.elapsed().as_secs(), "session closed by limit");
+    }
+}
+
+/// An end the proxy chose by a `[session]` limit.
+fn is_limit(end: SessionEnd) -> bool {
+    matches!(
+        end,
+        SessionEnd::IdleLimit | SessionEnd::MaxSession | SessionEnd::TokenExpired
+    )
+}
+
+/// With `session.end_at_token_expiry`, when a session whose token expires
+/// at `exp` (Unix seconds) ends: at `exp` plus the grace, by the system
+/// clock, however late the session started. `None` past what the clock can
+/// represent: never.
+fn token_end(exp: u64, grace: Duration) -> Option<SystemTime> {
+    UNIX_EPOCH.checked_add(Duration::from_secs(exp).saturating_add(grace))
+}
+
+/// Longest single wait for a token's end: the system clock is read again
+/// after each, so a clock step after the login moves the session's end by
+/// at most this much.
+const CLOCK_RECHECK: Duration = Duration::from_secs(60);
+
+/// Resolves once `now()` reaches `end`; at once if it already has.
+async fn until_clock(end: SystemTime, now: &(dyn Fn() -> SystemTime + Sync)) {
+    loop {
+        match end.duration_since(now()) {
+            Ok(left) if !left.is_zero() => tokio::time::sleep(left.min(CLOCK_RECHECK)).await,
+            _ => return,
+        }
     }
 }
 
@@ -55,6 +104,8 @@ async fn relay<A, B>(
     client: &mut A,
     backend: &mut B,
     tuning: &Tuning,
+    token_end: Option<SystemTime>,
+    clock: &(dyn Fn() -> SystemTime + Sync),
     dialect: Option<Dialect>,
 ) -> SessionEnd
 where
@@ -84,6 +135,12 @@ where
             None => std::future::pending().await,
         }
     };
+    let token = async {
+        match token_end {
+            Some(end) => until_clock(end, clock).await,
+            None => std::future::pending().await,
+        }
+    };
     let copy = async {
         match dialect {
             Some(d) => guarded(&mut client, &mut backend, Guard::new(d)).await,
@@ -108,11 +165,9 @@ where
         },
         _ = idle => SessionEnd::IdleLimit,
         _ = max => SessionEnd::MaxSession,
+        _ = token => SessionEnd::TokenExpired,
     };
-    if matches!(
-        end,
-        SessionEnd::IdleLimit | SessionEnd::MaxSession | SessionEnd::Blocked
-    ) {
+    if is_limit(end) || end == SessionEnd::Blocked {
         let _ = tokio::time::timeout(super::CLOSE_GRACE, async {
             tokio::join!(client.shutdown(), backend.shutdown())
         })
@@ -345,12 +400,93 @@ mod tests {
         DuplexStream,
         tokio::task::JoinHandle<SessionEnd>,
     ) {
+        let (client, backend, task, _) = start_with_token(tuning, None);
+        (client, backend, task)
+    }
+
+    /// A system clock for paused tests: a fixed start that advances with
+    /// Tokio's clock, plus a step in seconds set by the test.
+    struct TestClock {
+        base: SystemTime,
+        t0: Instant,
+        step: std::sync::atomic::AtomicI64,
+    }
+
+    impl TestClock {
+        fn new() -> TestClock {
+            TestClock {
+                base: UNIX_EPOCH + Duration::from_secs(1_800_000_000),
+                t0: Instant::now(),
+                step: Default::default(),
+            }
+        }
+
+        fn now(&self) -> SystemTime {
+            let t = self.base + self.t0.elapsed();
+            let step = self.step.load(Ordering::Relaxed);
+            let by = Duration::from_secs(step.unsigned_abs());
+            if step < 0 {
+                t - by
+            } else {
+                t + by
+            }
+        }
+    }
+
+    /// Like `start`, for a token session that ends `token_in` seconds after
+    /// the start by the returned clock (negative: already past).
+    fn start_with_token(
+        tuning: Tuning,
+        token_in: Option<i64>,
+    ) -> (
+        DuplexStream,
+        DuplexStream,
+        tokio::task::JoinHandle<SessionEnd>,
+        std::sync::Arc<TestClock>,
+    ) {
         let (client, mut proxy_client) = tokio::io::duplex(1024);
         let (backend, mut proxy_backend) = tokio::io::duplex(1024);
-        let task = tokio::spawn(async move {
-            relay(&mut proxy_client, &mut proxy_backend, &tuning, None).await
+        let clock = std::sync::Arc::new(TestClock::new());
+        let end = token_in.map(|secs| {
+            let by = Duration::from_secs(secs.unsigned_abs());
+            if secs < 0 {
+                clock.now() - by
+            } else {
+                clock.now() + by
+            }
         });
-        (client, backend, task)
+        let c = clock.clone();
+        let task = tokio::spawn(async move {
+            let now = move || c.now();
+            relay(
+                &mut proxy_client,
+                &mut proxy_backend,
+                &tuning,
+                end,
+                &now,
+                None,
+            )
+            .await
+        });
+        (client, backend, task, clock)
+    }
+
+    /// Keep both directions busy until the relay ends; how long it ran.
+    async fn busy_until_end(
+        client: &mut DuplexStream,
+        backend: &mut DuplexStream,
+        task: &tokio::task::JoinHandle<SessionEnd>,
+    ) -> Duration {
+        let t0 = Instant::now();
+        while !task.is_finished() {
+            // Not a divisor of the limits below, so none fires mid-exchange.
+            tokio::time::sleep(Duration::from_secs(70)).await;
+            if task.is_finished() {
+                break;
+            }
+            exchange(client, backend).await;
+        }
+        t0.elapsed()
     }
 
     fn limits(idle: Option<u64>, max: Option<u64>) -> Tuning {
@@ -428,6 +564,83 @@ mod tests {
         assert_eq!(task.await.unwrap(), SessionEnd::MaxSession);
         assert!(t0.elapsed() >= Duration::from_secs(3600));
         assert_closed(&mut client).await;
+    }
+
+    /// The token's end ends a session that is busy the whole time,
+    /// closing both sides like `max_session`.
+    #[tokio::test(start_paused = true)]
+    async fn token_expiry_ends_a_busy_session() {
+        let (mut client, mut backend, task, _) =
+            start_with_token(limits(Some(1800), None), Some(3600));
+        let took = busy_until_end(&mut client, &mut backend, &task).await;
+        assert_eq!(task.await.unwrap(), SessionEnd::TokenExpired);
+        assert!(took >= Duration::from_secs(3600), "{took:?}");
+        assert!(took < Duration::from_secs(3600 + 70), "{took:?}");
+        assert_closed(&mut client).await;
+        assert_closed(&mut backend).await;
+    }
+
+    /// A session whose token end has passed when the relay starts (a token
+    /// accepted within the leeway, a slow backend login) ends at once.
+    #[tokio::test(start_paused = true)]
+    async fn token_end_already_past_ends_at_once() {
+        for past in [0, -1, -3600] {
+            let t0 = Instant::now();
+            let (mut client, mut backend, task, _) =
+                start_with_token(limits(None, None), Some(past));
+            assert_eq!(task.await.unwrap(), SessionEnd::TokenExpired, "{past}");
+            assert_eq!(t0.elapsed(), Duration::ZERO, "{past}");
+            assert_closed(&mut client).await;
+            assert_closed(&mut backend).await;
+        }
+    }
+
+    /// With both `max_session` and a token end, the earlier one ends the
+    /// session and names the reason.
+    #[tokio::test(start_paused = true)]
+    async fn earliest_deadline_wins() {
+        for (max, token, reason) in [
+            (3600, 1800, SessionEnd::TokenExpired),
+            (1800, 3600, SessionEnd::MaxSession),
+        ] {
+            let (mut client, mut backend, task, _) =
+                start_with_token(limits(None, Some(max)), Some(token));
+            let took = busy_until_end(&mut client, &mut backend, &task).await;
+            assert_eq!(task.await.unwrap(), reason);
+            let first = Duration::from_secs(max.min(token as u64));
+            assert!(
+                took >= first && took < first + Duration::from_secs(70),
+                "{took:?}"
+            );
+        }
+    }
+
+    /// The token's end is a time of the system clock: a step of that clock
+    /// after the login moves the end within `CLOCK_RECHECK`, either way.
+    #[tokio::test(start_paused = true)]
+    async fn token_end_follows_a_clock_step() {
+        for (step, at) in [(2000, 1600), (-2000, 5600)] {
+            let (_client, _backend, task, clock) = start_with_token(limits(None, None), Some(3600));
+            let t0 = Instant::now();
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            clock.step.store(step, Ordering::Relaxed);
+            assert_eq!(task.await.unwrap(), SessionEnd::TokenExpired, "{step}");
+            let (took, at) = (t0.elapsed(), Duration::from_secs(at));
+            assert!(took >= at && took <= at + CLOCK_RECHECK, "{step}: {took:?}");
+        }
+    }
+
+    /// The token's end: `exp` plus the grace, as a time; never for an
+    /// `exp` past what the clock can represent.
+    #[test]
+    fn token_end_is_exp_plus_grace() {
+        let grace = Duration::from_secs(300);
+        assert_eq!(
+            token_end(1_800_000_000, grace),
+            Some(UNIX_EPOCH + Duration::from_secs(1_800_000_300))
+        );
+        assert_eq!(token_end(0, Duration::ZERO), Some(UNIX_EPOCH));
+        assert_eq!(token_end(u64::MAX, grace), None);
     }
 
     #[tokio::test]

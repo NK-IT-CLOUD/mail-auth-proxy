@@ -176,6 +176,8 @@ keepalive_count = 5                        # 600 + 5 x 60 s of silence
 # idle_limit_secs = 3600                   # after login, no byte either way; off by default,
 #                                          # warning below 1800 (RFC 9051 section 5.4)
 # max_session_secs = 86400                 # after login, hard cap; off by default
+# end_at_token_expiry = true               # OAuth sessions end at the token's exp + grace;
+# token_expiry_grace_secs = 300            # off by default, password sessions unaffected
 
 [metrics]                                  # optional feature, off by default
 enabled = false

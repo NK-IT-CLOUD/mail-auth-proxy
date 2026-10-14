@@ -276,15 +276,19 @@ pub enum SessionEnd {
     /// The client sent a command the relay keeps from the backend where it
     /// cannot refuse it (`wire::guard`).
     Blocked,
+    /// `session.end_at_token_expiry`: the token of the login expired, plus
+    /// `session.token_expiry_grace_secs`.
+    TokenExpired,
 }
 
-const SESSION_ENDS: [SessionEnd; 6] = [
+const SESSION_ENDS: [SessionEnd; 7] = [
     SessionEnd::ClientClose,
     SessionEnd::BackendClose,
     SessionEnd::IdleLimit,
     SessionEnd::MaxSession,
     SessionEnd::Error,
     SessionEnd::Blocked,
+    SessionEnd::TokenExpired,
 ];
 
 impl SessionEnd {
@@ -297,6 +301,7 @@ impl SessionEnd {
             SessionEnd::MaxSession => "max_session",
             SessionEnd::Error => "error",
             SessionEnd::Blocked => "blocked",
+            SessionEnd::TokenExpired => "token_expired",
         }
     }
 

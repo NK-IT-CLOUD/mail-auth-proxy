@@ -4,18 +4,22 @@
 
 mod common;
 use common::*;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A logged-in session of `kind` that relays to the backend.
 async fn logged_in(h: &Harness, kind: Kind) -> Client {
-    let token = h.idp.token(EMAIL);
+    logged_in_with(h, kind, &h.idp.token(EMAIL)).await
+}
+
+/// A logged-in session of `kind` with `token`.
+async fn logged_in_with(h: &Harness, kind: Kind, token: &str) -> Client {
     let (mut c, reply) = h
         .auth(
             kind,
             Src::External,
             Sni::Public,
             "XOAUTH2",
-            &xoauth2(EMAIL, &token),
+            &xoauth2(EMAIL, token),
         )
         .await;
     assert!(
@@ -140,4 +144,168 @@ async fn ends_are_counted_by_who_closed() {
             assert_eq!(h.proxy.metric(&ended(kind, reason)).await, 0);
         }
     }
+}
+
+/// A token for `EMAIL` that expires `secs` from now (negative: in the past).
+fn token_expiring_in(h: &Harness, secs: i64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    h.idp.mint(serde_json::json!({ "exp": now + secs }))
+}
+
+/// Keep `c` (a logged-in IMAP session) busy until the proxy closes it;
+/// returns how long that took.
+async fn busy_imap_until_closed(c: &mut Client) -> Duration {
+    let t0 = Instant::now();
+    let mut i = 0;
+    loop {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        c.send(&format!("b{i} NOOP")).await;
+        match c.try_line().await {
+            Some(l) => assert_eq!(l, format!("ECHO b{i} NOOP")),
+            None => return t0.elapsed(),
+        }
+        i += 1;
+        assert!(t0.elapsed() < IO_TIMEOUT, "session was not ended");
+    }
+}
+
+/// `end_at_token_expiry` ends a busy OAuth session of each protocol once
+/// the token's `exp` plus the grace has passed: closed without a message,
+/// counted as `token_expired`, logged with that reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_expiry_ends_an_oauth_session() {
+    let h = Harness::start_with(with_session(
+        "end_at_token_expiry = true\ntoken_expiry_grace_secs = 1",
+    ))
+    .await;
+    for kind in Kind::ALL {
+        let mut c = logged_in_with(&h, kind, &token_expiring_in(&h, 1)).await;
+        let t0 = Instant::now();
+        c.expect_closed().await;
+        // exp has a resolution of one second: at least the grace.
+        let took = t0.elapsed();
+        assert!(took >= Duration::from_millis(900), "{kind:?}: {took:?}");
+        assert!(took < Duration::from_secs(4), "{kind:?}: {took:?}");
+        wait_metric(&h, &ended(kind, "token_expired"), 1).await;
+        for reason in ["idle_limit", "max_session", "client_close", "error"] {
+            assert_eq!(h.proxy.metric(&ended(kind, reason)).await, 0, "{kind:?}");
+        }
+    }
+    h.proxy
+        .wait_logs(
+            "session closed by limit proto=\"imap\" reason=\"token_expired\"",
+            1,
+        )
+        .await;
+}
+
+/// Log in as `user` with `token` (IMAP); how long after the login's OK the
+/// proxy closed the session.
+async fn closed_after_login(h: &Harness, user: &str, token: &str) -> Duration {
+    let (mut c, reply) = h
+        .auth(
+            Kind::Imap,
+            Src::External,
+            Sni::Public,
+            "XOAUTH2",
+            &xoauth2(user, token),
+        )
+        .await;
+    assert!(reply.starts_with("a OK"), "{reply}");
+    let t0 = Instant::now();
+    c.expect_closed().await;
+    t0.elapsed()
+}
+
+/// The session ends at `exp` plus the grace as an absolute time, whenever
+/// the session started: a token already past `exp` (accepted within
+/// `oauth.leeway_secs`) and a slow backend login both leave only the rest
+/// of the grace, and a session whose deadline has passed by the end of the
+/// login is closed right after it. A grace below the leeway is a warning.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_deadline_is_absolute() {
+    let h = Harness::start_with(with_session(
+        "end_at_token_expiry = true\ntoken_expiry_grace_secs = 2",
+    ))
+    .await;
+    assert!(h
+        .proxy
+        .log_contains("session.token_expiry_grace_secs = 2 is below oauth.leeway_secs = 60"));
+    let key = ended(Kind::Imap, "token_expired");
+
+    // exp one second ago: at most one second of the grace is left.
+    let took = closed_after_login(&h, EMAIL, &token_expiring_in(&h, -1)).await;
+    assert!(took < Duration::from_millis(1500), "{took:?}");
+    wait_metric(&h, &key, 1).await;
+
+    // Past exp + grace already at the login: closed at once.
+    let took = closed_after_login(&h, EMAIL, &token_expiring_in(&h, -10)).await;
+    assert!(took < Duration::from_millis(500), "{took:?}");
+    wait_metric(&h, &key, 2).await;
+
+    // A backend login of SLOW_OK counts against the deadline too.
+    let user = "slowok@example.test";
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let token = h
+        .idp
+        .mint(serde_json::json!({ "email": user, "exp": now + 1 }));
+    let took = closed_after_login(&h, user, &token).await;
+    assert!(took < Duration::from_millis(1500), "{took:?}");
+    wait_metric(&h, &key, 3).await;
+}
+
+/// With `max_session_secs` shorter than the token's lifetime, that limit
+/// ends the session and names itself; the token's deadline does not fire
+/// for a session that has already ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn earlier_max_session_wins_over_token_expiry() {
+    let h = Harness::start_with(with_session(
+        "max_session_secs = 1\nend_at_token_expiry = true\ntoken_expiry_grace_secs = 0",
+    ))
+    .await;
+    let mut c = logged_in(&h, Kind::Imap).await;
+    busy_imap_until_closed(&mut c).await;
+    wait_metric(&h, &ended(Kind::Imap, "max_session"), 1).await;
+    assert_eq!(h.proxy.metric(&ended(Kind::Imap, "token_expired")).await, 0);
+}
+
+/// The option only touches OAuth sessions: a password session has no
+/// `exp` and stays, even with no grace. Without the option a session lives
+/// on past its token's `exp`, as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn password_sessions_and_the_default_ignore_token_expiry() {
+    let h = Harness::start_with(with_session(
+        "end_at_token_expiry = true\ntoken_expiry_grace_secs = 0",
+    ))
+    .await;
+    let (mut pw, reply) = h
+        .auth(
+            Kind::Imap,
+            Src::Internal,
+            Sni::Internal,
+            "PLAIN",
+            &plain("bob@example.test", "pw"),
+        )
+        .await;
+    assert!(reply.starts_with("a OK"), "{reply}");
+    let mut oauth = logged_in_with(&h, Kind::Imap, &token_expiring_in(&h, 1)).await;
+    oauth.expect_closed().await;
+    wait_metric(&h, &ended(Kind::Imap, "token_expired"), 1).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    pw.send("p NOOP").await;
+    assert_eq!(pw.line().await, "ECHO p NOOP");
+
+    // The grace alone does nothing.
+    let h = Harness::start_with(with_session("token_expiry_grace_secs = 0")).await;
+    let mut c = logged_in_with(&h, Kind::Imap, &token_expiring_in(&h, 1)).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    c.send("late NOOP").await;
+    assert_eq!(c.line().await, "ECHO late NOOP");
+    assert_eq!(h.proxy.metric(&ended(Kind::Imap, "token_expired")).await, 0);
 }

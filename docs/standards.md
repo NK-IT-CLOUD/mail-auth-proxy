@@ -60,7 +60,7 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 | Unknown commands, and commands not valid in this state → BAD | | RFC 9051 §7.1.3, RFC 3501 §3 | Yes | Then the connection closes |
 | Tag syntax (`astring-char` except `+`) | | RFC 9051 §9 | Yes | A line with an invalid tag gets the untagged BAD and closes |
 | Pre-authentication inactivity timeout may be short | | RFC 9051 §5.4 | Yes | Default 30 s idle, 60 s total. See D-GEN-2. |
-| Post-authentication autologout ≥ 30 min | MUST | RFC 9051 §5.4 | Depends on configuration | No proxy timer after login by default; the backend decides. `session.idle_limit_secs` and `session.max_session_secs` below 1800 give a warning (section 7, D-GEN-3) |
+| Post-authentication autologout ≥ 30 min | MUST | RFC 9051 §5.4 | Depends on configuration | No proxy timer after login by default; the backend decides. `session.idle_limit_secs` and `session.max_session_secs` below 1800 give a warning (section 7, D-GEN-3); `session.end_at_token_expiry` (off) follows the access token's lifetime, often shorter, without a warning |
 | STARTTLS on cleartext ports | MUST | RFC 9051 §6.1.1 | N/A | No cleartext IMAP port |
 | Pipelined commands after AUTHENTICATE reach the backend | | RFC 9051 §5.5 | Yes | |
 
@@ -198,7 +198,7 @@ Bearer tokens are validated locally as signed JWTs (JWS compact serialisation) a
 | EHLO domain is a resolvable FQDN or an address literal | MUST | RFC 5321 §2.3.5, §4.1.4 | Depends on configuration | The configured server name is used. Its syntax is checked and a single label gives a warning (D-SMTP-4); whether it resolves is not |
 | TCP keepalive switched on per connection by the application; interval configurable | MUST (of the TCP stack) | RFC 9293 §3.8.4 (MUST-24, MUST-27) | Yes | On for client and backend connections (`session.keepalive_*`, default 600 s / 60 s / 5). The stack's 2-hour default (MUST-28) is for connections the application leaves alone. |
 | One unanswered keepalive probe does not mean a dead connection | MUST | RFC 9293 §3.8.4 (MUST-29) | Yes | `session.keepalive_count` must be at least 2 |
-| Post-login autologout at least 30 minutes | MUST | RFC 9051 §5.4, RFC 5804 §1.2 | Depends on configuration | No autologout by default. `session.idle_limit_secs` and `session.max_session_secs` below 1800 give a warning. |
+| Post-login autologout at least 30 minutes | MUST | RFC 9051 §5.4, RFC 5804 §1.2 | Depends on configuration | No autologout by default. `session.idle_limit_secs` and `session.max_session_secs` below 1800 give a warning; `session.end_at_token_expiry` (off) follows the access token's lifetime, often shorter, without a warning |
 | BYE / 421 before the server closes | SHOULD | RFC 9051 §3.4, RFC 5804 §1.2, RFC 5321 §3.8 | Deviation | Not sent when a session limit closes a logged-in session. D-GEN-3. |
 
 ## 8. Metrics
@@ -274,12 +274,12 @@ The relay after login; details in [protocols](protocols.md#imap-and-managesieve-
 
 ### D-GEN-3: no BYE or 421 when a session limit ends a session
 
-- Behaviour: when `session.idle_limit_secs` or `session.max_session_secs` ends a logged-in session, the proxy closes both TLS streams (close_notify, then FIN) without a protocol message of its own. Both limits are off by default. A session the command guard ends ([After login](#9-after-login)) is closed the same way.
+- Behaviour: when `session.idle_limit_secs`, `session.max_session_secs` or `session.end_at_token_expiry` ends a logged-in session, the proxy closes both TLS streams (close_notify, then FIN) without a protocol message of its own. All three are off by default. A session the command guard ends ([After login](#9-after-login)) is closed the same way.
 - What the specifications say:
   - IMAP: a server SHOULD NOT close the connection without an untagged `BYE` (RFC 9051 §3.4); a post-login autologout timer MUST be at least 30 minutes (RFC 9051 §5.4).
   - ManageSieve: `BYE` SHOULD be used when the server closes the connection; an autologout timer MUST be at least 30 minutes after authentication (RFC 5804 §1.2).
   - SMTP: a server closes only after QUIT, after a `421`, or after a timeout (RFC 5321 §3.8); a client treats an unexpected close as a temporary failure.
-- Rationale: a limit can fire while the client is in the middle of a response. A `BYE` or `421` written into an IMAP or ManageSieve literal, or between the lines of an SMTP multi-line reply, would corrupt the client's data. A closed connection is something every client already handles. The idle limit counts traffic in both directions, which is at least as lenient as the RFC 9051 timer (reset by client commands); `--check-config` warns about either limit below 30 minutes. `max_session_secs` ends sessions that are not idle, which none of the three protocols foresees; it exists to bound how long a session outlives its credential.
+- Rationale: a limit can fire while the client is in the middle of a response. A `BYE` or `421` written into an IMAP or ManageSieve literal, or between the lines of an SMTP multi-line reply, would corrupt the client's data. A closed connection is something every client already handles. The idle limit counts traffic in both directions, which is at least as lenient as the RFC 9051 timer (reset by client commands); `--check-config` warns about either limit below 30 minutes. `max_session_secs` and `end_at_token_expiry` end sessions that are not idle, which none of the three protocols foresees; they exist to bound how long a session outlives its credential.
 
 ### D-AUTH-1: password mechanisms are a policy decision
 

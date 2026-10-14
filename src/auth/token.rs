@@ -99,6 +99,8 @@ pub struct Validated {
     pub issuer: String,
     /// The token's `aud` values (a string or an array of strings).
     pub audiences: Vec<String>,
+    /// The token's `exp`, Unix seconds.
+    pub expires: u64,
 }
 
 /// The token rules of one issuer (compiled from `config::Issuer`).
@@ -739,13 +741,19 @@ impl Validator {
             // issuer borrowed from another realm (see `KeyEntry`).
             match decode::<Map<String, Value>>(token, &e.key, &e.validation) {
                 Ok(data) => {
-                    return check_claims(&data.claims, &header, &e.policy).map(|identity| {
-                        Validated {
-                            identity,
-                            issuer: e.policy.issuer.clone(),
-                            audiences: audiences(&data.claims),
-                        }
-                    })
+                    let identity = check_claims(&data.claims, &header, &e.policy)?;
+                    // jsonwebtoken required and checked `exp`.
+                    let expires = data
+                        .claims
+                        .get("exp")
+                        .and_then(numeric_date)
+                        .ok_or_else(|| invalid!("exp is not a number"))?;
+                    return Ok(Validated {
+                        identity,
+                        issuer: e.policy.issuer.clone(),
+                        audiences: audiences(&data.claims),
+                        expires,
+                    });
                 }
                 Err(err) => last = Some(err),
             }
@@ -755,6 +763,16 @@ impl Validator {
             None => invalid!("no usable key for kid"),
         })
     }
+}
+
+/// A NumericDate claim (RFC 7519 §2: seconds, possibly fractional) as
+/// whole seconds, read the way jsonwebtoken reads `exp` and `nbf` for its
+/// own checks: an integer as it is, a finite non-negative number rounded.
+fn numeric_date(v: &Value) -> Option<u64> {
+    v.as_u64().or_else(|| {
+        let f = v.as_f64()?;
+        (f.is_finite() && f >= 0.0 && f < u64::MAX as f64).then(|| f.round() as u64)
+    })
 }
 
 /// The `aud` claim as a list: a string, or the strings of an array (RFC
@@ -968,6 +986,31 @@ mod tests {
         assert!(v.validate(&tok).is_err());
     }
 
+    /// `exp` is a NumericDate, which may be fractional (RFC 7519 §2):
+    /// jsonwebtoken accepts it rounded to whole seconds, and `expires` is
+    /// that same value.
+    #[test]
+    fn expires_is_the_exp_claim() {
+        let (priv_pem, jwks) = test_es256_keypair("kid1");
+        let v = validator_with(jwks, ISS_A, "dovecot");
+        for (exp, secs) in [
+            (json!(4102444800u64), 4102444800),
+            (json!(4102444800.0), 4102444800),
+            (json!(4102444800.4), 4102444800),
+            (json!(4102444800.5), 4102444801),
+        ] {
+            let tok = mint(
+                &priv_pem,
+                "kid1",
+                json!({"iss":ISS_A,"aud":"dovecot","exp":exp,"email":"nk@x"}),
+            );
+            assert_eq!(v.verify(&tok).unwrap().expires, secs, "{exp}");
+        }
+        for exp in [json!(-1), json!("4102444800")] {
+            assert_eq!(numeric_date(&exp), None, "{exp}");
+        }
+    }
+
     #[test]
     fn rejects_wrong_issuer() {
         let (priv_pem, jwks) = test_es256_keypair("kid1");
@@ -1061,6 +1104,7 @@ mod tests {
                     identity: identity.into(),
                     issuer: issuer.into(),
                     audiences: vec!["dovecot".into()],
+                    expires: 4102444800,
                 }
             );
         }

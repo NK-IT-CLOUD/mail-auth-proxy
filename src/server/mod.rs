@@ -424,6 +424,10 @@ impl Generation {
                     .session
                     .max_session_secs
                     .map(std::time::Duration::from_secs),
+                token_expiry_grace: cfg
+                    .session
+                    .end_at_token_expiry
+                    .then(|| std::time::Duration::from_secs(cfg.session.token_expiry_grace_secs)),
             },
         });
         let generation = Generation {

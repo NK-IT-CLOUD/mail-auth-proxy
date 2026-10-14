@@ -519,10 +519,12 @@ pub fn blocked_source() -> anyhow::Error {
 pub enum Outcome<C> {
     /// Logged in as `identity`. `issuer`: the configured issuer whose key
     /// verified the token; `None` for a password.
+    /// `token_exp`: the token's `exp` (Unix seconds), `None` for a password.
     Ok {
         conn: C,
         identity: String,
         issuer: Option<String>,
+        token_exp: Option<u64>,
     },
     /// A password on a connection that offers no password mechanism (or not
     /// this one). It was not forwarded.
@@ -641,6 +643,7 @@ pub async fn authorize<B: BackendLogin>(
                 identity,
                 issuer,
                 audiences,
+                expires,
             } = match validated {
                 Ok(validated) => {
                     metrics::record_token_validate(true);
@@ -693,6 +696,7 @@ pub async fn authorize<B: BackendLogin>(
                         conn,
                         identity,
                         issuer: Some(issuer),
+                        token_exp: Some(expires),
                     }
                 }
                 Err(BackendError::Rejected(reply)) => {
@@ -794,6 +798,7 @@ pub async fn authorize<B: BackendLogin>(
                         conn,
                         identity: user.clone(),
                         issuer: None,
+                        token_exp: None,
                     }
                 }
                 Err(BackendError::Rejected(reply)) => {

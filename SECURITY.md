@@ -207,8 +207,10 @@ relays the session (IMAP and ManageSieve through a command guard, invariant 4). 
   `auth_ratelimit.exempt_networks`; the default exempts only loopback.
 - **Session lifetime.** A revoked token, or an account locked in the directory or the
   IdP, does not end an open session: the credential is checked once, at login. Set
-  `session.max_session_secs` to bound how long such a session lives on (off by default),
-  or end it at the backend (for example `doveadm kick`). TCP keepalive frees the slots
+  `session.end_at_token_expiry` to end OAuth sessions when their token expires (plus
+  `session.token_expiry_grace_secs`), `session.max_session_secs` to bound how long any
+  session lives on (both off by default), or end it at the backend (for example
+  `doveadm kick`). TCP keepalive frees the slots
   of dead peers; `session.idle_limit_secs` is off by default. There is no per-user
   session limit.
 - **Trust store.** JWKS fetches trust the system CA store (backends use it too unless

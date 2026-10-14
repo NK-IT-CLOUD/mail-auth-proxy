@@ -138,6 +138,7 @@ pub async fn handle(
             let (reply, error) = match outcome {
                 auth::Outcome::Ok {
                     conn: (mut be, logged_in),
+                    token_exp,
                     ..
                 } => {
                     permit.authenticated();
@@ -150,7 +151,14 @@ pub async fn handle(
                     client
                         .write_all(&wire::guard::imap_response(ok.as_bytes()))
                         .await?;
-                    wire::splice(&mut client, &mut be, metrics::Proto::Imap, tuning).await;
+                    wire::splice(
+                        &mut client,
+                        &mut be,
+                        metrics::Proto::Imap,
+                        tuning,
+                        token_exp,
+                    )
+                    .await;
                     return Ok(());
                 }
                 auth::Outcome::Blocked => (

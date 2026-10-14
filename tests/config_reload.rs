@@ -536,6 +536,7 @@ async fn open_sessions_survive_every_reload() {
             "idle_limit",
             "max_session",
             "error",
+            "token_expired",
         ] {
             let key = format!(
                 "mail_auth_proxy_sessions_ended_total{{proto=\"{proto}\",reason=\"{reason}\"}}"
@@ -543,6 +544,56 @@ async fn open_sessions_survive_every_reload() {
             assert_eq!(m[&key], 0, "{key}");
         }
     }
+}
+
+/// An IMAP session logged in with a token that expires `secs` from now.
+async fn logged_in_expiring(h: &Harness, secs: u64) -> Client {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let token = h.idp.mint(serde_json::json!({ "exp": now + secs }));
+    let (mut c, reply) = h
+        .auth(
+            Kind::Imap,
+            Src::External,
+            Sni::Public,
+            "XOAUTH2",
+            &xoauth2(EMAIL, &token),
+        )
+        .await;
+    assert!(reply.starts_with("a OK"), "{reply}");
+    relays(&mut c, "n0").await;
+    c
+}
+
+/// `end_at_token_expiry` is reloadable and, like the other session limits,
+/// applies to sessions that log in after the reload: one turned on does
+/// not end an open session at its token's `exp`, one turned off does not
+/// lift the deadline of a session that logged in with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_expiry_applies_to_new_sessions() {
+    const ENDED: &str =
+        "mail_auth_proxy_sessions_ended_total{proto=\"imap\",reason=\"token_expired\"}";
+    let h = Harness::start().await;
+    let mut before = logged_in_expiring(&h, 1).await;
+    let on = with(|o| {
+        o.session = Some("end_at_token_expiry = true\ntoken_expiry_grace_secs = 0".into())
+    });
+    reload(&h, &on).await;
+    let mut after = logged_in_expiring(&h, 2).await;
+    reload(&h, &Opts::default()).await;
+    let t0 = Instant::now();
+    after.expect_closed().await;
+    assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
+    let until = Instant::now() + IO_TIMEOUT;
+    while h.proxy.metric(ENDED).await != 1 {
+        assert!(Instant::now() < until, "{ENDED} did not reach 1");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Past its token's `exp` (and past the other's).
+    relays(&mut before, "b1").await;
+    assert_eq!(h.proxy.metric(ENDED).await, 1);
 }
 
 /// A backend address is reloadable: new sessions go to the new backend,

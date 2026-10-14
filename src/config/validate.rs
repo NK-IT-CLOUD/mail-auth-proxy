@@ -356,6 +356,15 @@ impl Config {
             (None, false) => {}
         }
         self.session.check(&mut err, warnings);
+        // The validator accepts a token up to the leeway after its exp; with
+        // a shorter grace its session is already over at the login.
+        let (s, leeway) = (&self.session, self.oauth.leeway_secs);
+        if s.end_at_token_expiry && s.token_expiry_grace_secs < leeway {
+            warnings.push(format!(
+                "session.token_expiry_grace_secs = {} is below oauth.leeway_secs = {leeway}: a token accepted within the leeway after its exp can end its session right after the login",
+                s.token_expiry_grace_secs
+            ));
+        }
     }
 
     /// Replace the short forms by what they mean, so the rest of the program
@@ -1007,6 +1016,10 @@ const MIN_RFC_SESSION_SECS: u64 = 1800;
 /// clock.
 const MAX_SESSION_SECS: u64 = 30 * 86_400;
 
+/// Upper bound of `token_expiry_grace_secs`: one day. A longer grace makes
+/// `end_at_token_expiry` pointless; `max_session_secs` is the longer bound.
+const MAX_TOKEN_EXPIRY_GRACE_SECS: u64 = 86_400;
+
 impl Session {
     fn check(&self, err: &mut impl FnMut(String), warnings: &mut Vec<String>) {
         for (name, secs) in [
@@ -1040,6 +1053,11 @@ impl Session {
                     "session.{name} = {secs} is below 30 minutes: IMAP and ManageSieve clients may count on at least 30 minutes of inactivity after login (RFC 9051 section 5.4, RFC 5804 section 1.2), and IDLE clients re-issue IDLE only every 29 minutes (RFC 9051 section 6.3.13); such sessions are cut"
                 ));
             }
+        }
+        if self.token_expiry_grace_secs > MAX_TOKEN_EXPIRY_GRACE_SECS {
+            err(format!(
+                "session.token_expiry_grace_secs must be between 0 and {MAX_TOKEN_EXPIRY_GRACE_SECS} seconds"
+            ));
         }
     }
 }
@@ -2125,6 +2143,59 @@ mod tests {
             .warnings
             .iter()
             .all(|w| w.contains("RFC 9051 section 5.4")));
+    }
+
+    /// `[session]` token expiry: off by default with a grace of 5 minutes;
+    /// the grace is 0-86400 seconds, also while the option is off. With the
+    /// option on, a grace below `oauth.leeway_secs` is a warning.
+    #[test]
+    fn session_token_expiry_defaults_and_bounds() {
+        let s = &parse(V2).unwrap().config.session;
+        assert!(!s.end_at_token_expiry);
+        assert_eq!(s.token_expiry_grace_secs, 300);
+
+        for (on, grace, leeway, warns) in [
+            (true, 60, 60, false),
+            (true, 86_400, 60, false),
+            (true, 59, 60, true),
+            (true, 0, 60, true),
+            (true, 0, 0, false),
+            (false, 0, 60, false),
+        ] {
+            let text = format!(
+                "{}[session]\nend_at_token_expiry = {on}\ntoken_expiry_grace_secs = {grace}\n",
+                V2.replace("[oauth]\n", &format!("[oauth]\nleeway_secs = {leeway}\n"))
+            );
+            assert!(text.contains("leeway_secs"), "V2 has no [oauth] line");
+            let l = parse(&text).unwrap();
+            assert!(l.errors.is_empty(), "{:?}", l.errors);
+            let id = format!("{on} {grace} {leeway}");
+            assert_eq!(
+                l.warnings.len(),
+                usize::from(warns),
+                "{id}: {:?}",
+                l.warnings
+            );
+            if warns {
+                assert_eq!(
+                    l.warnings[0],
+                    format!("session.token_expiry_grace_secs = {grace} is below oauth.leeway_secs = {leeway}: a token accepted within the leeway after its exp can end its session right after the login")
+                );
+            }
+            assert_eq!(l.config.session.end_at_token_expiry, on);
+            assert_eq!(l.config.session.token_expiry_grace_secs, grace);
+        }
+        for extra in [
+            "end_at_token_expiry = true\ntoken_expiry_grace_secs = 86401",
+            "token_expiry_grace_secs = 86401",
+        ] {
+            let e = errors_with(&format!("[session]\n{extra}\n"));
+            assert!(
+                e.contains("session.token_expiry_grace_secs must be between 0 and 86400"),
+                "{extra}: {e}"
+            );
+        }
+        assert!(errors_with("[session]\ntoken_expiry_grace_secs = -1\n").contains("parse"));
     }
 
     /// The backend profile: defaults are the behaviour of the short forms
