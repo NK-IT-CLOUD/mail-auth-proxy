@@ -33,6 +33,16 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   accepted before a reload that changed the endpoint's TLS or token is closed without an
   answer.
 
+### Security
+- Dependencies updated for RustSec advisories published after 0.7.0-rc.1: rustls 0.23.46
+  (RUSTSEC-2026-0346, -0347, -0348, -0349), rustls-webpki 0.103.16 (RUSTSEC-2026-0382) and
+  tokio 1.53.3 (RUSTSEC-2026-0386). Relevant here are the TLS client connections to the
+  backends and to the identity providers' JWKS endpoints: an unauthenticated ServerHello
+  could downgrade later connections to a classical key exchange (-0349), and certificate
+  verification could accept a distrusted intermediate (-0382). The proxy uses no ECH, no
+  custom client session store, no Brotli certificate compression and no `AsyncFd`, so the
+  other advisories do not apply to it.
+
 ## [0.6.0] - 2026-10-14
 
 ### Added
