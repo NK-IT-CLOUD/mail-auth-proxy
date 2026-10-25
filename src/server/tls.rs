@@ -336,9 +336,11 @@ const UNRECOGNIZED_NAME: [u8; 7] = [21, 3, 3, 0, 2, 2, 112];
 const NO_APPLICATION_PROTOCOL: [u8; 7] = [21, 3, 3, 0, 2, 2, 120];
 
 /// The protocol IDs of the IANA registry "TLS Application-Layer Protocol
-/// Negotiation (ALPN) Protocol IDs" (as of 2026-09-29), byte for byte, without
+/// Negotiation (ALPN) Protocol IDs" (as of 2026-10-25), byte for byte, without
 /// the GREASE values of RFC 8701, which a server must ignore. SMTP has no ID:
-/// on a submission listener each of these names another protocol.
+/// on a submission listener each of these names another protocol. A weekly
+/// CI job (`packaging/ci-alpn-registry.py`) compares the list with the
+/// registry; it reads this array one `b"…",` per line.
 const REGISTERED_ALPN: &[&[u8]] = &[
     b"http/0.9",
     b"http/1.0",
@@ -382,6 +384,7 @@ const REGISTERED_ALPN: &[&[u8]] = &[
     b"n-pamp/2",
     b"EoQ",
     b"snifq/1",
+    b"n-pamp/3",
 ];
 
 /// TLS for one listener with the certificates of a `CertStore`.

@@ -18,6 +18,11 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `WARN` line. Setting the key on a submission backend is a configuration error, since
   SMTP has no guard.
 
+### Changed
+- SMTP submission listeners: the refused ALPN IDs follow the IANA registry as of
+  2026-10-25, which adds `n-pamp/3`; a client that offers it now gets
+  `no_application_protocol` like for the other registered IDs.
+
 ## [0.7.0] - 2026-10-25
 
 ### Added
