@@ -39,6 +39,10 @@ jobs:
         run: |
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           [ -z "$CARGO_CACHE" ] || echo "CARGO_TARGET_DIR=$CARGO_CACHE/target" >> "$GITHUB_ENV"
+          # Jobs of other refs may share that target directory on the same runner host:
+          # a build there replaces the binaries a running test or check uses, so the
+          # steps that build and then run them hold this lock.
+          echo "TARGET_LOCK=${CARGO_CACHE:-$RUNNER_TEMP}/target.lock" >> "$GITHUB_ENV"
           "$HOME/.cargo/bin/rustup" show active-toolchain || "$HOME/.cargo/bin/rustup" toolchain install
           "$HOME/.cargo/bin/cargo" --version
 
@@ -49,12 +53,12 @@ jobs:
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Test
-        run: cargo test --locked
+        run: flock "$TARGET_LOCK" cargo test --locked
 
       - name: Release build
         run: |
-          cargo build --release --locked
-          bin=${CARGO_TARGET_DIR:-target}/release/mail-auth-proxy
+          bin=$RUNNER_TEMP/mail-auth-proxy
+          flock "$TARGET_LOCK" sh -c 'cargo build --release --locked && cp "${CARGO_TARGET_DIR:-target}/release/mail-auth-proxy" "$1"' sh "$bin"
           "$bin" --version
           sha256sum "$bin"
           echo "BIN=$bin" >> "$GITHUB_ENV"
