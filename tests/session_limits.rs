@@ -182,10 +182,11 @@ async fn token_expiry_ends_an_oauth_session() {
     ))
     .await;
     for kind in Kind::ALL {
-        let mut c = logged_in_with(&h, kind, &token_expiring_in(&h, 1)).await;
+        // exp has a resolution of one second: 2 leaves more than one second
+        // until exp, so the close comes at least the grace after the login.
+        let mut c = logged_in_with(&h, kind, &token_expiring_in(&h, 2)).await;
         let t0 = Instant::now();
         c.expect_closed().await;
-        // exp has a resolution of one second: at least the grace.
         let took = t0.elapsed();
         assert!(took >= Duration::from_millis(900), "{kind:?}: {took:?}");
         assert!(took < Duration::from_secs(4), "{kind:?}: {took:?}");
@@ -294,7 +295,9 @@ async fn password_sessions_and_the_default_ignore_token_expiry() {
         )
         .await;
     assert!(reply.starts_with("a OK"), "{reply}");
-    let mut oauth = logged_in_with(&h, Kind::Imap, &token_expiring_in(&h, 1)).await;
+    // exp has a resolution of one second and there is no grace: 2 leaves more
+    // than one second for the login and its NOOP, 1 might leave none.
+    let mut oauth = logged_in_with(&h, Kind::Imap, &token_expiring_in(&h, 2)).await;
     oauth.expect_closed().await;
     wait_metric(&h, &ended(Kind::Imap, "token_expired"), 1).await;
     tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -303,7 +306,7 @@ async fn password_sessions_and_the_default_ignore_token_expiry() {
 
     // The grace alone does nothing.
     let h = Harness::start_with(with_session("token_expiry_grace_secs = 0")).await;
-    let mut c = logged_in_with(&h, Kind::Imap, &token_expiring_in(&h, 1)).await;
+    let mut c = logged_in_with(&h, Kind::Imap, &token_expiring_in(&h, 2)).await;
     tokio::time::sleep(Duration::from_millis(2500)).await;
     c.send("late NOOP").await;
     assert_eq!(c.line().await, "ECHO late NOOP");
