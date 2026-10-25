@@ -2,7 +2,8 @@
 //!
 //! For IMAP and ManageSieve the client's commands pass the guard
 //! (`wire::guard`), which keeps the session from returning to the
-//! unauthenticated state; SMTP is relayed as it is. A limit can end a
+//! unauthenticated state, unless the backend has `post_login_guard = false`;
+//! SMTP is relayed as it is. A limit can end a
 //! session in the middle of a response: an IMAP or ManageSieve literal, or
 //! an SMTP multi-line reply, can hold any line. When a limit ends a session
 //! the proxy therefore sends no `* BYE`, `BYE` or `421` of its own (RFC 9051
@@ -28,8 +29,10 @@ const CLIENT: u8 = 1;
 const BACKEND: u8 = 2;
 
 /// Relay bytes both ways until either side closes or a `[session]` limit
-/// ends the session; record why it ended. `token_exp`: the `exp` (Unix
-/// seconds) of the token the client logged in with, `None` for a password.
+/// ends the session; record why it ended. `guarded`: IMAP and ManageSieve
+/// pass the command guard (SMTP has none, whatever it says). `token_exp`: the
+/// `exp` (Unix seconds) of the token the client logged in with, `None` for a
+/// password.
 /// A peer that disconnects without a TLS close_notify ends the relay with an
 /// error; that is the normal end of many sessions, so it counts as that
 /// peer's close and is not worth a warning.
@@ -37,6 +40,7 @@ pub async fn splice<A, B>(
     client: &mut A,
     backend: &mut B,
     proto: Proto,
+    guarded: bool,
     tuning: &Tuning,
     token_exp: Option<u64>,
 ) where
@@ -49,9 +53,9 @@ pub async fn splice<A, B>(
         .zip(token_exp)
         .and_then(|(grace, exp)| token_end(exp, grace));
     let dialect = match proto {
-        Proto::Imap => Some(Dialect::Imap),
-        Proto::Sieve => Some(Dialect::Sieve),
-        Proto::Smtp => None,
+        Proto::Imap if guarded => Some(Dialect::Imap),
+        Proto::Sieve if guarded => Some(Dialect::Sieve),
+        Proto::Imap | Proto::Sieve | Proto::Smtp => None,
     };
     let end = relay(
         client,
@@ -67,6 +71,23 @@ pub async fn splice<A, B>(
         tracing::info!(target: crate::obs::target::RELAY, proto = proto.label(), reason = end.label(),
             secs = start.elapsed().as_secs(), "session closed by limit");
     }
+}
+
+/// Whether an IMAP or ManageSieve session logged in to `backend` passes the
+/// command guard: unless the backend has `post_login_guard = false`, and
+/// even then when it advertised UNAUTHENTICATE in the capabilities the proxy
+/// read before the splice (`offers_unauthenticate`). Such a backend is not
+/// one that refuses the command, which is what the setting declares. Only a
+/// safety net: a backend may take UNAUTHENTICATE without offering it.
+pub fn session_guarded(backend: &crate::server::BackendConn, offers_unauthenticate: bool) -> bool {
+    if backend.guarded {
+        return true;
+    }
+    if offers_unauthenticate {
+        tracing::warn!(target: crate::obs::target::RELAY, backend = %backend.id, address = %backend.address,
+            "backend advertises UNAUTHENTICATE although post_login_guard = false; session relayed through the command guard");
+    }
+    offers_unauthenticate
 }
 
 /// An end the proxy chose by a `[session]` limit.
@@ -641,6 +662,38 @@ mod tests {
         );
         assert_eq!(token_end(0, Duration::ZERO), Some(UNIX_EPOCH));
         assert_eq!(token_end(u64::MAX, grace), None);
+    }
+
+    /// The guard is off only for a backend set to `false` that does not
+    /// advertise UNAUTHENTICATE.
+    #[test]
+    fn session_guarded_unless_off_and_not_offered() {
+        let cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let conn = |guarded| crate::server::BackendConn {
+            id: "imap".into(),
+            address: "192.0.2.10:993".into(),
+            name: rustls::pki_types::ServerName::try_from("backend.test").unwrap(),
+            tls: tokio_rustls::TlsConnector::from(std::sync::Arc::new(cfg.clone())),
+            client_ip: crate::config::ClientIp::None,
+            tls_mode: crate::config::BackendTls::Implicit,
+            auth_forward: crate::config::AuthForward::Xoauth2,
+            keepalive: Tuning::default().keepalive,
+            guarded,
+        };
+        for (guarded, offered, want) in [
+            (true, false, true),
+            (true, true, true),
+            (false, true, true),
+            (false, false, false),
+        ] {
+            assert_eq!(
+                session_guarded(&conn(guarded), offered),
+                want,
+                "{guarded} {offered}"
+            );
+        }
     }
 
     #[tokio::test]

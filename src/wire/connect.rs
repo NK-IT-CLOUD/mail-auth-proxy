@@ -123,6 +123,7 @@ mod tests {
             tls_mode: crate::config::BackendTls::Implicit,
             auth_forward: crate::config::AuthForward::Xoauth2,
             keepalive: crate::wire::Tuning::default().keepalive,
+            guarded: true,
         };
         let tcp = connect(&backend, None, Duration::from_secs(5), "sieve backend")
             .await
@@ -156,6 +157,7 @@ mod tests {
             tls_mode: crate::config::BackendTls::Implicit,
             auth_forward: crate::config::AuthForward::Xoauth2,
             keepalive: crate::wire::Tuning::default().keepalive,
+            guarded: true,
         };
         let client: SocketAddr = "192.0.2.7:40000".parse().unwrap();
         let local: SocketAddr = "[2001:db8::1]:993".parse().unwrap();

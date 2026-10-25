@@ -33,6 +33,14 @@ therefore needs:
 4. Only if the legacy gate is used: a passdb for passwords, and optionally the doveadm
    HTTP API for the account check.
 
+Dovecot's imap and Pigeonhole's managesieve processes, which take over after the login,
+have no `UNAUTHENTICATE`, `LOGIN` or `AUTHENTICATE`, and Postfix refuses a second `AUTH`.
+The command guard after login is therefore optional for these backends:
+`post_login_guard = false` on `[imap.backend]` and `[sieve.backend]` relays their
+sessions as they are, so IMAP `COMPRESS=DEFLATE` works and literals and `IDLE` cost no
+extra round trip ([protocols](protocols.md#without-the-guard-post_login_guard--false)).
+The default keeps the guard; `--check-config` warns about each backend without it.
+
 ## Dovecot
 
 ### Mechanisms and TLS

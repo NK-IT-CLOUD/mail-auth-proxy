@@ -164,6 +164,12 @@ pub struct Backend {
     pub doveadm_key_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doveadm_ca_file: Option<String>,
+    /// IMAP and ManageSieve: relay the sessions through the command guard
+    /// after login (`wire::guard`). Unset: on. `false` only for a backend
+    /// that refuses UNAUTHENTICATE and a second login itself; not on a
+    /// submission backend, which has no guard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_login_guard: Option<bool>,
 }
 
 /// An account check as configured: in `[legacy]` or on a backend.
@@ -197,6 +203,12 @@ impl Backend {
             key_file: self.doveadm_key_file.as_deref(),
             ca_file: self.doveadm_ca_file.as_deref(),
         })
+    }
+
+    /// Whether its IMAP or ManageSieve sessions pass the command guard:
+    /// unless `post_login_guard` is `false`, explicitly.
+    pub fn guarded(&self) -> bool {
+        self.post_login_guard != Some(false)
     }
 
     /// Whether any `doveadm_*` key is set.

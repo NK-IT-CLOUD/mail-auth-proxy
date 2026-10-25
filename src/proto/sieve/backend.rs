@@ -265,8 +265,9 @@ pub(super) struct SieveLogin<'a> {
 }
 
 impl BackendLogin for SieveLogin<'_> {
-    /// The backend connection and its OK line, relayed to the client.
-    type Conn = (TlsStream<TcpStream>, String);
+    /// The backend connection, its OK line, relayed to the client, and
+    /// whether the session passes the command guard (`wire::session_guarded`).
+    type Conn = (TlsStream<TcpStream>, String, bool);
 
     fn name(&self, index: usize) -> &str {
         &self.backends[index].pool.id
@@ -279,14 +280,21 @@ impl BackendLogin for SieveLogin<'_> {
     ) -> Result<Self::Conn, BackendError> {
         let pool = &self.backends[index].pool;
         // Up to the credential an address that fails gives way to the next.
-        let ((be, _caps), member) = pool
+        let ((be, caps), member) = pool
             .open(Some(credential.account()), |i| {
                 backend_session(&pool.members[i].conn, Some(self.origin), self.tuning)
             })
             .await?;
+        let conn = &pool.members[member].conn;
         let result = self
-            .authenticate(&pool.members[member].conn, be, credential)
-            .await;
+            .authenticate(conn, be, credential)
+            .await
+            .map(|(be, reply)| {
+                // RFC 5804 section 2.14.1: listed in the capabilities after
+                // TLS, those of this session.
+                let offered = caps.iter().any(|l| is_cap(l, "UNAUTHENTICATE"));
+                (be, reply, crate::wire::session_guarded(conn, offered))
+            });
         match &result {
             Ok(_) => pool.session(),
             Err(BackendError::Unavailable(_)) => pool.tempfail(member),
@@ -486,6 +494,7 @@ mod tests {
             tls_mode: BackendTls::Starttls,
             auth_forward: crate::config::AuthForward::Xoauth2,
             keepalive: Tuning::default().keepalive,
+            guarded: true,
         }
     }
 

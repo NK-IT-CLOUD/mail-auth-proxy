@@ -113,6 +113,19 @@ fn capability_code(resp: &str) -> Option<Vec<&str>> {
         .then(|| caps.split_ascii_whitespace().collect())
 }
 
+/// The capabilities of an untagged `* CAPABILITY …` response line, if `l`
+/// is one.
+fn untagged_capabilities(l: &str) -> Option<Vec<String>> {
+    l.get(..13)
+        .filter(|p| p.eq_ignore_ascii_case("* CAPABILITY "))
+        .map(|_| {
+            l[13..]
+                .split_ascii_whitespace()
+                .map(str::to_string)
+                .collect()
+        })
+}
+
 /// Ask the backend for its capabilities (`<tag> CAPABILITY`) after
 /// STARTTLS. The exchange is the proxy's own; the client never sees it.
 async fn query_capabilities(
@@ -136,12 +149,8 @@ async fn query_capabilities(
             }
             return Ok(caps);
         }
-        if let Some(list) = l
-            .get(..13)
-            .filter(|p| p.eq_ignore_ascii_case("* CAPABILITY "))
-            .map(|_| &l[13..])
-        {
-            caps.extend(list.split_ascii_whitespace().map(str::to_string));
+        if let Some(list) = untagged_capabilities(&l) {
+            caps.extend(list);
         }
     }
     Err(anyhow!(
@@ -198,16 +207,25 @@ fn classify_tagged(reply: &str, bad_is_verdict: bool) -> AuthReply {
 /// (RFC 9051 §6.2.2), which a compliant server answers with `BAD`: an
 /// outage, not a verdict. For a password a tagged `BAD` that is not the
 /// answer to such a cancel is a rejection (see `classify_tagged`).
+///
+/// The capabilities of an untagged `* CAPABILITY` response before the
+/// tagged reply (a server may announce its post-login list that way, RFC
+/// 9051 §7.2.2) are added to `caps`; the client never sees that response.
 async fn await_auth_ok(
     stream: &mut TlsStream<TcpStream>,
     idle: Duration,
     fwd: &Forwarded,
+    caps: &mut Vec<String>,
 ) -> Result<String, BackendError> {
     // Set once the error challenge is answered.
     let mut error_result: Option<Option<ErrorResult>> = None;
     let mut cancelled = false;
     for _ in 0..MAX_AUTH_LINES {
         let l = read_line(stream, idle).await?;
+        if let Some(list) = untagged_capabilities(&l) {
+            caps.extend(list);
+            continue;
+        }
         // An untagged BYE (connection limit, shutdown) stays an outage: the
         // backend closes whatever the credential; read_line reports the EOF.
         let password_verdict = fwd.token.is_none() && !cancelled;
@@ -257,8 +275,9 @@ pub struct ImapLogin<'a> {
 }
 
 impl BackendLogin for ImapLogin<'_> {
-    /// The backend connection and its tagged OK without the tag.
-    type Conn = (TlsStream<TcpStream>, String);
+    /// The backend connection, its tagged OK without the tag, and whether
+    /// the session passes the command guard (`wire::session_guarded`).
+    type Conn = (TlsStream<TcpStream>, String, bool);
 
     fn name(&self, index: usize) -> &str {
         &self.backends[index].id
@@ -285,14 +304,28 @@ impl BackendLogin for ImapLogin<'_> {
         }
         // Up to the credential an address that fails gives way to the next.
         let origin = Some((self.peer, self.local));
-        let ((stream, caps), member) = pool
+        let ((stream, mut caps), member) = pool
             .open(Some(credential.account()), |i| {
                 connect_tls(&pool.members[i].conn, origin, self.tuning)
             })
             .await?;
+        let conn = &pool.members[member].conn;
         let result = self
-            .authenticate(&pool.members[member].conn, stream, &caps, credential)
-            .await;
+            .authenticate(conn, stream, &mut caps, credential)
+            .await
+            .map(|(stream, ok)| {
+                // UNAUTHENTICATE (RFC 8437) is a capability of the
+                // authenticated state: in the login's CAPABILITY code or an
+                // untagged CAPABILITY response before it, or already in the
+                // list before the login.
+                let offered = caps
+                    .iter()
+                    .map(String::as_str)
+                    .chain(capability_code(&ok).unwrap_or_default())
+                    .any(|c| c.eq_ignore_ascii_case("UNAUTHENTICATE"));
+                let guarded = crate::wire::session_guarded(conn, offered);
+                (stream, ok, guarded)
+            });
         match &result {
             Ok(_) => pool.session(),
             Err(BackendError::Unavailable(_)) => pool.tempfail(member),
@@ -305,11 +338,13 @@ impl BackendLogin for ImapLogin<'_> {
 impl ImapLogin<'_> {
     /// The login on a connection to `backend` that offers `caps`: never
     /// retried on another address, a credential goes to one server once.
+    /// Capabilities the backend announces during the login are added to
+    /// `caps`.
     async fn authenticate(
         &self,
         backend: &BackendConn,
         mut stream: TlsStream<TcpStream>,
-        caps: &[String],
+        caps: &mut Vec<String>,
         credential: BackendCredential<'_>,
     ) -> Result<(TlsStream<TcpStream>, String), BackendError> {
         let sasl_ir = caps.iter().any(|c| c.eq_ignore_ascii_case("SASL-IR"));
@@ -341,8 +376,9 @@ impl ImapLogin<'_> {
                 .await?;
         }
         // UNAUTHENTICATE (RFC 8437), offered or not, is kept from the backend
-        // by the relay's guard (`wire::guard`).
-        let ok = await_auth_ok(&mut stream, self.tuning.idle, &fwd).await?;
+        // by the relay's guard (`wire::guard`), unless the backend has
+        // `post_login_guard = false` (`ImapLogin::login`).
+        let ok = await_auth_ok(&mut stream, self.tuning.idle, &fwd, caps).await?;
         Ok((stream, ok))
     }
 }

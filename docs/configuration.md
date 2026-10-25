@@ -72,6 +72,8 @@ The file is strict. Startup fails, and `--check-config` reports, when:
   short forms, or `client_ip = "xclient"` is set on the IMAP or ManageSieve backend
   (XCLIENT is an SMTP extension); a backend whose `client_ip` is `none`, set or by default,
   is a warning;
+- a submission backend sets `post_login_guard` (SMTP has no command guard); an IMAP or
+  ManageSieve backend with `post_login_guard = false` is a warning;
 - a protocol section has neither a `backend` nor a route that serves it, or both; a
   `backend` name or a route's `imap`/`submission`/`sieve` names no `[backends]` entry; a
   `[backends]` entry is used by two protocols, is named `imap`, `submission` or `sieve`
@@ -208,6 +210,7 @@ key over (`yes`) or it needs a restart ([Reload](#reload)).
 | backend `.proxy_protocol` | bool | `false` | yes | short form of `client_ip = "proxy_v2"`; `--print-config` shows `client_ip` |
 | backend `.account_check` | `none` \| `doveadm` | that of `[legacy]` | yes | the legacy gate's account check for passwords routed to this backend: none, or a doveadm userdb lookup with this backend's `doveadm_url`, `doveadm_key_file` and `doveadm_ca_file` (the same rules as the `legacy.doveadm_*` keys), one for all the backend's `addresses`. With several backends behind a protocol, one that inherits `legacy.account_check = "doveadm"` gives a warning: that doveadm would judge the other mail systems' accounts too |
 | backend `.doveadm_url`, `.doveadm_key_file`, `.doveadm_ca_file` | | none | yes | as `legacy.doveadm_*`, for the backend's own `account_check = "doveadm"` |
+| backend `.post_login_guard` | bool | `true` | yes | IMAP and ManageSieve: relay the sessions logged in to this backend through the command guard, which keeps `UNAUTHENTICATE`, a second login, `STARTTLS` and IMAP `COMPRESS` from it ([protocols](protocols.md#imap-and-managesieve-after-login)). `false` relays them as they are (`COMPRESS` works, no round trip per literal), for a backend that refuses those commands itself, such as Dovecot and Pigeonhole, never Stalwart; warning. One value for all the backend's `addresses`; a backend set to `false` that advertises `UNAUTHENTICATE` gets the guard all the same ([without the guard](protocols.md#without-the-guard-post_login_guard--false)). Not on a submission backend: SMTP has no guard. A reload applies to the sessions that log in after it |
 | `oauth.refresh_secs` | integer | 300 | yes | periodic JWKS refresh; 1-86400. Unknown key ids trigger a refresh sooner, but a key removed from the JWKS is dropped only by this one |
 | `oauth.leeway_secs` | integer | 60 | yes | clock skew on `exp`/`nbf`; 0-300 (RFC 7519 §4.1.4 allows a small leeway, "usually no more than a few minutes") |
 | `oauth.issuers[].issuer` | string | required | yes | exact `iss`; keys from this issuer's JWKS are accepted only with it |
@@ -359,6 +362,11 @@ The account check belongs to the backend, not to an address: one `account_check`
 `doveadm_url` for all its addresses, which serve the same mailboxes from one userdb. The
 doveadm endpoint is not part of the pool: it is neither failed over nor health-checked, and
 while it is unreachable password logins to the backend are outages.
+
+So does `post_login_guard`: there is no per-address setting, so a pool cannot mix
+addresses with and without the guard, and a login that fails over relays its session
+the same way. Put only servers that refuse `UNAUTHENTICATE` and a second login into a
+pool set to `false`.
 
 A reload keeps the health of each address the backend keeps, and the counters of a backend
 that keeps its name.

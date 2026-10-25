@@ -608,6 +608,9 @@ pub struct MockBackend {
     /// IMAP: the tagged OK of a login carries no CAPABILITY code; the list
     /// comes as the answer to `P2 CAPABILITY`.
     pub caps_untagged: Arc<AtomicBool>,
+    /// IMAP: an untagged `* CAPABILITY` response with this list before the
+    /// tagged reply of a successful login (RFC 9051 §7.2.2).
+    pub announced_caps: Arc<Mutex<Option<String>>>,
     /// IMAP: the greeting does not advertise SASL-IR, and an AUTHENTICATE
     /// with an initial response gets BAD (RFC 4959 §3).
     pub no_sasl_ir: Arc<AtomicBool>,
@@ -655,6 +658,8 @@ impl MockBackend {
         let caps = login_caps.clone();
         let caps_untagged: Arc<AtomicBool> = Arc::default();
         let untagged = caps_untagged.clone();
+        let announced_caps: Arc<Mutex<Option<String>>> = Arc::default();
+        let announced = announced_caps.clone();
         let no_sasl_ir: Arc<AtomicBool> = Arc::default();
         let no_ir = no_sasl_ir.clone();
         let smtp_ehlo: Arc<Mutex<Option<Vec<String>>>> = Arc::default();
@@ -683,6 +688,7 @@ impl MockBackend {
                     xclient_sticky: sticky.load(Ordering::SeqCst),
                     login_caps: caps.lock().unwrap().clone(),
                     caps_untagged: untagged.load(Ordering::SeqCst),
+                    announced_caps: announced.lock().unwrap().clone(),
                     no_sasl_ir: no_ir.load(Ordering::SeqCst),
                     smtp_ehlo: ehlo.lock().unwrap().clone(),
                     mode,
@@ -706,6 +712,7 @@ impl MockBackend {
             xclient_sticky,
             login_caps,
             caps_untagged,
+            announced_caps,
             no_sasl_ir,
             smtp_ehlo,
             refuse,
@@ -752,6 +759,8 @@ struct Rec {
     login_caps: Option<String>,
     /// `MockBackend::caps_untagged` when the connection was accepted.
     caps_untagged: bool,
+    /// `MockBackend::announced_caps` when the connection was accepted.
+    announced_caps: Option<String>,
     /// `MockBackend::no_sasl_ir` when the connection was accepted.
     no_sasl_ir: bool,
     /// `MockBackend::smtp_ehlo` when the connection was accepted.
@@ -1089,6 +1098,10 @@ async fn mock_imap(
             format!("{tag} NO [UNAVAILABLE] Temporary authentication failure.")
         }
     };
+    if let (Verdict::Ok, Some(announced)) = (v, &rec.announced_caps) {
+        s.write_all(format!("* CAPABILITY {announced}\r\n").as_bytes())
+            .await?;
+    }
     s.write_all(format!("{reply}\r\n").as_bytes()).await?;
     if verdict(&login) != Verdict::Ok {
         return Ok(());

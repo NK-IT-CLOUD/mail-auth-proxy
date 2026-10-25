@@ -428,6 +428,7 @@ mod tests {
             tls_mode: crate::config::BackendTls::Implicit,
             auth_forward: crate::config::AuthForward::Xoauth2,
             keepalive: crate::wire::Tuning::default().keepalive,
+            guarded: true,
         }
     }
 

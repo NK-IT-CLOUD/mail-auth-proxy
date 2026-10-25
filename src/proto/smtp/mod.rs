@@ -431,7 +431,9 @@ async fn serve(
                         .write_all(b"235 2.7.0 Authentication successful\r\n")
                         .await?;
                     tracing::info!(target: crate::obs::target::SUBMISSION, user=%crate::obs::authlog::sanitize(&identity), mech=%mech, issuer=%issuer.as_deref().unwrap_or(""), "submission auth ok; splicing");
-                    crate::wire::splice(&mut client_tls, &mut be, Proto::Smtp, &ctx.tuning, token_exp)
+                    // No command guard for SMTP: the backend refuses a
+                    // second AUTH (RFC 4954 section 4).
+                    crate::wire::splice(&mut client_tls, &mut be, Proto::Smtp, false, &ctx.tuning, token_exp)
                         .await;
                     return Ok(());
                 }

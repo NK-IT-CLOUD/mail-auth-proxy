@@ -61,6 +61,7 @@ auth_forward = "oauthbearer"
   takes it on ManageSieve too. This does not stand in the way: the proxy takes the
   capability out of what it relays and answers the command itself, so it never reaches
   Stalwart, offered or not ([protocols](protocols.md#imap-and-managesieve-after-login)).
+  It relies on the guard: never set `post_login_guard = false` on a Stalwart backend.
 - The `LOCAL` PROXY header of the proxy's own ManageSieve and EHLO probes.
 - The OAUTHBEARER error result Stalwart sends for a rejected token, and whether it checks
   the GS2 authzid, `host` and `port` the proxy sends.

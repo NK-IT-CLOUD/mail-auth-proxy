@@ -137,7 +137,7 @@ pub async fn handle(
             let unavailable = matches!(outcome, auth::Outcome::Unavailable(_));
             let (reply, error) = match outcome {
                 auth::Outcome::Ok {
-                    conn: (mut be, logged_in),
+                    conn: (mut be, logged_in, guarded),
                     token_exp,
                     ..
                 } => {
@@ -146,15 +146,19 @@ pub async fn handle(
                     // CAPABILITY response code is what the client may cache for the
                     // session (RFC 9051 section 7.1), so it must list the backend's real
                     // post-login capabilities, less those the relay's guard keeps
-                    // from the backend.
+                    // from the backend. Without the guard: all of them.
                     let ok = format!("{tag} {logged_in}\r\n");
-                    client
-                        .write_all(&wire::guard::imap_response(ok.as_bytes()))
-                        .await?;
+                    let ok = if guarded {
+                        wire::guard::imap_response(ok.as_bytes())
+                    } else {
+                        ok.into_bytes()
+                    };
+                    client.write_all(&ok).await?;
                     wire::splice(
                         &mut client,
                         &mut be,
                         metrics::Proto::Imap,
+                        guarded,
                         tuning,
                         token_exp,
                     )

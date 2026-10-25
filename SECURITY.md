@@ -9,7 +9,7 @@ Only the latest release receives security fixes. Upgrade older releases.
 The proxy sits on a public edge in front of an IMAP, ManageSieve and SMTP submission
 backend (for example Dovecot and Postfix). It terminates client TLS, decides how a client
 may authenticate, logs in to the backend with the client's **own** credential and then
-relays the session (IMAP and ManageSieve through a command guard, invariant 4). It never holds a master password or any other credential of its own.
+relays the session (IMAP and ManageSieve through a command guard unless a backend is set to `post_login_guard = false`, invariant 4). It never holds a master password or any other credential of its own.
 
 ### Trust boundaries
 
@@ -53,7 +53,7 @@ relays the session (IMAP and ManageSieve through a command guard, invariant 4). 
 | Log injection | client text escaped or reduced to a fixed character set in every log field |
 | A rogue or intercepted backend | backend TLS always verified; no option to disable it |
 | An authenticated SMTP client sending its own `XCLIENT` to impersonate another user | the proxy never relays into a session in which the backend still offers `XCLIENT`. A backend that advertises it while the submission backend's `client_ip` is not `xclient`, or still advertises it after the proxy's own `XCLIENT` (the client's address is itself authorized), is treated as misconfigured, and the login fails as an outage |
-| A logged-in client returning to the unauthenticated state (`UNAUTHENTICATE`, RFC 8437, RFC 5804 §2.14.1) or presenting a second credential, to try passwords directly at the backend | the relay's command guard keeps these commands from the backend whatever it offers or does, and takes `UNAUTHENTICATE` out of the capabilities it relays (invariant 4) |
+| A logged-in client returning to the unauthenticated state (`UNAUTHENTICATE`, RFC 8437, RFC 5804 §2.14.1) or presenting a second credential, to try passwords directly at the backend | the relay's command guard keeps these commands from the backend whatever it offers or does, and takes `UNAUTHENTICATE` out of the capabilities it relays (invariant 4); on by default, off only for a backend the operator sets to `post_login_guard = false` (see [Operator responsibilities](#operator-responsibilities)) |
 | Bans of legitimate users during an outage | outages are answered with retry-later and never logged as failed logins |
 | One issuer asserting identities that belong to another | `oauth.issuers[].identity_domains`: an issuer logs in only to addresses in its domains. Without it, all issuers share one identity namespace, so an account name valid at issuer A can be asserted by issuer B; with more than one issuer the configuration warns about each issuer without it ([D-JWT-3](docs/standards.md#d-jwt-3-identity-namespace-across-issuers)) |
 
@@ -125,6 +125,14 @@ relays the session (IMAP and ManageSieve through a command guard, invariant 4). 
    the proxy relays. SMTP has no such command: a second `AUTH` must be refused by the
    backend (RFC 4954 §4; Postfix answers `503 5.5.1 Error: already authenticated`).
 
+   The guard is on for every IMAP and ManageSieve backend unless the configuration sets
+   `post_login_guard = false` on it, explicitly; that backend then carries the invariant
+   itself, as the submission backend does. The setting is the backend's, read from the
+   backend the login went to and the same for all its addresses. A backend set to `false`
+   that advertises `UNAUTHENTICATE` in the capabilities the login reads is relayed
+   through the guard all the same. `--check-config` warns about every backend with the
+   guard off.
+
 ### Hardening
 
 - Pre-authentication limits: a global connection cap (at most half unauthenticated), a
@@ -193,6 +201,14 @@ relays the session (IMAP and ManageSieve through a command guard, invariant 4). 
   login without looking at it. IMAP and ManageSieve need nothing of the kind: the relay
   keeps `UNAUTHENTICATE` and a second login from the backend (invariant 4), so a backend
   that offers `UNAUTHENTICATE`, such as Stalwart, can be used.
+- **`post_login_guard = false`.** Set it only on a backend you know refuses
+  `UNAUTHENTICATE`, `AUTHENTICATE` and (IMAP) `LOGIN` after a login, on every address
+  of the backend and after every upgrade, as Dovecot and Pigeonhole do. On a backend
+  that takes one of them, a logged-in client can return to the unauthenticated state
+  and try passwords for any account directly at the backend, where the legacy gate,
+  the throttle and the rate limit do not see them; only the backend's own limits and
+  logs remain. Never set it on Stalwart. What it buys: IMAP `COMPRESS`, literals and
+  `IDLE` without the guard's round trips.
 - **Audiences.** Give the mail audience only to mail clients. Any token with an accepted
   audience, issuer and identity opens that mailbox.
 - **`token_type = "any"`** also accepts ID tokens that carry an accepted audience; use it

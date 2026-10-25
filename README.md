@@ -51,7 +51,8 @@ accepts a password only where a rule allows it.
 3. It logs in to the backend with the same credential, passing the real client address
    (PROXY protocol v2 for Dovecot, XCLIENT for Postfix), and relays the session until
    either side closes. IMAP and ManageSieve commands pass a guard that keeps
-   `UNAUTHENTICATE` and a second login from the backend.
+   `UNAUTHENTICATE` and a second login from the backend (per backend
+   `post_login_guard`, on unless set to `false`).
 
 > [!IMPORTANT]
 > The backend must still validate the forwarded token itself; the proxy does not replace
@@ -288,7 +289,9 @@ forwarded token itself and speaks the standard dialogs; the backend profile
   (`[session]`); TCP keepalive is on. A session does not end when its token expires.
 - ManageSieve `LOGIN` is not supported.
 - After login, IMAP and ManageSieve clients cannot use `UNAUTHENTICATE`, a second login,
-  `STARTTLS` or IMAP `COMPRESS`; an IMAP literal costs one round trip.
+  `STARTTLS` or IMAP `COMPRESS`; an IMAP literal costs one round trip. A backend that
+  refuses `UNAUTHENTICATE` and a second login itself can be set to
+  `post_login_guard = false`, which relays its sessions as they are.
 - The SMTP `EHLO` list is the backend's as the proxy's own probe sees it, cached for
   `submission.capability_cache_secs`; extensions the proxy does not handle are left out.
 - Connections closed by a connection limit, a failed-login block or a timeout get no

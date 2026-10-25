@@ -38,6 +38,7 @@
 "identity_claim = "
 "internal_networks = "
 "account_check = "
+"post_login_guard = "
 "allowed_algorithms = "
 "allowed_clients = "
 "allowed_domains = "

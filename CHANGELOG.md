@@ -6,6 +6,18 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Backend key `post_login_guard` (default `true`). `false` relays the IMAP and ManageSieve
+  sessions of that backend after login without the command guard, as SMTP is relayed:
+  IMAP `COMPRESS=DEFLATE` works again, literals and `IDLE` no longer wait for the
+  backend, and the capabilities are passed on unchanged. Only for backends that refuse
+  `UNAUTHENTICATE` and a second login themselves (Dovecot, Pigeonhole), never Stalwart;
+  `--check-config` warns about every backend with the guard off. The setting holds for
+  all addresses of a pool and for the backend a login is routed to; a backend set to
+  `false` that advertises `UNAUTHENTICATE` is still relayed through the guard, with a
+  `WARN` line. Setting the key on a submission backend is a configuration error, since
+  SMTP has no guard.
+
 ## [0.7.0] - 2026-10-25
 
 ### Added

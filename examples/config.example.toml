@@ -31,6 +31,9 @@ key = "/path/to/privkey.pem"                  # readable by group mail-auth-prox
 #   client_ip    = "proxy_v2" | "xclient" | "none"   how the backend learns the client
 #                  address (xclient: submission only; none: the backend sees only the proxy)
 #   auth_forward = "xoauth2" | "oauthbearer"    how a validated token is forwarded
+#   post_login_guard = true | false             IMAP, ManageSieve: the command guard after
+#                  login (default true); false only for a backend that refuses
+#                  UNAUTHENTICATE and a second login itself (warning; not for submission)
 # Examples for Dovecot + Postfix and for Stalwart: examples/config.dovecot-postfix.toml
 # and examples/config.stalwart.toml in the source repository.
 

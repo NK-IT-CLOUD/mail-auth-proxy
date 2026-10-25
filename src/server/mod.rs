@@ -44,6 +44,9 @@ pub struct BackendConn {
     pub auth_forward: config::AuthForward,
     /// TCP keepalive of every connection to this backend.
     pub keepalive: crate::wire::Keepalive,
+    /// IMAP and ManageSieve: the session after login passes the command
+    /// guard (`post_login_guard`, the same for every address of a backend).
+    pub guarded: bool,
 }
 
 impl BackendConn {
@@ -73,6 +76,7 @@ impl BackendConn {
             tls_mode: b.tls.unwrap_or(default_tls),
             auth_forward: b.auth_forward,
             keepalive,
+            guarded: b.guarded(),
         })
     }
 

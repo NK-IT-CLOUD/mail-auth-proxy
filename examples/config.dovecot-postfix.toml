@@ -24,6 +24,10 @@ verify_name = "imap.example.org"
 tls = "implicit"
 client_ip = "proxy_v2"
 auth_forward = "xoauth2"                   # what the production setup uses; oauthbearer is untested with Dovecot
+# Dovecot's imap process has no UNAUTHENTICATE, LOGIN or AUTHENTICATE after the
+# login, so the command guard may be turned off for COMPRESS and fewer round
+# trips (a warning; docs/protocols.md, "Without the guard"). Same for [sieve.backend].
+# post_login_guard = false
 
 # Postfix submission (587, STARTTLS) with the proxy in
 # smtpd_authorized_xclient_hosts. Clients may use 465 as well: the proxy's own

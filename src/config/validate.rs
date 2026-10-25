@@ -504,6 +504,7 @@ impl Config {
                     warnings,
                 );
                 check_backend_address(&key, used.backend, err);
+                check_post_login_guard(&key, used.backend, protocol, err, warnings);
             }
         }
         for (name, b) in &self.backends {
@@ -790,6 +791,34 @@ fn check_client_ip(
             if submission { " or \"xclient\"" } else { "" }
         )),
         _ => {}
+    }
+}
+
+/// `post_login_guard` of the backend `name` against its protocol: the
+/// submission relay has no guard, so the key there would promise something
+/// that does not exist; off for IMAP or ManageSieve is a warning.
+fn check_post_login_guard(
+    name: &str,
+    b: &Backend,
+    protocol: Protocol,
+    err: &mut impl FnMut(String),
+    warnings: &mut Vec<String>,
+) {
+    match (protocol, b.post_login_guard) {
+        (_, None) | (Protocol::Imap | Protocol::Sieve, Some(true)) => {}
+        (Protocol::Submission, Some(_)) => err(format!(
+            "{name}.post_login_guard applies to IMAP and ManageSieve only: submission sessions are relayed without a guard, the backend must refuse a second AUTH (RFC 4954 section 4)"
+        )),
+        (Protocol::Imap | Protocol::Sieve, Some(false)) => {
+            let (proto, second) = if protocol == Protocol::Imap {
+                ("IMAP", "AUTHENTICATE or LOGIN")
+            } else {
+                ("ManageSieve", "AUTHENTICATE")
+            };
+            warnings.push(format!(
+                "{name}: post_login_guard = false relays {proto} sessions after login without the command guard: if the backend takes UNAUTHENTICATE or a second {second}, a logged-in client can try passwords for any account directly at the backend, past the legacy gate, the throttle and the rate limit; only for a backend known to refuse them"
+            ))
+        }
     }
 }
 
@@ -2526,5 +2555,90 @@ mod tests {
             let e = errors_of(&with(keys));
             assert!(e.contains(expect), "want {expect:?}, got {e}");
         }
+    }
+
+    /// `post_login_guard`: unset and `true` are on, only `false` is off
+    /// (a warning for IMAP and ManageSieve); the key is refused on a
+    /// submission backend, which has no guard; a pool has one setting for
+    /// all its addresses; the printed form keeps it.
+    #[test]
+    fn backend_post_login_guard() {
+        let imap = |keys: &str| {
+            V2.replace(
+                "client_ip = \"proxy_v2\" }",
+                &format!("client_ip = \"proxy_v2\"{keys} }}"),
+            )
+        };
+        let warned = |l: &crate::config::Loaded| {
+            l.warnings
+                .iter()
+                .filter(|w| w.contains("post_login_guard"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for (keys, on) in [
+            ("", true),
+            (", post_login_guard = true", true),
+            (", post_login_guard = false", false),
+        ] {
+            let l = parse(&imap(keys)).unwrap();
+            let b = inline(&l.config.imap.backend);
+            assert_eq!(b.guarded(), on, "{keys:?}");
+            let again = parse(&toml::to_string(&l.config).unwrap()).unwrap();
+            assert_eq!(again.config.imap.backend, l.config.imap.backend);
+            assert_eq!(warned(&l).len(), usize::from(!on), "{:?}", l.warnings);
+        }
+        let l = parse(&imap(", post_login_guard = false")).unwrap();
+        assert_eq!(
+            warned(&l),
+            ["imap.backend: post_login_guard = false relays IMAP sessions after login without the command guard: if the backend takes UNAUTHENTICATE or a second AUTHENTICATE or LOGIN, a logged-in client can try passwords for any account directly at the backend, past the legacy gate, the throttle and the rate limit; only for a backend known to refuse them"]
+        );
+        // Unset prints nothing: the default is not written out.
+        assert!(!toml::to_string(&parse(&imap("")).unwrap().config)
+            .unwrap()
+            .contains("post_login_guard"));
+        // One setting for every address of a pool.
+        let pool = imap(", post_login_guard = false").replace(
+            "address = \"192.0.2.10:993\"",
+            "addresses = [\"192.0.2.10:993\", \"192.0.2.11:993\"]",
+        );
+        assert!(!inline(&parse(&pool).unwrap().config.imap.backend).guarded());
+        // ManageSieve: the same warning for its commands.
+        let sieve = |v: &str| {
+            format!("{V2}[sieve]\nlisten = \"0.0.0.0:4190\"\nbackend = {{ address = \"192.0.2.10:4190\", client_ip = \"proxy_v2\", post_login_guard = {v} }}\n")
+        };
+        let l = parse(&sieve("false")).unwrap();
+        assert!(
+            warned(&l).iter().any(|w| w.starts_with(
+                "sieve.backend: post_login_guard = false relays ManageSieve sessions"
+            ) && w.contains("a second AUTHENTICATE, a logged-in client")),
+            "{:?}",
+            l.warnings
+        );
+        assert!(warned(&parse(&sieve("true")).unwrap()).is_empty());
+        // Submission has no guard: the key is an error, either value, on an
+        // inline or a named backend.
+        for v in ["false", "true"] {
+            let inline_smtp = format!("{V2}[submission]\nlisten = \"0.0.0.0:587\"\nbackend = {{ address = \"192.0.2.10:587\", client_ip = \"xclient\", post_login_guard = {v} }}\n");
+            assert!(
+                errors_of(&inline_smtp).contains(
+                    "submission.backend.post_login_guard applies to IMAP and ManageSieve only"
+                ),
+                "{}",
+                errors_of(&inline_smtp)
+            );
+            let named_smtp = format!("{V2}[submission]\nlisten = \"0.0.0.0:587\"\nbackend = \"relay\"\n[backends.relay]\naddress = \"192.0.2.10:587\"\nclient_ip = \"xclient\"\npost_login_guard = {v}\n");
+            assert!(
+                errors_of(&named_smtp).contains(
+                    "backends.relay.post_login_guard applies to IMAP and ManageSieve only"
+                ),
+                "{}",
+                errors_of(&named_smtp)
+            );
+        }
+        // Strict: a misspelling or another type is refused.
+        assert!(parse(&imap(", post_login_gaurd = false")).is_err());
+        assert!(parse(&imap(", post_login_guard = \"false\"")).is_err());
+        assert!(parse(&imap(", post_login_guard = 0")).is_err());
     }
 }

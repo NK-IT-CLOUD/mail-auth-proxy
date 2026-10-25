@@ -7,7 +7,7 @@ pub mod line;
 pub mod proxyproto;
 mod relay;
 
-pub use relay::splice;
+pub use relay::{session_guarded, splice};
 
 use anyhow::{anyhow, Result};
 use std::time::Duration;

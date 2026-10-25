@@ -21,7 +21,8 @@
 # (192.0.2.20: the proxy's address as Stalwart sees it.)
 #
 # Stalwart offers RFC 8437 (IMAP UNAUTHENTICATE); the proxy keeps the command
-# from it and does not relay the capability.
+# from it and does not relay the capability. Keep post_login_guard at its
+# default (true) on every Stalwart backend.
 
 config_version = 2
 
