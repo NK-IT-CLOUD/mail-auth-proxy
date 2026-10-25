@@ -78,6 +78,17 @@ cargo deny check                               # advisories, licenses, sources (
 access and no root. `HARNESS_LOGS=1 cargo test -- --nocapture` prints the proxy's log of
 each test.
 
+The ALPN IDs the submission listeners refuse (`REGISTERED_ALPN` in `src/server/tls.rs`)
+are a copy of the IANA ALPN registry. The workflow `.github/workflows/alpn-registry.yml`
+compares them with the registry once a week (Monday 05:00 UTC) and on manual start, and
+fails with the IDs to add or remove; locally:
+
+```bash
+curl -fsSL -o /tmp/alpn.csv \
+    https://www.iana.org/assignments/tls-extensiontype-values/alpn-protocol-ids.csv
+packaging/ci-alpn-registry.py /tmp/alpn.csv src/server/tls.rs
+```
+
 If you change `contrib/crowdsec/`, run its hubtest cases as described in
 [contrib/crowdsec/README.md](contrib/crowdsec/README.md#tests). Release packages are built by
 `packaging/build.sh` in a digest-pinned container; you do not need it for a change.

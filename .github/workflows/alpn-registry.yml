@@ -1,0 +1,32 @@
+# Weekly check that REGISTERED_ALPN in src/server/tls.rs (the ALPN IDs the
+# submission listeners refuse) still matches the IANA registry "TLS ALPN
+# Protocol IDs": fails with the IDs to add or remove (packaging/ci-alpn-registry.py).
+# Scheduled runs only on the maintainer's Gitea (repository variable CI_RUNNER),
+# so a registry change is reported in one place; elsewhere only when started by
+# hand.
+name: ALPN registry
+on:
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  alpn-registry:
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
+    if: vars.CI_RUNNER != '' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compare with the IANA registry
+        run: |
+          set -euo pipefail
+          csv=$RUNNER_TEMP/alpn-protocol-ids.csv
+          curl -fsSL --proto '=https' --retry 3 -o "$csv" \
+            https://www.iana.org/assignments/tls-extensiontype-values/alpn-protocol-ids.csv
+          python3 -I packaging/ci-alpn-registry.py "$csv" src/server/tls.rs
