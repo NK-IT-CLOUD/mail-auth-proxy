@@ -6,7 +6,7 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.7.0] - 2026-10-14
+## [0.7.0] - 2026-10-25
 
 ### Added
 - Metrics endpoint over HTTPS with a bearer token: `metrics.tls_cert` and `metrics.tls_key`
