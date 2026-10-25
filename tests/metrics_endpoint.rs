@@ -315,6 +315,19 @@ async fn tls_and_bearer_token() {
     std::fs::copy(&h.pki.proxy_key, &key).unwrap();
     let broken = format!("{}\nunknown_key = 1\n", h.config(&opts));
     h.proxy.reload(&broken).await.unwrap_err();
+    // The refusal is logged after the files are taken over, so a scrape that
+    // follows it is not accepted under settings being replaced (no answer).
+    let logs = h.proxy.logs();
+    let outcome = |l: &String| l.contains("reload: configuration ");
+    let refused = logs.iter().rposition(outcome).unwrap();
+    let before = logs[..refused].iter().rposition(outcome).unwrap();
+    for file in ["metrics certificate loaded", "metrics bearer token loaded"] {
+        assert!(
+            logs[before..refused].iter().any(|l| l.contains(file)),
+            "{file} not before the refusal:\n{}",
+            logs.join("\n")
+        );
+    }
     let (resp, der) = get(scrape_with(THIRD)).await.unwrap();
     assert_eq!(status(&resp), "HTTP/1.1 200 OK", "{resp}");
     assert_eq!(der, h.pki.proxy_der);

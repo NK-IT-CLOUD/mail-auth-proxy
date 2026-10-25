@@ -41,15 +41,16 @@ pub(super) async fn run(
             Ok(()) => metrics::record_config_reload(true),
             Err(e) => {
                 metrics::record_config_reload(false);
-                // One line: a TOML error spans several.
-                let error = crate::obs::authlog::escape(&format!("{e:#}"));
-                tracing::error!(target: crate::obs::target::MAIN, path=%path, error=%error,
-                    "reload: configuration not loaded; the one in use stays");
                 let in_use = current.borrow().clone();
                 reload_certificates(&in_use.certs);
                 if let Some(access) = &metrics_access {
                     reload_metrics_files(&in_use.config.metrics, access);
                 }
+                // Last, as on success: once this line is out, the reload is done.
+                // One line: a TOML error spans several.
+                let error = crate::obs::authlog::escape(&format!("{e:#}"));
+                tracing::error!(target: crate::obs::target::MAIN, path=%path, error=%error,
+                    "reload: configuration not loaded; the one in use stays");
             }
         }
         let validator = current.borrow().shared.validator.clone();

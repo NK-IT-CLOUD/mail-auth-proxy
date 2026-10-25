@@ -23,6 +23,12 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   2026-10-25, which adds `n-pamp/3`; a client that offers it now gets
   `no_application_protocol` like for the other registered IDs.
 
+### Fixed
+- A refused reload (`SIGHUP`) now logs `reload: configuration not loaded` after the
+  certificates and the metrics token are re-read, as a loaded one does: a metrics scrape
+  that followed the line could be accepted under the settings being replaced and closed
+  unanswered. `docs/operations.md` lists the reload lines in their actual order.
+
 ## [0.7.0] - 2026-10-25
 
 ### Added
