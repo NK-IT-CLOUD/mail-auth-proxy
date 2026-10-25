@@ -34,8 +34,12 @@ therefore needs:
    HTTP API for the account check.
 
 Dovecot's imap and Pigeonhole's managesieve processes, which take over after the login,
-have no `UNAUTHENTICATE`, `LOGIN` or `AUTHENTICATE`, and Postfix refuses a second `AUTH`.
-The command guard after login is therefore optional for these backends:
+have no `UNAUTHENTICATE`, `LOGIN` or `AUTHENTICATE` (nor `STARTTLS`): they answer them as
+unknown commands, IMAP with `BAD Error in IMAP command LOGIN: Unknown command …`,
+ManageSieve with `NO "Error in MANAGESIEVE command AUTHENTICATE: Unknown command."`.
+Postfix refuses a second `AUTH`. Checked in the source and in a session for Dovecot 2.4.5
+and Pigeonhole 2.4.5; check again after an upgrade ([checking the
+setup](#checking-the-setup)). The command guard after login is therefore optional for these backends:
 `post_login_guard = false` on `[imap.backend]` and `[sieve.backend]` relays their
 sessions as they are, so IMAP `COMPRESS=DEFLATE` works and literals and `IDLE` cost no
 extra round trip ([protocols](protocols.md#without-the-guard-post_login_guard--false)).
@@ -303,6 +307,16 @@ From the proxy host, with the backend's CA if it is not in the system store:
 # Postfix: STARTTLS and XCLIENT offered to the proxy
 openssl s_client -starttls smtp -connect 192.0.2.10:587 -servername imap.example.org -verify_return_error -crlf
 #   then type: EHLO proxy.example.org   (XCLIENT must be listed)
+```
+
+Before `post_login_guard = false`, and after every Dovecot or Pigeonhole upgrade, on the
+backend: `doveadm exec` starts the processes that take over after the login for an
+existing user, without a password, and reads the commands from standard input:
+
+```bash
+printf 'a LOGIN u p\r\nb AUTHENTICATE PLAIN\r\nc UNAUTHENTICATE\r\nd LOGOUT\r\n' | doveadm exec imap -u user@example.org
+printf 'AUTHENTICATE "PLAIN"\r\nUNAUTHENTICATE\r\nLOGOUT\r\n' | doveadm exec managesieve -u user@example.org
+#   every command but LOGOUT must be answered with "Unknown command"
 ```
 
 Then log in through the proxy with a mail client and check the proxy's
