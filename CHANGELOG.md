@@ -31,6 +31,10 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   backends counted the proxy's startup capability probes as client sessions until the
   probe's `QUIT` or `LOGOUT` arrived, so a count taken right after the start could be one
   too high. The harness now waits for the startup probes before a test begins.
+- jsonwebtoken is built without its default `use_pem` feature: the validator takes the
+  keys from the JWKS components, so `pem` 3 and `simple_asn1` are no longer in the
+  binary. Only the unit tests enable `use_pem`. `base64` 0.22 stays in the binary through
+  jsonwebtoken until an upstream release moves to 0.23.
 
 ### Fixed
 - A refused reload (`SIGHUP`) now logs `reload: configuration not loaded` after the
