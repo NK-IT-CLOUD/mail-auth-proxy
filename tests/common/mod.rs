@@ -729,6 +729,22 @@ impl MockBackend {
         self.seen().into_iter().filter(Seen::is_session).collect()
     }
 
+    /// Wait until `n` connections are known as capability probes. The proxy
+    /// has its probe's result once it has sent the `QUIT` or `LOGOUT`; the
+    /// mock marks the connection when that arrives, a little later.
+    pub async fn wait_probes(&self, n: usize) {
+        let until = Instant::now() + IO_TIMEOUT;
+        while self.seen().iter().filter(|s| s.probe).count() < n {
+            assert!(
+                Instant::now() < until,
+                "{:?} mock: waited for {n} probes: {:?}",
+                self.kind,
+                self.seen()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
     /// Stop listening: from now on the port is closed (connection refused).
     pub async fn shutdown(&self) {
         let task = self.accept.lock().unwrap().take();
@@ -1722,6 +1738,29 @@ pub fn grok_regex() -> regex::Regex {
     regex::Regex::new(&translated).unwrap()
 }
 
+/// The `backends` field of a `… listener up` line, `["name=addr|addr", …]`:
+/// each backend's name and addresses.
+fn listed_backends(line: &str) -> Vec<(String, Vec<String>)> {
+    let list = line
+        .split_once("backends=[")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .unwrap_or_else(|| panic!("no backends field: {line}"))
+        .0;
+    list.split(", ")
+        .filter(|e| !e.is_empty())
+        .map(|e| {
+            let e = e.trim_matches('"');
+            let (name, addrs) = e
+                .split_once('=')
+                .unwrap_or_else(|| panic!("backend entry {e:?}: {line}"));
+            (
+                name.to_owned(),
+                addrs.split('|').map(str::to_owned).collect(),
+            )
+        })
+        .collect()
+}
+
 /// Strict parser for the full line as the binary writes it. Group 10
 /// is the `rule` field, appended after `pwfp`, group 11 `listener`, group
 /// 12 `backend`, group 13 `tls`.
@@ -2261,7 +2300,7 @@ impl Harness {
             named: &named,
         };
         let proxy = Proxy::start(&pki, &idp, mocks, &opts).await;
-        Harness {
+        let h = Harness {
             pki,
             idp,
             imap_be,
@@ -2269,7 +2308,70 @@ impl Harness {
             sieve_be,
             named,
             proxy,
+        };
+        h.wait_startup_probes().await;
+        h
+    }
+
+    /// Wait until the proxy's startup capability probes have ended: every
+    /// submission and ManageSieve backend the proxy listed at startup has
+    /// a probe recorded by the mock at one of its addresses, or a logged
+    /// startup failure.
+    ///
+    /// A mock counts a connection as a client session, and not as a probe,
+    /// from accept until the probe's `QUIT` (SMTP) or `LOGOUT` (ManageSieve)
+    /// arrives. The proxy runs these probes while its listeners come up, so
+    /// without this wait a count taken right after the start can include a
+    /// probe still in flight.
+    async fn wait_startup_probes(&self) {
+        let until = Instant::now() + IO_TIMEOUT;
+        let probes = [
+            (
+                Kind::Smtp,
+                "submission listener up",
+                "submission backend EHLO extensions not available at startup",
+            ),
+            (
+                Kind::Sieve,
+                "sieve listener up",
+                "sieve backend capabilities not available at startup",
+            ),
+        ];
+        for (kind, listener, failed) in probes {
+            let Some(line) = self.proxy.logs().into_iter().find(|l| l.contains(listener)) else {
+                continue;
+            };
+            for (name, addrs) in listed_backends(&line) {
+                let failure = format!(" backend={name} ");
+                loop {
+                    let probed = self.mocks(kind).any(|m| {
+                        addrs.contains(&m.addr.to_string()) && m.seen().iter().any(|s| s.probe)
+                    });
+                    let logged = || {
+                        self.proxy
+                            .logs()
+                            .iter()
+                            .any(|l| l.contains(failed) && l.contains(&failure))
+                    };
+                    if probed || logged() {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < until,
+                        "{kind:?} startup probe of {name} did not end:\n{}",
+                        self.proxy.logs().join("\n")
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
         }
+    }
+
+    /// The mocks of protocol `kind`: the section's and the named ones.
+    fn mocks(&self, kind: Kind) -> impl Iterator<Item = &MockBackend> {
+        std::iter::once(self.backend(kind))
+            .chain(self.named.iter().map(|(_, m)| m))
+            .filter(move |m| m.kind == kind)
     }
 
     /// The harness configuration for `opts`, with this harness's PKI, IdP

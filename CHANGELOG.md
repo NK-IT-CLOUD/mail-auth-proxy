@@ -22,6 +22,11 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - SMTP submission listeners: the refused ALPN IDs follow the IANA registry as of
   2026-10-25, which adds `n-pamp/3`; a client that offers it now gets
   `no_application_protocol` like for the other registered IDs.
+- The lockfile pins tokio 1.54.1 (was 1.53.3). The test failure that held it back came
+  from the test harness, not from the proxy, and occurred with 1.53.3 as well: the mock
+  backends counted the proxy's startup capability probes as client sessions until the
+  probe's `QUIT` or `LOGOUT` arrived, so a count taken right after the start could be one
+  too high. The harness now waits for the startup probes before a test begins.
 
 ### Fixed
 - A refused reload (`SIGHUP`) now logs `reload: configuration not loaded` after the

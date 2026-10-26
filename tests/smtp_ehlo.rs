@@ -81,6 +81,7 @@ async fn the_list_is_cached() {
     set_backend_ehlo(&h, &["DSN"]);
     tokio::time::sleep(Duration::from_millis(2100)).await;
     assert_eq!(extensions(&h).await, ["DSN"]);
+    h.smtp_be.wait_probes(2).await;
     assert_eq!(probes(&h), 2);
     c.send("EHLO again.test").await;
     assert_eq!(c.smtp_reply().await, first);
