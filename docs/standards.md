@@ -234,6 +234,7 @@ Metric names follow the Prometheus naming guidelines: an application prefix (`ma
 | `mail_auth_proxy_backend_failovers_total{backend}` | counter |
 | `mail_auth_proxy_backend_sessions_total{proto,backend}` | counter |
 | `mail_auth_proxy_sessions_ended_total{proto,reason}` | counter |
+| `mail_auth_proxy_post_login_guard_sessions_total{proto,guard}` | counter |
 | `mail_auth_proxy_tls_cert_expiry_timestamp_seconds{cert}` | gauge |
 | `mail_auth_proxy_jwks_last_success_timestamp_seconds{issuer}` | gauge |
 | `mail_auth_proxy_jwks_refresh_failures_total{issuer}` | counter |

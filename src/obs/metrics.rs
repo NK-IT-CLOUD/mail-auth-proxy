@@ -321,6 +321,52 @@ pub fn record_session_end(proto: Proto, why: SessionEnd) {
     SESSIONS_ENDED[proto.idx()][why.idx()].fetch_add(1, Ordering::Relaxed);
 }
 
+/// How an IMAP or ManageSieve session is relayed after login: the `guard`
+/// label of `mail_auth_proxy_post_login_guard_sessions_total`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PostLoginGuard {
+    /// Through the command guard: the backend has `post_login_guard` unset
+    /// or `true`.
+    On,
+    /// As it is: `post_login_guard = false`.
+    Off,
+    /// Through the command guard although `post_login_guard = false`: the
+    /// backend advertised UNAUTHENTICATE (`wire::session_guarded`).
+    SafetyNet,
+}
+
+const POST_LOGIN_GUARDS: [PostLoginGuard; 3] = [
+    PostLoginGuard::On,
+    PostLoginGuard::Off,
+    PostLoginGuard::SafetyNet,
+];
+
+impl PostLoginGuard {
+    /// The `guard` label.
+    pub fn label(self) -> &'static str {
+        match self {
+            PostLoginGuard::On => "on",
+            PostLoginGuard::Off => "off",
+            PostLoginGuard::SafetyNet => "safety_net",
+        }
+    }
+}
+
+/// The protocols with a command guard after login; SMTP has none and is
+/// not exported in `post_login_guard_sessions_total`.
+const GUARDED_PROTOS: [Proto; 2] = [Proto::Imap, Proto::Sieve];
+
+// post_login_guard[proto][guard]: logged-in IMAP and ManageSieve sessions
+// by how they are relayed.
+static POST_LOGIN_GUARD: [[AtomicU64; POST_LOGIN_GUARDS.len()]; N_PROTO] =
+    [const { [const { AtomicU64::new(0) }; POST_LOGIN_GUARDS.len()] }; N_PROTO];
+
+/// Record how a logged-in session of `proto` is relayed.
+#[inline]
+pub fn record_post_login_guard(proto: Proto, guard: PostLoginGuard) {
+    POST_LOGIN_GUARD[proto.idx()][guard as usize].fetch_add(1, Ordering::Relaxed);
+}
+
 /// `le` label values of the latency histogram and the same bounds in
 /// microseconds: from a local backend (a few ms) up to the connect timeout.
 const LATENCY_LE: [&str; 11] = [
@@ -861,6 +907,19 @@ fn render() -> String {
             o.push_str(&format!(
                 "mail_auth_proxy_sessions_ended_total{{proto=\"{plabel}\",reason=\"{}\"}} {v}\n",
                 why.label()
+            ));
+        }
+    }
+
+    o.push_str("# HELP mail_auth_proxy_post_login_guard_sessions_total Logged-in IMAP and ManageSieve sessions by how they are relayed: through the command guard (on), without it (off, post_login_guard = false), or through it although post_login_guard = false because the backend advertised UNAUTHENTICATE (safety_net).\n");
+    o.push_str("# TYPE mail_auth_proxy_post_login_guard_sessions_total counter\n");
+    for proto in GUARDED_PROTOS {
+        for guard in POST_LOGIN_GUARDS {
+            let v = POST_LOGIN_GUARD[proto.idx()][guard as usize].load(Ordering::Relaxed);
+            o.push_str(&format!(
+                "mail_auth_proxy_post_login_guard_sessions_total{{proto=\"{}\",guard=\"{}\"}} {v}\n",
+                proto.label(),
+                guard.label()
             ));
         }
     }
@@ -1846,6 +1905,23 @@ mod tests {
         assert!(render().contains(
             "mail_auth_proxy_sessions_ended_total{proto=\"smtp\",reason=\"idle_limit\"} 1\n"
         ));
+    }
+
+    /// Every IMAP and ManageSieve pair of the post-login guard is exported
+    /// from the start, SMTP (no guard) never.
+    #[test]
+    fn post_login_guard_by_protocol() {
+        let out = render();
+        for p in ["imap", "sieve"] {
+            for guard in POST_LOGIN_GUARDS {
+                let key = format!(
+                    "mail_auth_proxy_post_login_guard_sessions_total{{proto=\"{p}\",guard=\"{}\"}} ",
+                    guard.label()
+                );
+                assert!(out.contains(&key), "{key}");
+            }
+        }
+        assert!(!out.contains("mail_auth_proxy_post_login_guard_sessions_total{proto=\"smtp\""));
     }
 
     /// The connection gauge goes back down when the session task panics or

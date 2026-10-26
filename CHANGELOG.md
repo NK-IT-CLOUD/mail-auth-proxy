@@ -17,6 +17,10 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `false` that advertises `UNAUTHENTICATE` is still relayed through the guard, with a
   `WARN` line. Setting the key on a submission backend is a configuration error, since
   SMTP has no guard.
+- Metric `mail_auth_proxy_post_login_guard_sessions_total{proto,guard}`: the IMAP and
+  ManageSieve logins by how their session is relayed, `guard="on"` through the command
+  guard, `"off"` without it (`post_login_guard = false`) and `"safety_net"` through it
+  although the backend is set to `false`, because it advertised `UNAUTHENTICATE`.
 
 ### Changed
 - SMTP submission listeners: the refused ALPN IDs follow the IANA registry as of

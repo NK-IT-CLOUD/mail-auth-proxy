@@ -323,7 +323,8 @@ impl BackendLogin for ImapLogin<'_> {
                     .map(String::as_str)
                     .chain(capability_code(&ok).unwrap_or_default())
                     .any(|c| c.eq_ignore_ascii_case("UNAUTHENTICATE"));
-                let guarded = crate::wire::session_guarded(conn, offered);
+                let guarded =
+                    crate::wire::session_guarded(conn, offered, crate::obs::metrics::Proto::Imap);
                 (stream, ok, guarded)
             });
         match &result {

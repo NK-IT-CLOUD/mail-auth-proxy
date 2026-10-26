@@ -9,6 +9,9 @@
 //! UNAUTHENTICATE in the capabilities the proxy reads before the splice is
 //! relayed through the guard whatever the setting.
 //!
+//! `mail_auth_proxy_post_login_guard_sessions_total` counts each login by
+//! how its session is relayed: `on`, `off`, or `safety_net` for the last case.
+//!
 //! The mock backends execute UNAUTHENTICATE and echo every other command, so
 //! an unguarded session shows what the backend receives.
 
@@ -33,6 +36,20 @@ const IMAP_GUARDED: [(&str, &str); 5] = [
 ];
 /// The commands the guard keeps from a ManageSieve backend.
 const SIEVE_GUARDED: [&str; 3] = ["UNAUTHENTICATE", "AUTHENTICATE \"PLAIN\"", "STARTTLS"];
+
+/// `mail_auth_proxy_post_login_guard_sessions_total` per protocol and
+/// `guard` label (`on`, `off`, `safety_net`), as `[imap, sieve]`.
+async fn guard_counts(h: &Harness) -> [[u64; 3]; 2] {
+    let m = h.proxy.metrics().await;
+    ["imap", "sieve"].map(|p| {
+        ["on", "off", "safety_net"].map(|g| {
+            let key = format!(
+                "mail_auth_proxy_post_login_guard_sessions_total{{proto=\"{p}\",guard=\"{g}\"}}"
+            );
+            *m.get(&key).unwrap_or_else(|| panic!("no metric {key}"))
+        })
+    })
+}
 
 /// Lines the backend received after the login.
 fn relayed(be: &MockBackend) -> Vec<String> {
@@ -142,6 +159,7 @@ async fn unset_or_true_keeps_the_guard() {
         assert_eq!(reply, "OK \"Logged in.\"");
         assert_sieve_guarded(&mut c, &h.sieve_be).await;
         assert!(!h.proxy.log_contains("post_login_guard"), "{extra:?}");
+        assert_eq!(guard_counts(&h).await, [[1, 0, 0], [1, 0, 0]], "{extra:?}");
     }
 }
 
@@ -210,6 +228,7 @@ async fn false_relays_the_session_as_it_is() {
     );
     // One authresult per login, as with the guard.
     assert_eq!(h.proxy.wait_authresults(2).await.len(), 2);
+    assert_eq!(guard_counts(&h).await, [[0, 1, 0], [0, 1, 0]]);
 }
 
 /// A backend that advertises UNAUTHENTICATE contradicts `false`: the
@@ -243,6 +262,7 @@ async fn false_with_unauthenticate_advertised_keeps_the_guard() {
         h.proxy.logs().join("\n")
     );
     assert!(h.proxy.log_contains("backend=imap"));
+    assert_eq!(guard_counts(&h).await, [[0, 0, 2], [0, 0, 1]]);
 }
 
 /// Routes: two mail systems, `one` with the guard off, `two` with it on.
@@ -286,6 +306,7 @@ sieve = "two-sieve"
     assert_sieve_unguarded(&mut c, h.named("one-sieve")).await;
     let (mut c, _) = login(&h, Kind::Sieve, TWO).await;
     assert_sieve_guarded(&mut c, h.named("two-sieve")).await;
+    assert_eq!(guard_counts(&h).await, [[1, 1, 0], [1, 1, 0]]);
     assert!(h
         .proxy
         .log_contains("backends.one-imap: post_login_guard = false relays"));

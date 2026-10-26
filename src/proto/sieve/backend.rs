@@ -293,7 +293,11 @@ impl BackendLogin for SieveLogin<'_> {
                 // RFC 5804 section 2.14.1: listed in the capabilities after
                 // TLS, those of this session.
                 let offered = caps.iter().any(|l| is_cap(l, "UNAUTHENTICATE"));
-                (be, reply, crate::wire::session_guarded(conn, offered))
+                (
+                    be,
+                    reply,
+                    crate::wire::session_guarded(conn, offered, crate::obs::metrics::Proto::Sieve),
+                )
             });
         match &result {
             Ok(_) => pool.session(),

@@ -245,6 +245,7 @@ scrapes it over HTTPS with a bearer token.
 | `mail_auth_proxy_active_connections` | admitted connections currently open |
 | `mail_auth_proxy_backend_errors_total` | backend or account-check outages while a client waited |
 | `mail_auth_proxy_upstream_forwards_total` | sessions spliced to a backend |
+| `mail_auth_proxy_post_login_guard_sessions_total` | IMAP and ManageSieve sessions by whether they pass the command guard (`on`, `off`, `safety_net`) |
 | `mail_auth_proxy_backend_login_duration_seconds` | histogram of successful backend logins |
 | `mail_auth_proxy_jwks_last_success_timestamp_seconds` | last JWKS fetch with usable keys, per issuer |
 | `mail_auth_proxy_tls_cert_expiry_timestamp_seconds` | expiry of each certificate in use (label `cert`) |

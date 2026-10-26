@@ -519,6 +519,7 @@ A backend with `post_login_guard = false` ([configuration](configuration.md#keys
 - A backend that advertises `UNAUTHENTICATE` in the capabilities the login reads (IMAP: its list before the login, an untagged `CAPABILITY` response during it and the login's `[CAPABILITY …]` code; ManageSieve: the capabilities after TLS) contradicts the setting: the session goes through the guard all the same, and a `WARN … backend advertises UNAUTHENTICATE although post_login_guard = false` line names the backend. This is a safety net, not a check: a backend can take the command without advertising it, and an IMAP backend that lists it only in a later `CAPABILITY` response is not seen.
 - Submission has no guard, so the key is refused on a submission backend ([SECURITY.md](../SECURITY.md#operator-responsibilities): the backend refuses a second `AUTH`).
 - A reload applies to the sessions that log in after it; a session keeps the setting it was relayed with.
+- `mail_auth_proxy_post_login_guard_sessions_total{proto,guard}` counts the logins by how their session is relayed: `on`, `off`, or `safety_net` for a backend set to `false` that advertised `UNAUTHENTICATE` ([operations](operations.md#prometheus-metrics)).
 
 ## Surprising and client-incompatible behaviour
 

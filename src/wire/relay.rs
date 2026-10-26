@@ -14,7 +14,7 @@
 
 use super::guard::{Dialect, Event, Guard};
 use super::Tuning;
-use crate::obs::metrics::{self, Proto, SessionEnd};
+use crate::obs::metrics::{self, PostLoginGuard, Proto, SessionEnd};
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
@@ -79,15 +79,23 @@ pub async fn splice<A, B>(
 /// read before the splice (`offers_unauthenticate`). Such a backend is not
 /// one that refuses the command, which is what the setting declares. Only a
 /// safety net: a backend may take UNAUTHENTICATE without offering it.
-pub fn session_guarded(backend: &crate::server::BackendConn, offers_unauthenticate: bool) -> bool {
-    if backend.guarded {
-        return true;
-    }
-    if offers_unauthenticate {
+/// Called once per login the backend accepted, and counted by `proto`.
+pub fn session_guarded(
+    backend: &crate::server::BackendConn,
+    offers_unauthenticate: bool,
+    proto: Proto,
+) -> bool {
+    let guard = if backend.guarded {
+        PostLoginGuard::On
+    } else if offers_unauthenticate {
         tracing::warn!(target: crate::obs::target::RELAY, backend = %backend.id, address = %backend.address,
             "backend advertises UNAUTHENTICATE although post_login_guard = false; session relayed through the command guard");
-    }
-    offers_unauthenticate
+        PostLoginGuard::SafetyNet
+    } else {
+        PostLoginGuard::Off
+    };
+    metrics::record_post_login_guard(proto, guard);
+    guard != PostLoginGuard::Off
 }
 
 /// An end the proxy chose by a `[session]` limit.
@@ -689,7 +697,7 @@ mod tests {
             (false, false, false),
         ] {
             assert_eq!(
-                session_guarded(&conn(guarded), offered),
+                session_guarded(&conn(guarded), offered, Proto::Imap),
                 want,
                 "{guarded} {offered}"
             );
