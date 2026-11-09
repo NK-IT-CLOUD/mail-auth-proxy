@@ -6,6 +6,8 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-09
+
 ### Added
 - Backend key `post_login_guard` (default `true`). `false` relays the IMAP and ManageSieve
   sessions of that backend after login without the command guard, as SMTP is relayed:
@@ -35,6 +37,10 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   keys from the JWKS components, so `pem` 3 and `simple_asn1` are no longer in the
   binary. Only the unit tests enable `use_pem`. `base64` 0.22 stays in the binary through
   jsonwebtoken until an upstream release moves to 0.23.
+- Built with Rust 1.99.1 (was 1.98.1).
+- The lockfile pins webpki-root-certs 1.0.11 (RUSTSEC-2026-0383, was 1.0.9). The crate is
+  not part of the Linux build: there `reqwest` verifies certificates against the system
+  store, so the 0.7.0 packages were not affected.
 
 ### Fixed
 - A refused reload (`SIGHUP`) now logs `reload: configuration not loaded` after the
@@ -614,7 +620,8 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 - Initial public release.
 
-[Unreleased]: https://github.com/NK-IT-CLOUD/mail-auth-proxy/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/NK-IT-CLOUD/mail-auth-proxy/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/NK-IT-CLOUD/mail-auth-proxy/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/NK-IT-CLOUD/mail-auth-proxy/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/NK-IT-CLOUD/mail-auth-proxy/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/NK-IT-CLOUD/mail-auth-proxy/compare/v0.5.0...v0.5.1
