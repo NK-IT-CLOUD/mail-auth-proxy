@@ -1,6 +1,7 @@
 # CI for pushes and pull requests. The same file runs on GitHub (hosted runners) and
 # on the maintainer's Gitea (repository variable CI_RUNNER selects a self-hosted
-# runner there; CARGO_CACHE keeps build output between jobs). No secrets are needed
+# runner there; CARGO_CACHE keeps build output between jobs, TOOLS_CACHE the pinned
+# downloads, see packaging/ci-fetch.sh). No secrets are needed
 # on GitHub; the leak gate over the public file set runs where its patterns exist.
 name: CI
 on:
@@ -21,6 +22,7 @@ env:
   CARGO_TERM_COLOR: never
   # Set on the maintainer's Gitea only (repository variables).
   CARGO_CACHE: ${{ vars.CARGO_CACHE }}
+  TOOLS_CACHE: ${{ vars.TOOLS_CACHE }}
 
 jobs:
   # rustup installs the toolchain pinned in rust-toolchain.toml (with rustfmt and
@@ -162,10 +164,10 @@ jobs:
       - name: cargo-deny
         run: |
           set -euo pipefail
-          cd "$RUNNER_TEMP"
           f=cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
-          curl -fsSLO "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/$f"
-          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  $f" | sha256sum -c
+          packaging/ci-fetch.sh "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/$f" \
+            9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP"
           tar -xzf "$f"
           cd "$GITHUB_WORKSPACE"
           "$RUNNER_TEMP/cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny" check

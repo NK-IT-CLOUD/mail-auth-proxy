@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Pinned, checksum-verified packaging tools for CI: nfpm, cargo-auditable and
-# cargo-about into $RUNNER_TEMP/bin, which is added to the job's PATH.
+# cargo-about into $RUNNER_TEMP/bin, which is added to the job's PATH (downloads
+# through ci-fetch.sh).
 set -euo pipefail
+fetch=$(cd "$(dirname "$0")" && pwd)/ci-fetch.sh
 bin=$RUNNER_TEMP/bin
 mkdir -p "$bin"
 cd "$RUNNER_TEMP"
 get() { # url sha256
-    local f=${1##*/}
-    curl -fsSLO "$1"
-    echo "$2  $f" | sha256sum -c
+    "$fetch" "$1" "$2"
 }
 get https://github.com/goreleaser/nfpm/releases/download/v2.47.0/nfpm_2.47.0_Linux_x86_64.tar.gz \
     0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
