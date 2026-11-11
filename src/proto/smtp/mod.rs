@@ -14,7 +14,7 @@ use crate::limits::ConnPermit;
 use crate::obs::metrics::{Listener, Proto};
 use crate::server::Ctx;
 use crate::wire::deadline_at;
-use crate::wire::line::{read_client_line, verb_is};
+use crate::wire::line::{read_auth_line, read_client_line, verb_is};
 use anyhow::{anyhow, Result};
 use backend::{ClientHelo, SmtpLogin};
 use preauth::read_smtp_auth;
@@ -297,7 +297,9 @@ async fn serve(
                             client_tls.flush().await?;
                             return Err(anyhow!("submission: post-TLS command limit reached"));
                         }
-                        let line = read_client_line(&mut client_tls, tuning.idle).await?;
+                        // Any command line can be an AUTH with an initial
+                        // response.
+                        let line = read_auth_line(&mut client_tls, tuning.idle).await?;
                         if let Some(h) = ClientHelo::parse(&line) {
                             helo = Some(h);
                         }

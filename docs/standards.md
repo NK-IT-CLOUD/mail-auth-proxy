@@ -85,7 +85,7 @@ The greeting and pre-authentication dialog follow IMAP4rev2 (RFC 9051) and stay 
 | Unsupported mechanism → `504 5.5.4` | | RFC 4954 §4, §6 | Yes | Also a password mechanism the connection does not offer, before the password is asked for |
 | Invalid credentials → `535 5.7.8`; temporary failure → `454 4.7.0`; success → `235 2.7.0` | SHOULD | RFC 4954 §6 | Yes | |
 | Commands before AUTH → `530 5.7.0` | SHOULD | RFC 4954 §6 | Yes | |
-| Authentication lines up to 12288 octets | | RFC 4954 §4 | Yes | Limit 16384 |
+| Authentication lines up to 12288 octets | | RFC 4954 §4 | Yes | Limit 23512 for command lines after TLS and SASL responses (room for a 16384-byte token), 16384 for the other lines; a longer response gets `501 5.5.2`, then `421` and the close ([architecture](architecture.md#line-reading)) |
 | Server closes only after QUIT, 421 or a timeout | MUST NOT (otherwise) | RFC 5321 §3.8, §7.8 | Yes | After a refused AUTH the client may send another, up to `limits.max_auth_attempts`. The reply to the last one, and to an AUTH that meets an outage, is followed by `421 4.7.0 <domain> closing connection`, then the close. See D-GEN-1. |
 | Unknown commands → `500` | SHOULD | RFC 5321 §4.2.4 | Yes | |
 | Server timeout ≥ 5 minutes | SHOULD | RFC 5321 §4.5.3.2.7 | Deviation | Pre-authentication budget. See D-GEN-2. |

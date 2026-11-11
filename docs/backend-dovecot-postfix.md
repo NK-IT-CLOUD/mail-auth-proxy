@@ -294,7 +294,9 @@ seen: remove them for the proxy's address too, or leave them out with
 
 The proxy sends `AUTH XOAUTH2` (or `AUTH OAUTHBEARER`) without an initial response and the token on its own line,
 which Postfix limits by `smtpd_sasl_response_limit` (12288 octets), not by
-`line_length_limit` (default 2048). The working installation raises `line_length_limit`
+`line_length_limit` (default 2048). 12288 octets of base64 hold a token of about 9 KB;
+the proxy accepts tokens up to 16384 bytes, and Postfix answers a longer response with
+`500`, which the proxy treats as an outage (retry-later). The working installation raises `line_length_limit`
 to 16384 on the submission service; whether the default is enough behind the proxy is
 **not verified** there. Clients that connect to Postfix directly and send the token as an
 initial response on the `AUTH` line need the higher value.

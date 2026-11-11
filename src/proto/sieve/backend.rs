@@ -317,6 +317,7 @@ impl SieveLogin<'_> {
         mut be: TlsStream<TcpStream>,
         credential: BackendCredential<'_>,
     ) -> Result<(TlsStream<TcpStream>, String), BackendError> {
+        let password = matches!(credential, BackendCredential::Password { .. });
         let fwd = credential.forward(backend);
         let (mech, response) = (fwd.mech, fwd.response.as_str());
         // A quoted string holds at most 1024 octets (RFC 5804 §4); a longer
@@ -353,7 +354,7 @@ impl SieveLogin<'_> {
             be.write_all(format!("\"{answer}\"\r\n").as_bytes()).await?;
             be_reply = read_line(&mut be, self.tuning.idle).await?;
         }
-        match classify_auth_reply(&be_reply) {
+        match classify_auth_reply(&be_reply, password) {
             AuthReply::Ok => Ok((be, be_reply)),
             AuthReply::Rejected => {
                 Err(crate::auth::rejected_after(be_reply, error_result.as_ref()))
@@ -412,7 +413,8 @@ enum AuthReply {
     Unavailable,
 }
 
-/// Classify the reply to `AUTHENTICATE`, case-insensitively.
+/// Classify the reply to `AUTHENTICATE` of a token (`password` false) or
+/// password login, case-insensitively.
 ///
 /// - `OK`: logged in.
 /// - `NO (TRYLATER)` (RFC 5804 §1.3): a temporary failure, an outage.
@@ -421,9 +423,14 @@ enum AuthReply {
 ///   `AUTH-TOO-WEAK` or `TRANSITION-NEEDED`, which judge the credential.
 ///   Counting an outage as a rejection would feed the rate limit and CrowdSec
 ///   bans against legitimate users.
-/// - Any other `NO` (and anything unexpected): a rejection.
-fn classify_auth_reply(reply: &str) -> AuthReply {
+/// - Any other `NO`: a rejection.
+/// - Anything unexpected: for a token, the backend did not judge the
+///   credential, an outage (as IMAP `classify_tagged` and SMTP
+///   `auth_verdict`). For a password it is a rejection: the client chose the
+///   credential bytes (see `auth::MAX_PASSWORD`).
+fn classify_auth_reply(reply: &str, password: bool) -> AuthReply {
     let upper = reply.to_ascii_uppercase();
+    let status = upper.split(' ').next().unwrap_or("");
     if upper.starts_with("OK") {
         AuthReply::Ok
     } else if upper.starts_with("NO (TRYLATER)")
@@ -432,8 +439,10 @@ fn classify_auth_reply(reply: &str) -> AuthReply {
             && !upper.starts_with("BYE (TRANSITION-NEEDED)"))
     {
         AuthReply::Unavailable
-    } else {
+    } else if password || status == "NO" || upper.starts_with("BYE") {
         AuthReply::Rejected
+    } else {
+        AuthReply::Unavailable
     }
 }
 
@@ -641,26 +650,37 @@ mod tests {
             .is_err());
     }
 
-    /// A `BYE` is an outage, not a verdict on the credential.
+    /// A `BYE` is an outage, not a verdict on the credential. A reply that
+    /// is neither `OK`, `NO` nor `BYE` is a rejection of a password and an
+    /// outage for a token.
     #[test]
     fn auth_reply_classification() {
         use AuthReply::*;
-        for (reply, want) in [
-            ("OK \"Logged in.\"", Ok),
-            ("ok", Ok),
-            ("NO \"Authentication failed.\"", Rejected),
+        for (reply, token, password) in [
+            ("OK \"Logged in.\"", Ok, Ok),
+            ("ok", Ok, Ok),
+            ("NO \"Authentication failed.\"", Rejected, Rejected),
+            ("no", Rejected, Rejected),
             (
                 "NO (TRYLATER) \"Temporary authentication failure.\"",
                 Unavailable,
+                Unavailable,
             ),
-            ("BYE \"Server shutting down.\"", Unavailable),
-            ("bye \"Too many connections\"", Unavailable),
-            ("BYE", Unavailable),
-            ("BYE (AUTH-TOO-WEAK) \"x\"", Rejected),
-            ("BYE (TRANSITION-NEEDED) \"x\"", Rejected),
-            ("garbage", Rejected),
+            ("BYE \"Server shutting down.\"", Unavailable, Unavailable),
+            ("bye \"Too many connections\"", Unavailable, Unavailable),
+            ("BYE", Unavailable, Unavailable),
+            ("BYE (AUTH-TOO-WEAK) \"x\"", Rejected, Rejected),
+            ("BYE (TRANSITION-NEEDED) \"x\"", Rejected, Rejected),
+            ("garbage", Unavailable, Rejected),
+            ("NOPE \"x\"", Unavailable, Rejected),
+            ("", Unavailable, Rejected),
         ] {
-            assert_eq!(classify_auth_reply(reply), want, "{reply}");
+            assert_eq!(classify_auth_reply(reply, false), token, "token: {reply}");
+            assert_eq!(
+                classify_auth_reply(reply, true),
+                password,
+                "password: {reply}"
+            );
         }
     }
 

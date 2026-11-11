@@ -16,7 +16,7 @@ use crate::limits::ConnPermit;
 use crate::obs::metrics::Proto;
 use crate::server::Ctx;
 use crate::wire::deadline_at;
-use crate::wire::line::{read_client_line, verb_is};
+use crate::wire::line::{read_auth_line, read_client_line, verb_is};
 use anyhow::{anyhow, Context as _, Result};
 use backend::{backend_caps, caps_for_client, sieve_line, SieveLogin};
 use preauth::{
@@ -286,7 +286,9 @@ pub async fn handle(
                                 .await?;
                             return Err(anyhow!("sieve: post-TLS command limit reached"));
                         }
-                        let line = read_client_line(&mut client_tls, tuning.idle).await?;
+                        // Any command line can be an AUTHENTICATE with a
+                        // quoted initial response.
+                        let line = read_auth_line(&mut client_tls, tuning.idle).await?;
                         if verb_is(&line, "CAPABILITY") {
                             client_tls.write_all(caps.as_bytes()).await?;
                             client_tls

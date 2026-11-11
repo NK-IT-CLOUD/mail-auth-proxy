@@ -349,6 +349,44 @@ async fn backend_syntax_error_on_password_is_rejection() {
     }
 }
 
+/// A ManageSieve reply to `AUTHENTICATE` that is neither `OK`, `NO` nor
+/// `BYE` is no verdict on a token: an outage, as an IMAP `BAD` or an SMTP
+/// `50x`. Answering a password it stays a rejection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sieve_unexpected_reply_on_token_is_outage() {
+    let h = Harness::start().await;
+    let reply = "XYZZY \"Unexpected.\"";
+    *h.sieve_be.auth_reply.lock().unwrap() = Some(reply.into());
+    let token = h.idp.token(EMAIL);
+    let c = h.ready(Kind::Sieve, Src::External, Sni::Public).await;
+    expect_outage(
+        &h,
+        Kind::Sieve,
+        c,
+        &auth_command(Kind::Sieve, "XOAUTH2", &xoauth2(EMAIL, &token)),
+        reply,
+    )
+    .await;
+    let user = "bob@example.test";
+    let (mut c, answer) = h
+        .auth(
+            Kind::Sieve,
+            Src::Internal,
+            Sni::Internal,
+            "PLAIN",
+            &plain(user, "pw"),
+        )
+        .await;
+    assert_eq!(answer, rejected_password(Kind::Sieve));
+    c.expect_end(Kind::Sieve).await;
+    let ar = &h.proxy.wait_authresults(1).await[0];
+    assert_eq!(
+        (ar.reason.as_str(), ar.user.as_str()),
+        ("backend_reject", user)
+    );
+    assert_eq!(h.proxy.metric(&backend_errors(Kind::Sieve)).await, 1);
+}
+
 /// A reply other than `334` to the bare SMTP `AUTH <mech>` line comes before
 /// any credential: backend configuration (AUTH not enabled, unknown
 /// mechanism), an outage on both paths.

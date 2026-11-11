@@ -145,8 +145,12 @@ relays the session (IMAP and ManageSieve through a command guard unless a backen
   refusal timing is unchanged, so a block does not reveal whether an account exists;
   outages and pre-auth aborts never count; the table is bounded.
 - Size caps: a password over 1024 bytes and a token over 16384 bytes are refused without
-  further processing (`oversize`, `bad_token`); a JWKS response over 256 KiB fails the
-  fetch; a line is at most 16384 bytes, a ManageSieve literal at most 64 KiB.
+  further processing (`oversize`, `bad_token`), on every protocol; a JWKS response over
+  256 KiB fails the fetch. A client line that can carry a SASL response (a command line
+  after TLS, the response to a challenge) is at most 23512 bytes, room for a 16384-byte
+  token in the largest SASL message the proxy accepts; every other line is at most 16384
+  bytes; a ManageSieve literal at most 64 KiB. A longer line ends the connection
+  ([architecture](docs/architecture.md#line-reading)).
 - Refusal timing: a refusal by the legacy gate is answered after the larger of
   `failure_delay_ms` and the median of the last 32 rejections of the backend the login
   goes to (at most 10 s); a backend rejection no earlier than `failure_delay_ms`; both with the

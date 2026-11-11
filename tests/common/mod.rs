@@ -617,6 +617,10 @@ pub struct MockBackend {
     /// SMTP: the extension lines of the post-TLS EHLO reply besides
     /// XCLIENT and AUTH, instead of `SMTP_EHLO`.
     pub smtp_ehlo: Arc<Mutex<Option<Vec<String>>>>,
+    /// SMTP: a SASL response after `334` may be longer than
+    /// `SMTP_SASL_RESPONSE_LIMIT` (a Postfix with a raised
+    /// `smtpd_sasl_response_limit`).
+    pub smtp_long_sasl: Arc<AtomicBool>,
     /// While set, every connection is closed at accept, before a greeting
     /// (a backend whose service is down behind a listening port).
     pub refuse: Arc<AtomicBool>,
@@ -664,6 +668,8 @@ impl MockBackend {
         let no_ir = no_sasl_ir.clone();
         let smtp_ehlo: Arc<Mutex<Option<Vec<String>>>> = Arc::default();
         let ehlo = smtp_ehlo.clone();
+        let smtp_long_sasl: Arc<AtomicBool> = Arc::default();
+        let long_sasl = smtp_long_sasl.clone();
         let refuse: Arc<AtomicBool> = Arc::default();
         let refusing = refuse.clone();
         let acceptor = tokio_rustls::TlsAcceptor::from(tls);
@@ -691,6 +697,7 @@ impl MockBackend {
                     announced_caps: announced.lock().unwrap().clone(),
                     no_sasl_ir: no_ir.load(Ordering::SeqCst),
                     smtp_ehlo: ehlo.lock().unwrap().clone(),
+                    smtp_long_sasl: long_sasl.load(Ordering::SeqCst),
                     mode,
                 };
                 let acceptor = acceptor.clone();
@@ -715,6 +722,7 @@ impl MockBackend {
             announced_caps,
             no_sasl_ir,
             smtp_ehlo,
+            smtp_long_sasl,
             refuse,
         }
     }
@@ -781,6 +789,8 @@ struct Rec {
     no_sasl_ir: bool,
     /// `MockBackend::smtp_ehlo` when the connection was accepted.
     smtp_ehlo: Option<Vec<String>>,
+    /// `MockBackend::smtp_long_sasl` when the connection was accepted.
+    smtp_long_sasl: bool,
     mode: MockMode,
 }
 
@@ -1237,7 +1247,7 @@ async fn mock_smtp(
                         s.write_all(b"501 5.7.0 Authentication aborted\r\n").await?;
                         return Ok(());
                     }
-                    if r.len() > SMTP_SASL_RESPONSE_LIMIT {
+                    if r.len() > SMTP_SASL_RESPONSE_LIMIT && !rec.smtp_long_sasl {
                         s.write_all(b"500 5.5.6 SASL response too long\r\n").await?;
                         return Ok(());
                     }

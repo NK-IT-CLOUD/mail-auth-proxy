@@ -5,8 +5,35 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use zeroize::{Zeroize as _, Zeroizing};
 
-/// Longest accepted protocol line.
+/// Longest accepted protocol line: backend replies, the dialogs before TLS,
+/// and client lines that cannot carry a SASL response.
 pub(crate) const MAX_LINE: usize = 16384;
+
+/// Longest accepted client line that can carry a SASL response before
+/// authentication (`read_auth_line`): sized for a token of
+/// `auth::MAX_TOKEN` bytes in the largest framing the proxy accepts, so the
+/// token check decides about a token, not the line limit. That framing is an
+/// OAUTHBEARER message (RFC 7628 §3.1) with an authzid of
+/// `sasl::MAX_SASL_USER` bytes, each escaped as `=2C` or `=3D`, a `host` of
+/// 255 and a `port` of 5 bytes, base64-encoded (an XOAUTH2 message is
+/// shorter), after the command prefix (`AUTH_LINE_PREFIX`).
+pub(crate) const MAX_AUTH_LINE: usize = {
+    use crate::auth::{sasl::MAX_SASL_USER, MAX_TOKEN};
+    let framing = "n,a=".len()
+        + 3 * MAX_SASL_USER
+        + ",\x01host=".len()
+        + 255
+        + "\x01port=".len()
+        + 5
+        + "\x01auth=Bearer ".len()
+        + "\x01\x01".len();
+    (MAX_TOKEN + framing).div_ceil(3) * 4 + AUTH_LINE_PREFIX
+};
+
+/// Room for what precedes the initial response on a command line: an IMAP
+/// tag and `AUTHENTICATE OAUTHBEARER `, SMTP `AUTH OAUTHBEARER `, ManageSieve
+/// `AUTHENTICATE "OAUTHBEARER" "` and its closing quote.
+const AUTH_LINE_PREFIX: usize = 256;
 
 /// True if `tag` is a valid IMAP tag (RFC 9051 §9: one or more
 /// `astring-char` except `+`). A server answers a line with an invalid
@@ -34,7 +61,7 @@ pub enum LineError {
     Eof,
     /// The peer closed in the middle of a line.
     EofMidLine,
-    /// The line exceeds `MAX_LINE` bytes.
+    /// The line exceeds the reader's limit (`MAX_LINE`, `MAX_AUTH_LINE`).
     TooLong,
     /// No byte arrived within the idle timeout (seconds).
     Timeout(u64),
@@ -93,10 +120,30 @@ pub async fn read_line<S: AsyncRead + Unpin>(
 
 /// `read_line` for a client line: a command line (IMAP `LOGIN`, an inline
 /// SASL response) or a SASL response can carry a password or token, so the
-/// line and every buffer it outgrows are overwritten when dropped.
+/// line and every buffer it outgrows are overwritten when dropped. A line
+/// that can carry a SASL response is read with `read_auth_line`.
 pub async fn read_client_line<S: AsyncRead + Unpin>(
     s: &mut S,
     idle: Duration,
+) -> Result<Zeroizing<String>, LineError> {
+    read_limited(s, idle, MAX_LINE).await
+}
+
+/// `read_client_line` up to `MAX_AUTH_LINE` bytes, for a client line that
+/// can carry a SASL response before authentication: a command line after
+/// TLS (IMAP, SMTP, ManageSieve, an initial response on it) and the
+/// response to a server challenge.
+pub async fn read_auth_line<S: AsyncRead + Unpin>(
+    s: &mut S,
+    idle: Duration,
+) -> Result<Zeroizing<String>, LineError> {
+    read_limited(s, idle, MAX_AUTH_LINE).await
+}
+
+async fn read_limited<S: AsyncRead + Unpin>(
+    s: &mut S,
+    idle: Duration,
+    max: usize,
 ) -> Result<Zeroizing<String>, LineError> {
     let mut line = Zeroizing::new(Vec::new());
     let mut consumed = 0usize;
@@ -128,7 +175,7 @@ pub async fn read_client_line<S: AsyncRead + Unpin>(
         // an endless stream of bare CR would otherwise never grow `line` and
         // never trip the limit.
         consumed += 1;
-        if consumed > MAX_LINE {
+        if consumed > max {
             return Err(LineError::TooLong);
         }
     }
@@ -177,14 +224,14 @@ fn push_zeroizing(buf: &mut Vec<u8>, byte: u8) {
     buf.push(byte);
 }
 
-/// Read one SASL client response line. A lone `*` is the client cancelling
-/// the exchange (RFC 3501 §6.2.2, RFC 4954 §4) and ends it with an error
-/// (`BadResponse`).
+/// Read one SASL client response line, up to `MAX_AUTH_LINE` bytes. A lone
+/// `*` is the client cancelling the exchange (RFC 3501 §6.2.2, RFC 4954 §4)
+/// and ends it with an error (`BadResponse`).
 pub async fn read_sasl_response<S: AsyncRead + Unpin>(
     s: &mut S,
     idle: Duration,
 ) -> Result<Zeroizing<String>> {
-    let line = read_client_line(s, idle).await?;
+    let line = read_auth_line(s, idle).await?;
     if line.trim() == "*" {
         return Err(anyhow::Error::new(crate::auth::sasl::BadResponse(
             "client cancelled authentication",
@@ -263,6 +310,62 @@ mod tests {
     async fn overlong_line_is_rejected() {
         let mut c = Cursor::new(vec![b'A'; MAX_LINE + 10]);
         assert!(read_line(&mut c, IDLE).await.is_err());
+    }
+
+    /// A line that can carry a SASL response takes `MAX_AUTH_LINE` bytes
+    /// before its LF (a CR counts), one more is too long; any other client
+    /// line keeps `MAX_LINE`.
+    #[tokio::test]
+    async fn auth_lines_have_their_own_limit() {
+        let line = |n: usize| {
+            let mut v = vec![b'A'; n];
+            v.push(b'\n');
+            Cursor::new(v)
+        };
+        assert_eq!(
+            read_auth_line(&mut line(MAX_AUTH_LINE), IDLE)
+                .await
+                .unwrap()
+                .len(),
+            MAX_AUTH_LINE
+        );
+        assert!(matches!(
+            read_auth_line(&mut line(MAX_AUTH_LINE + 1), IDLE).await,
+            Err(LineError::TooLong)
+        ));
+        assert!(read_sasl_response(&mut line(MAX_AUTH_LINE), IDLE)
+            .await
+            .is_ok());
+        assert!(read_client_line(&mut line(MAX_LINE), IDLE).await.is_ok());
+        assert!(matches!(
+            read_client_line(&mut line(MAX_LINE + 1), IDLE).await,
+            Err(LineError::TooLong)
+        ));
+    }
+
+    /// The largest SASL message the proxy accepts with a token of
+    /// `MAX_TOKEN` bytes fits an auth line on every protocol: OAUTHBEARER
+    /// with an authzid of `MAX_SASL_USER` escaped characters, a 255-byte
+    /// host and a port, behind each protocol's command prefix (an IMAP tag
+    /// of 64 characters).
+    #[test]
+    fn auth_line_fits_the_largest_token() {
+        use crate::auth::{sasl, MAX_TOKEN};
+        let user = ",".repeat(sasl::MAX_SASL_USER);
+        let host = "h".repeat(255);
+        let ir = sasl::build_oauthbearer(&user, &host, 65535, &"t".repeat(MAX_TOKEN));
+        let tag = "t".repeat(64);
+        for line in [
+            format!("{tag} AUTHENTICATE OAUTHBEARER {}", ir.as_str()),
+            format!("AUTH OAUTHBEARER {}", ir.as_str()),
+            format!("AUTHENTICATE \"OAUTHBEARER\" \"{}\"", ir.as_str()),
+        ] {
+            // With its CR, which the limit counts.
+            assert!(line.len() < MAX_AUTH_LINE, "{} bytes", line.len());
+        }
+        // The value the docs and the black-box tests name.
+        assert_eq!(MAX_AUTH_LINE, 23512);
+        assert_eq!(MAX_AUTH_LINE - ir.len(), AUTH_LINE_PREFIX);
     }
 
     #[test]

@@ -51,7 +51,7 @@ A client that reads the greeting and disconnects before its first command (a hea
 - A response that decodes but holds no valid credential gets `t NO [AUTHENTICATIONFAILED] Authentication failed`: a PLAIN message without two NULs, with a NUL in the password or an authzid other than the login, a NUL in a LOGIN field, an OAuth response without `auth=Bearer <token>`, a malformed OAUTHBEARER GS2 header (the flag must be `n` or `y`, `p=` is refused), a malformed `host`, or a SASL user over 255 bytes or with control characters. Such a response carries no usable credential: the `authresult` line is `protocol`.
 - An OAuth response with an empty `auth` value (`auth=`, or `Bearer` without a token) is a discovery request (RFC 7628 §4.3): it gets the [OAuth error result](#oauth-error-result) like a rejected token, and its `authresult` line is `protocol` with the mechanism and the SASL user. It is not a failed login and does not count in the rate limit.
 
-Each of these is an attempt: the connection stays open for another one, up to `limits.max_auth_attempts` ([below](#imap-decision-and-backend-login)). A response line that cannot be read (over 16384 bytes, the idle timeout, a close) ends the connection.
+Each of these is an attempt: the connection stays open for another one, up to `limits.max_auth_attempts` ([below](#imap-decision-and-backend-login)). A response line that cannot be read ends the connection: over 23512 bytes (after `t BAD AUTHENTICATE failed: invalid or cancelled response`; a command line that long closes without a reply, [line limits](architecture.md#line-reading)), the idle timeout, a close. A token of up to 16384 bytes fits on the command line and as a response; a longer one is a `bad_token`.
 
 ### IMAP: decision and backend login
 
@@ -189,6 +189,7 @@ On the STARTTLS listener the banner is `220 <hostname> ESMTP`.
 | `AUTH <mech> =` | the empty response (RFC 4954 §4) |
 | `AUTH LOGIN` | `334 VXNlcm5hbWU6`, `334 UGFzc3dvcmQ6`. With an IR (`AUTH LOGIN <b64user>`) only `334 UGFzc3dvcmQ6` follows. |
 | `*` cancel, a response that is not base64 | `501 5.5.2 Invalid or cancelled authentication response` |
+| a response line over 23512 bytes ([line limits](architecture.md#line-reading)) | `501 5.5.2 Invalid or cancelled authentication response`, then `421 4.7.0 <hostname> closing connection` and the close; a command line that long closes without a reply |
 | a response that decodes but holds no valid credential (the cases listed for [IMAP](#imap-sasl-exchange), `AUTH PLAIN =` included) | `535 5.7.8 Authentication credentials invalid` |
 | an OAuth response with an empty `auth` value (discovery, RFC 7628 §4.3) | `334 <error result>`, then after the client's answer `535 5.7.8 …` or, for `*` and undecodable answers, `501 5.5.2 …` ([OAuth error result](#oauth-error-result)); `authresult` `protocol`, not a failed login |
 
@@ -224,7 +225,7 @@ A `454` retry-later reply, and the reply to the last attempt, are followed by `4
    `tls = "implicit"` (RFC 8314 §3.3): TLS handshake, verified; expect `220`.
 3. `EHLO <hostname>`; expect `250`.
 4. (`client_ip = "xclient"`, when the backend lists `XCLIENT`) `XCLIENT …` with the client's post-TLS `EHLO`/`HELO` name (`HELO=`, xtext; `[UNAVAILABLE]` if it is empty, longer than 255 characters or would push the command past 512 octets), `PROTO=ESMTP` or `SMTP`, `PORT=` the client's source port (each only if the backend lists it), then `NAME=[UNAVAILABLE]` and `ADDR=`; expect `220`, then `EHLO` again and expect `250`. If the backend advertises `XCLIENT` but `client_ip` is not `xclient`, or the `EHLO` after the proxy's `XCLIENT` still lists `XCLIENT`, the login stops here as an outage. Otherwise, once the relay starts, the authenticated client could send its own `XCLIENT LOGIN=… ADDR=…` on the proxy's authorization.
-5. `AUTH <mech>` (`XOAUTH2` or `OAUTHBEARER` for a token, `PLAIN` for a password) without an initial response; expect `334`, then send the response on its own line. This keeps the AUTH command line short whatever the token size: Postfix limits command lines to `line_length_limit` (default 2048 octets) but SASL responses to 12288. A token's error challenge (`334 <base64 JSON>`) is answered with an empty line (XOAUTH2) or `AQ==` (OAUTHBEARER), after which the backend sends its final reply.
+5. `AUTH <mech>` (`XOAUTH2` or `OAUTHBEARER` for a token, `PLAIN` for a password) without an initial response; expect `334`, then send the response on its own line. This keeps the AUTH command line short whatever the token size: Postfix limits command lines to `line_length_limit` (default 2048 octets) but SASL responses to `smtpd_sasl_response_limit` (default 12288 octets, a token of about 9 KB); a longer response gets `500`, which for a token is an outage. A token's error challenge (`334 <base64 JSON>`) is answered with an empty line (XOAUTH2) or `AQ==` (OAUTHBEARER), after which the backend sends its final reply.
 
 Commands the client pipelines after `AUTH` in the same TLS record are kept in the buffer and reach the backend after `235`. A black-box test covers this.
 
@@ -348,12 +349,12 @@ Before `AUTHENTICATE`, `CAPABILITY` (the capability list again, then `OK "Capabi
 | Form | Handling |
 |---|---|
 | `AUTHENTICATE "MECH" "base64"` | quoted IR (`\"` escapes handled) |
-| `AUTHENTICATE "MECH" {n+}` CRLF `<n bytes>` CRLF | literal IR, n ≤ 65536. Only `{n+}` (RFC 5804 §4): `{n}`, `{n++}`, text after the header or after the octets are refused. |
+| `AUTHENTICATE "MECH" {n+}` CRLF `<n bytes>` CRLF | literal IR, n ≤ 65536, each read of the octets bounded by the idle timeout. Only `{n+}` (RFC 5804 §4): `{n}`, `{n++}`, text after the header or after the octets are refused. |
 | `AUTHENTICATE "MECH"` | proxy sends the empty challenge `""` and reads the response as a string: quoted, a literal `{n+}`, or a bare line (RFC 5804 §2.1). |
 | mech not in `XOAUTH2`, `OAUTHBEARER`, `PLAIN` (e.g. `LOGIN`) | `NO "Authentication mechanism not supported"`, before any challenge |
 | `AUTHENTICATE "PLAIN"` without IR where the connection does not offer PLAIN | `NO (AUTH-TOO-WEAK) "password authentication not available on this endpoint"`, without a challenge |
 | anything else (another command, unquoted mech, bad literal, literal > 64 KiB) | `NO "Invalid AUTHENTICATE"` (closed) |
-| `"*"` / `*` as the response, a response that is not base64 or holds no valid credential (the cases listed for [IMAP](#imap-sasl-exchange)) | `NO "Invalid authentication response"`; a malformed string (bad literal, text after the quoted string) closes the connection |
+| `"*"` / `*` as the response, a response that is not base64 or holds no valid credential (the cases listed for [IMAP](#imap-sasl-exchange)) | `NO "Invalid authentication response"`; a malformed string (bad literal, text after the quoted string) or a response line over 23512 bytes ([line limits](architecture.md#line-reading)) closes the connection after it. An `AUTHENTICATE` line that long closes without a reply. |
 | an OAuth response with an empty `auth` value (discovery, RFC 7628 §4.3) | the [OAuth error result](#oauth-error-result), then `NO "Authentication failed"`; `authresult` `protocol`, not a failed login |
 
 ### ManageSieve: decision and backend login
@@ -366,9 +367,9 @@ Before `AUTHENTICATE`, `CAPABILITY` (the capability list again, then `OK "Capabi
 | PLAIN refused by the legacy gate (including a password over 1024 bytes) | `NO "Authentication failed"`, after `failure_delay_ms` (see below) | `blocked_endpoint`, `unknown_domain`, `unknown_account`, `throttled`, `oversize` |
 | account check unavailable | `NO (TRYLATER) "Service temporarily unavailable"` | none (counted in `mail_auth_proxy_backend_errors_total`) |
 | the pre-auth budget runs out during token validation, the account check or the backend login | `NO (TRYLATER) "Service temporarily unavailable"` | none (counted in `mail_auth_proxy_backend_errors_total`) |
-| backend reply `NO` (except `NO (TRYLATER)`), `BYE (AUTH-TOO-WEAK)`, `BYE (TRANSITION-NEEDED)`, or any other reply that is neither `OK` nor `BYE` | `NO "Authentication failed"` | `backend_reject` |
+| backend reply `NO` (except `NO (TRYLATER)`), `BYE (AUTH-TOO-WEAK)`, `BYE (TRANSITION-NEEDED)`; for a password also any other reply that is neither `OK` nor `BYE` | `NO "Authentication failed"` | `backend_reject` |
 | the backend's OAUTHBEARER error result has `status` `invalid_request` | `NO (TRYLATER) "Service temporarily unavailable"` | none (counted in `mail_auth_proxy_backend_errors_total`) |
-| backend session fails (connect, TLS, capabilities), or it answers `NO (TRYLATER)` or any other `BYE` (shutdown, connection limit) | `NO (TRYLATER) "Service temporarily unavailable"` | none (counted in `mail_auth_proxy_backend_errors_total`) |
+| backend session fails (connect, TLS, capabilities), or it answers `NO (TRYLATER)`, any other `BYE` (shutdown, connection limit) or, for a token, a reply that is neither `OK`, `NO` nor `BYE` | `NO (TRYLATER) "Service temporarily unavailable"` | none (counted in `mail_auth_proxy_backend_errors_total`) |
 | backend `OK …` | the backend's reply line verbatim (e.g. `OK "Logged in."`), then relay | `ok` |
 
 The backend session is opened only after the credential has passed the local checks. It sends `AUTHENTICATE "<mech>" "<ir>"` (`XOAUTH2` or `OAUTHBEARER` for a token, `PLAIN` for a password), with a response over 1024 octets (any sizable token) as a literal `{n+}` instead of the quoted string (RFC 5804 §4), and reads the reply. For a token, a reply that is a string (quoted, or a literal `{n}` of at most 4096 octets) is the backend's error challenge: it is answered with `""` (XOAUTH2) or `"AQ=="` (OAUTHBEARER), and the next line is the verdict. An authenticated session therefore uses one backend connection, plus one probe connection when the capability cache is cold.
@@ -477,7 +478,7 @@ the result is `{"status":"invalid_token"}`.
 - A client that does not answer is cut off by the pre-auth budget
   (`timeouts.preauth_secs`, counted from the accept) or the idle timeout, whichever ends
   first. It gets the final reply, and the connection closes. A client that closes the
-  connection just ends the session. An answer longer than 16384 bytes is treated like no
+  connection just ends the session. An answer longer than 23512 bytes is treated like no
   answer.
 - The `authresult` line (`bad_token`) is written once, before the challenge; the answer
   changes neither it nor the metrics. The journal's session-end detail (DEBUG) notes an

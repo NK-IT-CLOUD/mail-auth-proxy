@@ -251,7 +251,8 @@ async fn overlong_answer_hits_the_line_limit() {
             )
             .await;
         error_result(kind, &challenge);
-        c.send(&"A".repeat(20_000)).await;
+        // Over the limit of a line that can carry a SASL response (23512).
+        c.send(&"A".repeat(30_000)).await;
         // The proxy closes with the rest of the line unread, so its reply
         // may be lost to the reset; the session end is what counts.
         let _ = c.read_to_close().await;

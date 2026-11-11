@@ -195,8 +195,8 @@ async fn sieve_token_rejections() {
     rejections(Kind::Sieve).await;
 }
 
-/// A token over 16384 bytes (reachable through a ManageSieve literal) is a
-/// bad token without validation.
+/// A token over 16384 bytes in a ManageSieve literal is a bad token without
+/// validation (on a line, for every protocol: `tests/token_size.rs`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn oversize_token_is_bad_token() {
     let h = Harness::start().await;

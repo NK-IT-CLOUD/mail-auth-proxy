@@ -1,6 +1,7 @@
 //! Pre-auth limits: the per-IP cap on unauthenticated connections (shared by
 //! all three listeners, released on login) and the total pre-auth budget.
-//! Both close silently: no greeting, no 421, no BYE.
+//! Both close silently: no greeting, no 421, no BYE. The idle timeout
+//! bounds every read within the budget, a ManageSieve literal's included.
 
 mod common;
 use common::*;
@@ -186,4 +187,64 @@ async fn preauth_budget_closes_silent_clients() {
         m["mail_auth_proxy_preauth_aborts_total{proto=\"sieve\",scope=\"external\"}"],
         1
     );
+}
+
+/// Run `closed` (which ends when the proxy closes) and check it took at
+/// least the 1 s idle timeout and less than `within`.
+async fn closed_within(closed: impl std::future::Future<Output = ()>, within: Duration) {
+    let t = Instant::now();
+    closed.await;
+    let e = t.elapsed();
+    assert!(
+        e >= Duration::from_millis(900) && e < within,
+        "closed after {e:?}"
+    );
+}
+
+/// The octets of a ManageSieve literal are read with the idle timeout per
+/// read: a client that sends the literal header and stalls is closed after
+/// the idle timeout, not after the pre-auth budget. Before TLS (a `NOOP` tag)
+/// and after it (the initial response of `AUTHENTICATE`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stalled_sieve_literal_hits_the_idle_timeout() {
+    let h = Harness::start_with(Opts {
+        preauth_secs: 30,
+        idle_secs: 1,
+        ..Opts::default()
+    })
+    .await;
+    let h = &h;
+    // The literal is never completed; well within the 30 s budget, the
+    // session ends: after the literal's idle timeout (and, before TLS, the
+    // idle timeout of the next command line, as a failed NOOP is answered).
+    let pre_tls = async {
+        let mut c = Client::connect(h.proxy.sieve, Src::External).await;
+        c.sieve_response().await;
+        c.send_raw(b"NOOP {100+}\r\nfirst part").await;
+        assert_eq!(c.line().await, "NO \"Invalid NOOP argument\"");
+        c.expect_closed().await;
+    };
+    let post_tls = async {
+        let (mut c, _, _) = h.sieve(Src::External, Sni::Public).await;
+        c.send_raw(b"AUTHENTICATE \"XOAUTH2\" {100+}\r\nfirst part")
+            .await;
+        assert_eq!(c.line().await, "NO \"Invalid AUTHENTICATE\"");
+        c.expect_closed().await;
+    };
+    tokio::join!(
+        closed_within(pre_tls, Duration::from_secs(5)),
+        closed_within(post_tls, Duration::from_secs(3))
+    );
+    h.wait_session_ended(Kind::Sieve, 2).await;
+    let ended: Vec<String> = h
+        .proxy
+        .logs()
+        .into_iter()
+        .filter(|l| l.contains(session_ended(Kind::Sieve)))
+        .collect();
+    assert!(
+        ended.iter().all(|l| l.contains("timed out after 1s")),
+        "{ended:#?}"
+    );
+    assert!(ended.iter().any(|l| l.contains("literal")), "{ended:#?}");
 }

@@ -12,7 +12,7 @@
 //! must not tell one cause of the rejection from another.
 
 use crate::config::OAuth;
-use crate::wire::line::read_client_line;
+use crate::wire::line::read_auth_line;
 use crate::wire::Tuning;
 use base64::Engine;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -101,7 +101,7 @@ where
     let line = crate::wire::deadline_at(until, tuning.preauth, "error challenge", async {
         stream.write_all(format!("{prompt}\r\n").as_bytes()).await?;
         stream.flush().await?;
-        Ok(read_client_line(stream, tuning.idle).await?)
+        Ok(read_auth_line(stream, tuning.idle).await?)
     })
     .await?;
     Ok(classify(mech, &line))

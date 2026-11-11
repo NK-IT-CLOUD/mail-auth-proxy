@@ -5,7 +5,8 @@ use crate::auth::legacy::MechSet;
 use crate::auth::sasl::{Discovery, Mechanism};
 use crate::auth::Withheld;
 use crate::wire::line::{
-    initial_response, is_bad_response, read_client_line, read_sasl_response, sasl_login_step,
+    initial_response, is_bad_response, read_auth_line, read_client_line, read_sasl_response,
+    sasl_login_step,
 };
 use crate::wire::Tuning;
 use anyhow::Context as _;
@@ -78,7 +79,8 @@ pub async fn read_client_auth<S: AsyncRead + AsyncWrite + Unpin>(
     }
     while *cmds < tuning.max_preauth_commands {
         *cmds += 1;
-        let line = match read_client_line(stream, tuning.idle).await {
+        // Any command line can be an AUTHENTICATE with an initial response.
+        let line = match read_auth_line(stream, tuning.idle).await {
             Ok(l) => l,
             // Connect, read the greeting, disconnect: a health check or port
             // probe, not a failed login.

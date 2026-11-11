@@ -1,7 +1,7 @@
 //! The ManageSieve `AUTHENTICATE` command: mechanism and initial response in
 //! quoted or literal form.
 
-use crate::wire::line::{read_client_line, verb_is, LineError};
+use crate::wire::line::{read_auth_line, read_client_line, verb_is, LineError};
 use anyhow::{anyhow, Result};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -130,8 +130,8 @@ pub(crate) fn sieve_string(s: &str) -> String {
 const MAX_LITERAL: usize = 65536;
 
 /// Read the octets of the literal whose header `{n+}` is all of `header`
-/// (the rest of the line); they follow on the next read. They can carry the
-/// credential and are zeroized on drop.
+/// (the rest of the line); they follow on the next read, each read waiting
+/// at most `idle`. They can carry the credential and are zeroized on drop.
 ///
 /// RFC 5804 §4 has clients send only `literal-c2s = "{" number "+}" CRLF
 /// *OCTET`: the octets follow at once. The synchronising `{n}` would wait for
@@ -154,7 +154,22 @@ where
     }
     use tokio::io::AsyncReadExt;
     let mut buf = Zeroizing::new(vec![0u8; n]);
-    stream.read_exact(&mut buf).await?;
+    // A failed read leaves the position in the stream unknown: never
+    // retryable (`auth::answered`), and a close is not a clean one.
+    let mut filled = 0;
+    while filled < n {
+        let read = tokio::time::timeout(idle, stream.read(&mut buf[filled..])).await;
+        let error = match read {
+            Ok(Ok(0)) => LineError::EofMidLine,
+            Ok(Ok(k)) => {
+                filled += k;
+                continue;
+            }
+            Ok(Err(e)) => return Err(anyhow::Error::new(e).context("literal")),
+            Err(_) => LineError::Timeout(idle.as_secs()),
+        };
+        return Err(anyhow::Error::new(error).context("literal"));
+    }
     // The octets end the command or response: the CRLF must follow, or it
     // would reach the post-auth relay as an empty command and shift every
     // response by one. Anything else on that line, an overlong one included,
@@ -170,14 +185,15 @@ where
     Ok(Zeroizing::new(text.to_owned()))
 }
 
-/// Read a SASL client response: one string on its own line, quoted or a
-/// literal (RFC 5804 section 2.1). A bare line is taken as it is. The
-/// response can carry a credential and is zeroized on drop.
+/// Read a SASL client response: one string on its own line (up to
+/// `MAX_AUTH_LINE` bytes), quoted or a literal (RFC 5804 section 2.1). A
+/// bare line is taken as it is. The response can carry a credential and is
+/// zeroized on drop.
 pub(crate) async fn read_sasl_string<S>(stream: &mut S, idle: Duration) -> Result<Zeroizing<String>>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
-    let line = read_client_line(stream, idle).await?;
+    let line = read_auth_line(stream, idle).await?;
     let line = line.trim();
     if line.starts_with('"') {
         match unquote_string(line) {
@@ -308,6 +324,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next, "LISTSCRIPTS");
+    }
+
+    /// The octets of a literal are read with the idle timeout per read: a
+    /// client that stops in the middle fails the read after `idle`.
+    #[tokio::test]
+    async fn stalled_literal_times_out() {
+        use tokio::io::AsyncWriteExt;
+        let idle = Duration::from_millis(200);
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        client.write_all(b"AQ").await.unwrap();
+        let read = parse_authenticate_line("AUTHENTICATE \"XOAUTH2\" {4+}", &mut server, idle);
+        let e = tokio::time::timeout(Duration::from_secs(5), read)
+            .await
+            .expect("the literal read waits without a timeout")
+            .unwrap_err();
+        assert!(
+            e.chain()
+                .any(|c| matches!(c.downcast_ref(), Some(LineError::Timeout(_)))),
+            "{e:#}"
+        );
+        drop(client);
     }
 
     /// Oversized literal {99999999+} is rejected before allocation (pre-auth DoS guard).

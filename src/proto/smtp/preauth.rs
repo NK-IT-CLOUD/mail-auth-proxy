@@ -5,7 +5,7 @@ use crate::auth::legacy::MechSet;
 use crate::auth::sasl::{Discovery, Mechanism};
 use crate::auth::Withheld;
 use crate::wire::line::{
-    initial_response, is_bad_response, read_client_line, read_sasl_response, sasl_login_step,
+    initial_response, is_bad_response, read_auth_line, read_sasl_response, sasl_login_step,
 };
 use anyhow::{anyhow, Context as _, Result};
 use std::time::Duration;
@@ -70,7 +70,7 @@ where
                 .write_all(format!("334 {challenge}\r\n").as_bytes())
                 .await?;
             stream.flush().await?;
-            let answer = read_client_line(stream, idle)
+            let answer = read_auth_line(stream, idle)
                 .await
                 .map(|l| discovery::classify(&mech, &l))
                 .map_err(anyhow::Error::new);
