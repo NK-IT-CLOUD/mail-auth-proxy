@@ -6,7 +6,7 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.8.0] - 2026-11-09
+## [0.8.0] - 2026-11-11
 
 ### Added
 - Backend key `post_login_guard` (default `true`). `false` relays the IMAP and ManageSieve
@@ -23,8 +23,54 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   ManageSieve logins by how their session is relayed, `guard="on"` through the command
   guard, `"off"` without it (`post_login_guard = false`) and `"safety_net"` through it
   although the backend is set to `false`, because it advertised `UNAUTHENTICATE`.
+- `--check-config --online` also fetches the JWKS of every issuer, as a start does, and
+  names each issuer whose JWKS cannot be fetched or holds no usable signing key. Exit
+  status 3 means the configuration is valid but a start would fail on a JWKS; the usage
+  text lists the statuses.
+- Configuration warnings for `require_email_verified = false` with
+  `identity_claim = "email"` (the mailbox then comes from an address the identity
+  provider has not verified) and for a network written as IPv4-mapped IPv6
+  (`::ffff:192.0.2.0/120`) in any network list: it never matches, because IPv4 clients
+  are compared as IPv4 addresses.
+- Metric label `reason="shutdown"` of `mail_auth_proxy_sessions_ended_total`.
 
 ### Changed
+- Package upgrade: a running service is restarted only when `--check-config --online`
+  passes, the JWKS of every issuer included. With an identity provider down during the
+  upgrade the running process, which has its keys, is kept, a warning names the command
+  to run later, and the new version starts with the next restart. Before, the restart
+  followed `--check-config` alone and the new process did not start.
+- Without `RUST_LOG` the log filter is `error,mail_auth_proxy=info,authlog=info` (was
+  `info` for every target): the proxy's own lines as before, the libraries' lines only
+  at `ERROR`. The systemd unit no longer sets `RUST_LOG`. A `RUST_LOG` you set yourself
+  replaces the whole filter, so name the proxy's targets in it, for example
+  `RUST_LOG=error,mail_auth_proxy=debug,authlog=info` ([docs/operations.md](docs/operations.md#logging)).
+- A session that ends before any credential was presented (EOF, a failed TLS handshake,
+  an unknown command, the command limit, the pre-auth budget) is logged at `INFO`
+  instead of `WARN`; on a public address these are mostly scanners. The text and
+  `mail_auth_proxy_preauth_aborts_total` are unchanged. Alerts that count `WARN` lines
+  see fewer of them.
+- Shutdown: sessions still open after the drain time (10 s) are closed with a TLS
+  `close_notify` on both sides, within 2 s more, instead of ending with the process.
+  New log lines: `sessions still open after the drain time; closing them`, a
+  `session closed at shutdown` line per session, and `logged-in sessions closed; exiting`.
+- The system trust store is read once per start and reload and shared by the backends
+  (was once per backend address).
+- A client line that can carry a SASL response (a command line after TLS, the response
+  to a challenge) may be 23512 bytes long (was 16384), room for a token of the token
+  limit, 16384 bytes, in the largest SASL message. Tokens between about 12 KB and that
+  limit were cut off on IMAP and SMTP with `line too long` and are accepted now; a larger
+  token is a `bad_token` with the protocol's normal reply on every protocol. Whether the
+  backend takes a token that size is its own limit ([docs/backend-dovecot-postfix.md](docs/backend-dovecot-postfix.md)).
+- CrowdSec (`contrib/crowdsec`): the scenario `mail-auth-proxy/slow-bf` counts distinct
+  pairs of login and password fingerprint, as the proxy's rate limit does, so an external
+  client that keeps retrying one stale password is no longer banned after three retries.
+  A package upgrade does not replace the copies under `/etc/crowdsec`: install the parser
+  and this scenario again ([contrib/crowdsec/README.md](contrib/crowdsec/README.md#after-a-package-upgrade)).
+- The weekly fuzz run keeps each target's corpus between runs when the repository
+  variable `FUZZ_CORPUS` names a directory on the runner, and runs the stateful targets
+  for 300 s; the `relay_guard` target checks every command the guard blocks. Dependabot
+  version updates are off: the updates come from Renovate.
 - SMTP submission listeners: the refused ALPN IDs follow the IANA registry as of
   2026-10-25, which adds `n-pamp/3`; a client that offers it now gets
   `no_application_protocol` like for the other registered IDs.
@@ -47,6 +93,33 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   certificates and the metrics token are re-read, as a loaded one does: a metrics scrape
   that followed the line could be accepted under the settings being replaced and closed
   unanswered. `docs/operations.md` lists the reload lines in their actual order.
+- ManageSieve: a backend reply to a token's `AUTHENTICATE` that is neither `OK`, `NO` nor
+  `BYE` is an outage (retry-later, `mail_auth_proxy_backend_errors_total`), as on IMAP
+  and SMTP. It was written as `backend_reject` and counted as a failed login in the rate
+  limit and in log-based blocking. For a password such a reply stays a rejection.
+- ManageSieve: each read of the octets of a literal (`{n+}`) is bounded by
+  `timeouts.idle_secs`; a client that stopped in the middle held the connection until the
+  pre-auth budget ended.
+
+### Security
+- Legacy gate: a password the gate refused could be told from a wrong password for an
+  account a rule lets through by its timing. Parallel attempts for one account were
+  answered together when refused and one backend login apart when they reached the
+  backend, and the learned refusal time included the wait for the account's turn and
+  never expired. Every password attempt now ends with a backend login, real or
+  simulated, and is answered at its end, no earlier than `legacy.failure_delay_ms`, plus
+  jitter; with `legacy.throttle`, refused attempts take turns per account in a table of
+  their own, so they never delay a real login. A sample of the learned time is the
+  backend's latency alone and counts for one hour. Not equalised is a backend delay that
+  grows with a source's failures: turn Dovecot's authentication penalty off behind the
+  proxy ([docs/backend-dovecot-postfix.md](docs/backend-dovecot-postfix.md#failure-delay-and-auth-penalty)).
+- CrowdSec parser (`contrib/crowdsec`): the pattern matched `authresult result=` anywhere
+  in a line of the program, so client text in a line of another target could be read as
+  an `authresult` event. It is anchored at the start of the line (timestamp, level,
+  `authlog: authresult `). Install the parser again after the upgrade.
+- The default log filter (see Changed) keeps the libraries' `INFO` and `WARN` lines out
+  of the journal: they can carry client text the proxy does not escape, such as a
+  rejected TLS server name, in the stream that log parsers read.
 
 ## [0.7.0] - 2026-10-25
 
