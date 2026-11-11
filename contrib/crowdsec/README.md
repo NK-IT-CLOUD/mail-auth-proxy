@@ -3,12 +3,17 @@
 A parser for the `authresult` log line (see [docs/operations.md](../../docs/operations.md#the-authresult-line))
 and five scenarios that ban attacking source IPs with the CrowdSec engine and a bouncer.
 
+The parser takes a line only from its start: the timestamp, the level (`INFO` or `WARN`)
+and the target `authlog`, then `authresult result=`. The same text anywhere else, in a line
+of another target of the proxy or after other content on an `authlog` line, is not parsed,
+so client text that ends up in another log line cannot forge an `authresult` event.
+
 | File | Name | Fires when | Bucket | `blackhole` |
 |---|---|---|---|---|
 | `scenarios/mail-auth-proxy-bf.yaml` | `mail-auth-proxy/bf` | failed logins from one external IP (bad tokens, `authzid_mismatch`, refused, oversized or rejected passwords; not `protocol`) | leaky, capacity 10, leakspeed 20 s | 5 min |
 | `scenarios/mail-auth-proxy-user-enum.yaml` | `mail-auth-proxy/user-enum` | many different accounts tried with passwords from one external IP | leaky, 5 distinct accounts, leakspeed 1 min | 10 min |
 | `scenarios/mail-auth-proxy-password-probe.yaml` | `mail-auth-proxy/password-probe` | passwords sent from an external IP where the proxy does not offer them (`blocked_endpoint`) | leaky, capacity 3, leakspeed 1 min | 10 min |
-| `scenarios/mail-auth-proxy-slow-bf.yaml` | `mail-auth-proxy/slow-bf` | slow password guessing from an external IP | leaky, capacity 2, leakspeed 1 h | 2 h |
+| `scenarios/mail-auth-proxy-slow-bf.yaml` | `mail-auth-proxy/slow-bf` | slow password guessing from an external IP; a retry with the same login and password counts once | leaky, 2 distinct attempts, leakspeed 1 h | 2 h |
 | `scenarios/mail-auth-proxy-honeypot-users.yaml` | `mail-auth-proxy/honeypot-users` | a failed password login from an external IP with a role or test account name (`admin@`, `postmaster@`, `test@`, …) | trigger | 24 h |
 
 `internal` and `external` are the proxy's `scope` field: internal means the source is in
@@ -61,14 +66,42 @@ Check that live lines are parsed:
 sudo cscli explain --dsn "journalctl://filters=_SYSTEMD_UNIT=mail-auth-proxy.service" --type syslog
 ```
 
+### After a package upgrade
+
+A package upgrade replaces the files under `/usr/share/doc/mail-auth-proxy/crowdsec/`, not
+the copies you installed under `/etc/crowdsec`: CrowdSec keeps running the parser and
+scenarios of the release you installed them from. After each upgrade, compare the
+installed copies with the packaged files (the changelog names changes to them):
+
+```bash
+cd /usr/share/doc/mail-auth-proxy/crowdsec
+diff -u /etc/crowdsec/parsers/s01-parse/mail-auth-proxy-logs.yaml parsers/s01-parse/mail-auth-proxy-logs.yaml
+for f in scenarios/mail-auth-proxy-*.yaml; do diff -u "/etc/crowdsec/$f" "$f"; done
+diff -u /etc/crowdsec/acquis.d/mail-auth-proxy.yaml acquis/mail-auth-proxy.yaml
+```
+
+Copy every changed file with the `install` commands above. Where you changed a copy
+yourself (the honeypot list, a parser filter for another program name), carry your change
+over into the new file instead of overwriting it. Then reload CrowdSec and check the lists
+as after the first install.
+
 ## Buckets and bans
 
 A leaky bucket holds `capacity` events per source IP and drains one event every
 `leakspeed`; the event that finds the bucket full overflows it and raises the alert. For
 `bf` that is the 11th counted failure while 10 are still in the bucket: 11 failures within
 20 seconds always overflow, and a steady rate above one failure per 20 seconds overflows
-after a while. For `slow-bf` it is a third failure while two are pending, for example
-three failures within one hour.
+after a while. For `slow-bf` it is a third distinct failure while two are pending, for
+example three different passwords within one hour.
+
+`slow-bf` counts distinct attempts only (`distinct` on login and `pwfp`), as the proxy's
+own rate limit does: a client that keeps retrying the same stale password counts once, so
+it does not get its address banned. The bucket of an address remembers what it counted
+until it has drained. `pwfp` is keyed per process, so after a restart of the proxy the same
+password counts once more. A line without `pwfp` (a password mechanism the connection does
+not offer, refused before the password is sent; an OAuth credential) counts once per
+login; `password-probe` and `bf` count every such line. The fast `bf` bucket counts every
+failure, identical ones included.
 
 Buckets are per address. An IPv6 source is one bucket per /128, so an attacker who rotates
 addresses within a /64 is not caught by the per-IP buckets; the hub scenarios behave the
@@ -93,10 +126,11 @@ The directory `contrib/crowdsec/.tests/` in the
 [source repository](https://github.com/NK-IT-CLOUD/mail-auth-proxy) (not part of the
 package) holds [`cscli hubtest`](https://doc.crowdsec.net/docs/cscli/cscli_hubtest) cases: one
 for the parser (every documented reason, lines without the optional `pwfp` and `rule`
-fields, IPv6, injected text in the user field, lines that must not match) and one per
+fields, IPv6, injected text in the user field, lines that must not match: another program,
+another target of the proxy, the `authresult` text after other content) and one per
 scenario, each with negative cases (internal sources, successful logins, repeated single
-account, attempts too slow to count). To run them, copy the files into a checkout of
-[crowdsecurity/hub](https://github.com/crowdsecurity/hub):
+account, attempts too slow to count, for `slow-bf` identical retries). To run them, copy
+the files into a checkout of [crowdsecurity/hub](https://github.com/crowdsecurity/hub):
 
 ```bash
 HUB=/path/to/hub

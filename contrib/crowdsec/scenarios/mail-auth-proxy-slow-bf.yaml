@@ -1,13 +1,32 @@
 # Slow or distributed brute force: a few failed password logins per source IP,
 # spread over hours, stay below the fast buckets. Only external sources count, so
 # an internal client with an outdated password is not banned by this bucket.
+#
+# Only distinct attempts count, like the proxy's own failed-login rate limit: an
+# attempt with the same login and the same password fingerprint (`pwfp`) as one the
+# address's bucket has already counted is a retry, not a guess, so an external
+# client that keeps retrying a stale password does not get its address banned. The
+# bucket remembers what it counted until it has drained and is closed. `pwfp` is
+# keyed per process, so after a restart of the proxy the same password counts once
+# more.
+# A line without `pwfp` (a password mechanism withheld on a connection that does
+# not offer it, `blocked_endpoint`; an OAuth credential the backend rejects or no
+# route takes) counts once per login, as the proxy's rate limit counts a withheld
+# attempt (the login with an empty password): such a line carries no guess to tell
+# apart, so different logins are different attempts and repeating one login is a
+# retry. Withheld attempts without a login therefore
+# count once per bucket here; mail-auth-proxy/password-probe and mail-auth-proxy/bf
+# count every one of them.
 type: leaky
 name: mail-auth-proxy/slow-bf
 description: "mail-auth-proxy: slow password brute force from an external IP"
 filter: "evt.Meta.log_type == 'mail_auth_proxy_auth' && evt.Meta.auth_scope == 'external' && evt.Meta.log_subtype in ['blocked_endpoint', 'unknown_domain', 'unknown_account', 'throttled', 'oversize', 'backend_reject']"
 groupby: evt.Meta.source_ip
-# holds 2 failures and leaks one per hour: a third failure within the hour overflows;
-# slower attempts leak away (the fast bucket mail-auth-proxy/bf covers bursts)
+# login and password fingerprint; `sanitize` keeps `/` out of the login, so the
+# pair is unambiguous
+distinct: evt.Meta.username + '/' + evt.Parsed.pwfp
+# holds 2 failures and leaks one per hour: a third distinct failure within the hour
+# overflows; slower attempts leak away (the fast bucket mail-auth-proxy/bf covers bursts)
 capacity: 2
 leakspeed: 1h
 blackhole: 2h

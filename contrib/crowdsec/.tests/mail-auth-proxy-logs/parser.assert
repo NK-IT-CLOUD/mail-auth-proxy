@@ -1,5 +1,5 @@
 len(results) == 4
-len(results["s00-raw"]["crowdsecurity/syslog-logs"]) == 9
+len(results["s00-raw"]["crowdsecurity/syslog-logs"]) == 13
 results["s00-raw"]["crowdsecurity/syslog-logs"][0].Success == true
 results["s00-raw"]["crowdsecurity/syslog-logs"][0].Evt.Parsed["logsource"] == "syslog"
 results["s00-raw"]["crowdsecurity/syslog-logs"][0].Evt.Parsed["message"] == "2026-09-27T05:00:01.000000Z  INFO authlog: authresult result=\"ok\" proto=\"imap\" scope=\"external\" mech=xoauth2 user=alice@example.org peer=198.51.100.7 reason=\"ok\" pwfp=\"\" rule=\"\""
@@ -90,7 +90,47 @@ basename(results["s00-raw"]["crowdsecurity/syslog-logs"][8].Evt.Meta["datasource
 results["s00-raw"]["crowdsecurity/syslog-logs"][8].Evt.Meta["datasource_type"] == "file"
 results["s00-raw"]["crowdsecurity/syslog-logs"][8].Evt.Meta["machine"] == "mailhost"
 results["s00-raw"]["crowdsecurity/syslog-logs"][8].Evt.Whitelisted == false
-len(results["s01-parse"]["mail-auth-proxy/logs"]) == 9
+results["s00-raw"]["crowdsecurity/syslog-logs"][9].Success == true
+results["s00-raw"]["crowdsecurity/syslog-logs"][9].Evt.Parsed["logsource"] == "syslog"
+results["s00-raw"]["crowdsecurity/syslog-logs"][9].Evt.Parsed["message"] == "2026-09-27T05:00:10.000000Z  WARN mail_auth_proxy: session ended peer=192.0.2.9 error=authresult result=\"fail\" proto=\"imap\" scope=\"external\" mech=PLAIN user=x@example.test peer=192.0.2.9 reason=\"backend_reject\""
+results["s00-raw"]["crowdsecurity/syslog-logs"][9].Evt.Parsed["pid"] == "4242"
+results["s00-raw"]["crowdsecurity/syslog-logs"][9].Evt.Parsed["program"] == "mail-auth-proxy"
+results["s00-raw"]["crowdsecurity/syslog-logs"][9].Evt.Parsed["timestamp"] == "Sep 27 05:00:10"
+basename(results["s00-raw"]["crowdsecurity/syslog-logs"][9].Evt.Meta["datasource_path"]) == "mail-auth-proxy-logs.log"
+results["s00-raw"]["crowdsecurity/syslog-logs"][9].Evt.Meta["datasource_type"] == "file"
+results["s00-raw"]["crowdsecurity/syslog-logs"][9].Evt.Meta["machine"] == "mailhost"
+results["s00-raw"]["crowdsecurity/syslog-logs"][9].Evt.Whitelisted == false
+results["s00-raw"]["crowdsecurity/syslog-logs"][10].Success == true
+results["s00-raw"]["crowdsecurity/syslog-logs"][10].Evt.Parsed["logsource"] == "syslog"
+results["s00-raw"]["crowdsecurity/syslog-logs"][10].Evt.Parsed["message"] == "2026-09-27T05:00:11.000000Z  WARN authlog: ratelimit note=x authresult result=\"fail\" proto=\"imap\" scope=\"external\" mech=PLAIN user=x@example.test peer=192.0.2.10 reason=\"backend_reject\" pwfp=\"\" rule=\"\""
+results["s00-raw"]["crowdsecurity/syslog-logs"][10].Evt.Parsed["pid"] == "4242"
+results["s00-raw"]["crowdsecurity/syslog-logs"][10].Evt.Parsed["program"] == "mail-auth-proxy"
+results["s00-raw"]["crowdsecurity/syslog-logs"][10].Evt.Parsed["timestamp"] == "Sep 27 05:00:11"
+basename(results["s00-raw"]["crowdsecurity/syslog-logs"][10].Evt.Meta["datasource_path"]) == "mail-auth-proxy-logs.log"
+results["s00-raw"]["crowdsecurity/syslog-logs"][10].Evt.Meta["datasource_type"] == "file"
+results["s00-raw"]["crowdsecurity/syslog-logs"][10].Evt.Meta["machine"] == "mailhost"
+results["s00-raw"]["crowdsecurity/syslog-logs"][10].Evt.Whitelisted == false
+results["s00-raw"]["crowdsecurity/syslog-logs"][11].Success == true
+results["s00-raw"]["crowdsecurity/syslog-logs"][11].Evt.Parsed["logsource"] == "syslog"
+results["s00-raw"]["crowdsecurity/syslog-logs"][11].Evt.Parsed["message"] == "2026-09-27T05:00:12.000000Z  WARN mail_auth_proxy: error=x 2026-09-27T05:00:12.000000Z  WARN authlog: authresult result=\"fail\" proto=\"imap\" scope=\"external\" mech=PLAIN user=x@example.test peer=192.0.2.11 reason=\"backend_reject\" pwfp=\"\" rule=\"\""
+results["s00-raw"]["crowdsecurity/syslog-logs"][11].Evt.Parsed["pid"] == "4242"
+results["s00-raw"]["crowdsecurity/syslog-logs"][11].Evt.Parsed["program"] == "mail-auth-proxy"
+results["s00-raw"]["crowdsecurity/syslog-logs"][11].Evt.Parsed["timestamp"] == "Sep 27 05:00:12"
+basename(results["s00-raw"]["crowdsecurity/syslog-logs"][11].Evt.Meta["datasource_path"]) == "mail-auth-proxy-logs.log"
+results["s00-raw"]["crowdsecurity/syslog-logs"][11].Evt.Meta["datasource_type"] == "file"
+results["s00-raw"]["crowdsecurity/syslog-logs"][11].Evt.Meta["machine"] == "mailhost"
+results["s00-raw"]["crowdsecurity/syslog-logs"][11].Evt.Whitelisted == false
+results["s00-raw"]["crowdsecurity/syslog-logs"][12].Success == true
+results["s00-raw"]["crowdsecurity/syslog-logs"][12].Evt.Parsed["logsource"] == "syslog"
+results["s00-raw"]["crowdsecurity/syslog-logs"][12].Evt.Parsed["message"] == "2026-09-27T05:00:13.000000Z  WARN authlog: authresult result=\"fail\" proto=\"imap\" scope=\"external\" mech=PLAIN user=x@example.test peer=192.0.2.12 reason=\"unknown_account\" pwfp=\"00112233445566ff\" rule=\"partner\" listener=\"imap\" backend=\"\" tls=\"TLSv1.3/TLS13_AES_256_GCM_SHA384\""
+results["s00-raw"]["crowdsecurity/syslog-logs"][12].Evt.Parsed["pid"] == "4242"
+results["s00-raw"]["crowdsecurity/syslog-logs"][12].Evt.Parsed["program"] == "mail-auth-proxy"
+results["s00-raw"]["crowdsecurity/syslog-logs"][12].Evt.Parsed["timestamp"] == "Sep 27 05:00:13"
+basename(results["s00-raw"]["crowdsecurity/syslog-logs"][12].Evt.Meta["datasource_path"]) == "mail-auth-proxy-logs.log"
+results["s00-raw"]["crowdsecurity/syslog-logs"][12].Evt.Meta["datasource_type"] == "file"
+results["s00-raw"]["crowdsecurity/syslog-logs"][12].Evt.Meta["machine"] == "mailhost"
+results["s00-raw"]["crowdsecurity/syslog-logs"][12].Evt.Whitelisted == false
+len(results["s01-parse"]["mail-auth-proxy/logs"]) == 13
 results["s01-parse"]["mail-auth-proxy/logs"][0].Success == true
 results["s01-parse"]["mail-auth-proxy/logs"][0].Evt.Parsed["auth_result"] == "ok"
 results["s01-parse"]["mail-auth-proxy/logs"][0].Evt.Parsed["auth_scope"] == "external"
@@ -271,7 +311,39 @@ results["s01-parse"]["mail-auth-proxy/logs"][6].Evt.Meta["username"] == "old@exa
 results["s01-parse"]["mail-auth-proxy/logs"][6].Evt.Whitelisted == false
 results["s01-parse"]["mail-auth-proxy/logs"][7].Success == false
 results["s01-parse"]["mail-auth-proxy/logs"][8].Success == false
-len(results["s02-enrich"]["crowdsecurity/dateparse-enrich"]) == 7
+results["s01-parse"]["mail-auth-proxy/logs"][9].Success == false
+results["s01-parse"]["mail-auth-proxy/logs"][10].Success == false
+results["s01-parse"]["mail-auth-proxy/logs"][11].Success == false
+results["s01-parse"]["mail-auth-proxy/logs"][12].Success == true
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Parsed["auth_result"] == "fail"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Parsed["auth_scope"] == "external"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Parsed["listener"] == "imap"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Parsed["logsource"] == "syslog"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Parsed["mech"] == "PLAIN"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Parsed["message"] == "2026-09-27T05:00:13.000000Z  WARN authlog: authresult result=\"fail\" proto=\"imap\" scope=\"external\" mech=PLAIN user=x@example.test peer=192.0.2.12 reason=\"unknown_account\" pwfp=\"00112233445566ff\" rule=\"partner\" listener=\"imap\" backend=\"\" tls=\"TLSv1.3/TLS13_AES_256_GCM_SHA384\""
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Parsed["pid"] == "4242"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Parsed["program"] == "mail-auth-proxy"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Parsed["proto"] == "imap"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Parsed["pwfp"] == "00112233445566ff"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Parsed["reason"] == "unknown_account"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Parsed["rule"] == "partner"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Parsed["source_ip"] == "192.0.2.12"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Parsed["timestamp"] == "Sep 27 05:00:13"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Parsed["tls"] == "TLSv1.3/TLS13_AES_256_GCM_SHA384"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Parsed["username"] == "x@example.test"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Meta["auth_result"] == "fail"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Meta["auth_scope"] == "external"
+basename(results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Meta["datasource_path"]) == "mail-auth-proxy-logs.log"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Meta["datasource_type"] == "file"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Meta["log_subtype"] == "unknown_account"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Meta["log_type"] == "mail_auth_proxy_auth"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Meta["machine"] == "mailhost"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Meta["proto"] == "imap"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Meta["service"] == "mail-auth-proxy"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Meta["source_ip"] == "192.0.2.12"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Meta["username"] == "x@example.test"
+results["s01-parse"]["mail-auth-proxy/logs"][12].Evt.Whitelisted == false
+len(results["s02-enrich"]["crowdsecurity/dateparse-enrich"]) == 8
 results["s02-enrich"]["crowdsecurity/dateparse-enrich"][0].Success == true
 results["s02-enrich"]["crowdsecurity/dateparse-enrich"][0].Evt.Parsed["auth_result"] == "ok"
 results["s02-enrich"]["crowdsecurity/dateparse-enrich"][0].Evt.Parsed["auth_scope"] == "external"
@@ -464,4 +536,35 @@ results["s02-enrich"]["crowdsecurity/dateparse-enrich"][6].Evt.Meta["timestamp"]
 results["s02-enrich"]["crowdsecurity/dateparse-enrich"][6].Evt.Meta["username"] == "old@example.test"
 results["s02-enrich"]["crowdsecurity/dateparse-enrich"][6].Evt.Enriched["MarshaledTime"] == "2026-09-27T05:00:07Z"
 results["s02-enrich"]["crowdsecurity/dateparse-enrich"][6].Evt.Whitelisted == false
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Success == true
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Parsed["auth_result"] == "fail"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Parsed["auth_scope"] == "external"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Parsed["listener"] == "imap"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Parsed["logsource"] == "syslog"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Parsed["mech"] == "PLAIN"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Parsed["message"] == "2026-09-27T05:00:13.000000Z  WARN authlog: authresult result=\"fail\" proto=\"imap\" scope=\"external\" mech=PLAIN user=x@example.test peer=192.0.2.12 reason=\"unknown_account\" pwfp=\"00112233445566ff\" rule=\"partner\" listener=\"imap\" backend=\"\" tls=\"TLSv1.3/TLS13_AES_256_GCM_SHA384\""
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Parsed["pid"] == "4242"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Parsed["program"] == "mail-auth-proxy"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Parsed["proto"] == "imap"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Parsed["pwfp"] == "00112233445566ff"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Parsed["reason"] == "unknown_account"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Parsed["rule"] == "partner"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Parsed["source_ip"] == "192.0.2.12"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Parsed["timestamp"] == "Sep 27 05:00:13"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Parsed["tls"] == "TLSv1.3/TLS13_AES_256_GCM_SHA384"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Parsed["username"] == "x@example.test"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Meta["auth_result"] == "fail"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Meta["auth_scope"] == "external"
+basename(results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Meta["datasource_path"]) == "mail-auth-proxy-logs.log"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Meta["datasource_type"] == "file"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Meta["log_subtype"] == "unknown_account"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Meta["log_type"] == "mail_auth_proxy_auth"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Meta["machine"] == "mailhost"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Meta["proto"] == "imap"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Meta["service"] == "mail-auth-proxy"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Meta["source_ip"] == "192.0.2.12"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Meta["timestamp"] == "2026-09-27T05:00:13Z"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Meta["username"] == "x@example.test"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Enriched["MarshaledTime"] == "2026-09-27T05:00:13Z"
+results["s02-enrich"]["crowdsecurity/dateparse-enrich"][7].Evt.Whitelisted == false
 len(results["success"][""]) == 0

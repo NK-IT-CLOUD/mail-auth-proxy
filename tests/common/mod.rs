@@ -1726,24 +1726,35 @@ pub struct AuthResult {
 /// The grok pattern of the shipped CrowdSec parser
 /// (`contrib/crowdsec/parsers/s01-parse/mail-auth-proxy-logs.yaml`),
 /// translated to a regex: WORD = `\b\w+\b`, DATA = `.*?`, NOTSPACE = `\S+`,
-/// IP = grok's IPV4 | IPV6. Each field is a capture group, in pattern order
-/// (1 result … 7 reason).
+/// IP = grok's IPV4 | IPV6, TIMESTAMP_ISO8601 = grok's ISO 8601 timestamp.
+/// Each named field (`%{WORD:proto}`) is a capture group, in pattern order
+/// (1 result … 7 reason); an unnamed one (`%{TIMESTAMP_ISO8601}`) is not.
 pub fn grok_regex() -> regex::Regex {
     const PARSER: &str =
         include_str!("../../contrib/crowdsec/parsers/s01-parse/mail-auth-proxy-logs.yaml");
     const IPV4: &str = r"(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9]?[0-9])";
     const IPV6: &str = r"(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}";
+    // YEAR-MONTHNUM-MONTHDAY[T ]HOUR:?MINUTE(:?SECOND)?ISO8601_TIMEZONE?
+    const TIMESTAMP_ISO8601: &str = r"(?:\d\d){1,2}-(?:0?[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01]|[1-9])[T ](?:2[0123]|[01]?[0-9]):?(?:[0-5][0-9])(?::?(?:[0-5]?[0-9]|60)(?:[:.,][0-9]+)?)?(?:Z|[+-](?:2[0123]|[01]?[0-9])(?::?(?:[0-5][0-9])))?";
     let pattern = PARSER
         .lines()
         .find_map(|l| l.trim().strip_prefix("pattern: '")?.strip_suffix('\''))
         .expect("grok pattern in the CrowdSec parser");
-    let token = regex::Regex::new(r"%\{(\w+):\w+\}").unwrap();
-    let translated = token.replace_all(pattern, |c: &regex::Captures| match &c[1] {
-        "WORD" => r"(\b\w+\b)".to_string(),
-        "DATA" => "(.*?)".to_string(),
-        "NOTSPACE" => r"(\S+)".to_string(),
-        "IP" => format!("({IPV4}|{IPV6})"),
-        other => panic!("grok pattern {other} is not translated"),
+    let token = regex::Regex::new(r"%\{(\w+)(:\w+)?\}").unwrap();
+    let translated = token.replace_all(pattern, |c: &regex::Captures| {
+        let body = match &c[1] {
+            "WORD" => r"\b\w+\b".to_string(),
+            "DATA" => ".*?".to_string(),
+            "NOTSPACE" => r"\S+".to_string(),
+            "IP" => format!("{IPV4}|{IPV6}"),
+            "TIMESTAMP_ISO8601" => TIMESTAMP_ISO8601.to_string(),
+            other => panic!("grok pattern {other} is not translated"),
+        };
+        if c.get(2).is_some() {
+            format!("({body})")
+        } else {
+            format!("(?:{body})")
+        }
     });
     regex::Regex::new(&translated).unwrap()
 }

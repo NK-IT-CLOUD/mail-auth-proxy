@@ -1,6 +1,7 @@
 //! The `authresult` line is an API for log parsers. Every reason the
 //! binary emits is produced here once and pinned byte for byte after the
-//! timestamp; every line must also match the CrowdSec grok pattern. The
+//! timestamp; every line must also match the CrowdSec grok pattern, which
+//! is anchored at the line start up to `authlog: authresult `. The
 //! legacy-gate reasons are pinned in `legacy_gate.rs`. New fields (`rule`,
 //! `listener`, `backend`, `tls`) are only appended at the end, so existing
 //! patterns keep matching. (The harness checks the grok pattern for every authresult line
@@ -141,4 +142,33 @@ async fn golden_authresult_lines() {
     // The same password gives the same fingerprint within one process.
     let pwfp = |l: &str| fp.find(l).unwrap().as_str().to_string();
     assert_eq!(pwfp(&lines[2]), pwfp(&lines[3]));
+}
+
+/// The pattern is anchored at the start of the line up to `authlog:
+/// authresult `: the same text in a line of another target, or after other
+/// content on an `authlog` line, is no `authresult` line. The cases are those
+/// of the parser's hubtest (`contrib/crowdsec/.tests/mail-auth-proxy-logs`).
+#[test]
+fn grok_matches_only_the_authresult_event() {
+    let grok = grok_regex();
+    let parsed = [
+        // The fields of 0.1.0: `reason`, `pwfp`, `rule`.
+        r#"2026-09-27T05:00:01.000000Z  INFO authlog: authresult result="ok" proto="imap" scope="external" mech=xoauth2 user=alice@example.org peer=198.51.100.7 reason="ok" pwfp="" rule="""#,
+        r#"2026-09-27T05:00:07.000000Z  WARN authlog: authresult result="fail" proto="imap" scope="external" mech=PLAIN user=old@example.test peer=192.0.2.5 reason="blocked_endpoint""#,
+        r#"2026-09-27T05:00:13.000000Z  WARN authlog: authresult result="fail" proto="imap" scope="external" mech=PLAIN user=x@example.test peer=192.0.2.12 reason="unknown_account" pwfp="00112233445566ff" rule="partner" listener="imap" backend="" tls="TLSv1.3/TLS13_AES_256_GCM_SHA384""#,
+    ];
+    for l in parsed {
+        assert!(grok.is_match(l), "not parsed: {l}");
+    }
+    let not_parsed = [
+        // Another target of the program.
+        r#"2026-09-27T05:00:10.000000Z  WARN mail_auth_proxy: session ended peer=192.0.2.9 error=authresult result="fail" proto="imap" scope="external" mech=PLAIN user=x@example.test peer=192.0.2.9 reason="backend_reject""#,
+        // Other content before the text on an `authlog` line.
+        r#"2026-09-27T05:00:11.000000Z  WARN authlog: ratelimit note=x authresult result="fail" proto="imap" scope="external" mech=PLAIN user=x@example.test peer=192.0.2.10 reason="backend_reject" pwfp="" rule="""#,
+        // A whole forged line inside the message of another target.
+        r#"2026-09-27T05:00:12.000000Z  WARN mail_auth_proxy: error=x 2026-09-27T05:00:12.000000Z  WARN authlog: authresult result="fail" proto="imap" scope="external" mech=PLAIN user=x@example.test peer=192.0.2.11 reason="backend_reject" pwfp="" rule="""#,
+    ];
+    for l in not_parsed {
+        assert!(!grok.is_match(l), "parsed: {l}");
+    }
 }

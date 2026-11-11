@@ -225,7 +225,9 @@ and a warning is printed. A stopped service stays stopped. Your `config.toml` is
 conffile: an upgrade never changes it and asks nothing, so unattended upgrades work. Compare
 it with `/usr/share/mail-auth-proxy/config.example.toml` for new settings. (Releases up to
 0.2.0 shipped `config.toml` as conffile; upgrading from them keeps your file as it is, and
-`dpkg` lists it as an obsolete conffile.)
+`dpkg` lists it as an obsolete conffile.) If you installed the CrowdSec parser and
+scenarios, the upgrade does not replace your copies under `/etc/crowdsec`; compare them with
+the packaged files ([contrib/crowdsec](contrib/crowdsec/README.md#after-a-package-upgrade)).
 
 An upgrade replaces the binary, so it needs this restart; `systemctl reload` would keep
 the old binary running. A configuration change needs only a reload ([4](#4-check-and-start)).

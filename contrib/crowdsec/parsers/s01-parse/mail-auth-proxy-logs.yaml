@@ -1,4 +1,8 @@
 # Parses the `authresult` line of mail-auth-proxy (docs/operations.md, "The authresult line").
+# The pattern is anchored at the start of the message up to `authlog: authresult `: the
+# timestamp, the level and the target `authlog` that the proxy writes before its own
+# `authresult` event. The same text elsewhere in a line (in another target's line, or
+# after other content on an `authlog` line) does not match.
 # `pwfp`, `rule`, `listener`, `backend` and `tls` follow `reason`; the pattern treats
 # them as optional, so lines of older releases parse as well. Fields appended later are
 # ignored.
@@ -7,7 +11,7 @@ name: mail-auth-proxy/logs
 description: "Parse mail-auth-proxy authentication results"
 filter: "evt.Parsed.program == 'mail-auth-proxy' && evt.Parsed.message contains 'authresult result='"
 grok:
-  pattern: 'authresult result="%{WORD:auth_result}" proto="%{WORD:proto}" scope="%{WORD:auth_scope}" mech=%{NOTSPACE:mech} user=%{DATA:username} peer=%{IP:source_ip} reason="%{WORD:reason}"( pwfp="%{DATA:pwfp}")?( rule="%{DATA:rule}")?( listener="%{WORD:listener}")?( backend="%{DATA:backend}")?( tls="%{DATA:tls}")?'
+  pattern: '^%{TIMESTAMP_ISO8601}\s+(?:INFO|WARN)\s+authlog: authresult result="%{WORD:auth_result}" proto="%{WORD:proto}" scope="%{WORD:auth_scope}" mech=%{NOTSPACE:mech} user=%{DATA:username} peer=%{IP:source_ip} reason="%{WORD:reason}"( pwfp="%{DATA:pwfp}")?( rule="%{DATA:rule}")?( listener="%{WORD:listener}")?( backend="%{DATA:backend}")?( tls="%{DATA:tls}")?'
   apply_on: message
 statics:
   - meta: service
