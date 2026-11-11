@@ -11,16 +11,27 @@ const DEFAULT_CONFIG: &str = "/etc/mail-auth-proxy/config.toml";
 /// (rustls logs a rejected SNI value), and log parsers read the same stream.
 const DEFAULT_LOG_FILTER: &str = "error,mail_auth_proxy=info,authlog=info";
 
-const USAGE: &str = "usage: mail-auth-proxy [-t | --check-config | --print-config] [CONFIG]
+const USAGE: &str =
+    "usage: mail-auth-proxy [-t | --check-config [--online] | --print-config] [CONFIG]
        mail-auth-proxy --version
        mail-auth-proxy -h | --help
 
   CONFIG           configuration file (default /etc/mail-auth-proxy/config.toml)
   -t, --check-config
                    validate CONFIG, load its certificates and CA files, then exit
+  --online         with --check-config: also fetch the JWKS of every issuer, as a
+                   start does
   --print-config   print the effective configuration
   --version        print the version
-  -h, --help       print this usage";
+  -h, --help       print this usage
+
+exit status: 0 success; 1 invalid configuration or start failed; 2 usage error;
+  3 (--check-config --online) configuration valid, but the JWKS of an issuer
+  has no usable signing key or cannot be fetched";
+
+/// `--check-config --online`: the configuration is valid, but a start would
+/// fail on the JWKS of an issuer.
+const EXIT_JWKS: i32 = 3;
 
 enum Mode {
     Run,
@@ -47,9 +58,11 @@ async fn main() -> Result<()> {
 
     let mut mode = Mode::Run;
     let mut path = None;
+    let mut online = false;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "-t" | "--check-config" => mode = Mode::Check,
+            "--online" => online = true,
             "--print-config" => mode = Mode::Print,
             "--version" => {
                 println!("mail-auth-proxy {}", mail_auth_proxy::version());
@@ -65,6 +78,10 @@ async fn main() -> Result<()> {
             }
             a => path = Some(a.to_string()),
         }
+    }
+    if online && !matches!(mode, Mode::Check) {
+        eprintln!("{USAGE}");
+        std::process::exit(2);
     }
     let path = path.unwrap_or_else(|| DEFAULT_CONFIG.into());
     let loaded = config::load(&path)?;
@@ -83,16 +100,32 @@ async fn main() -> Result<()> {
             for w in &warnings {
                 tracing::warn!("config: {w}");
             }
-            if problems.is_empty() {
-                println!("{path}: configuration OK ({} warning(s)); JWKS reachability is checked at start and reload",
+            if !problems.is_empty() {
+                eprintln!(
+                    "{path}: invalid configuration:\n  - {}",
+                    problems.join("\n  - ")
+                );
+                std::process::exit(1);
+            }
+            if !online {
+                println!("{path}: configuration OK ({} warning(s)); JWKS reachability is checked at start and reload, and with --online",
                     warnings.len());
                 return Ok(());
             }
+            let failed = server::check_jwks(&loaded.config).await?;
+            if failed.is_empty() {
+                println!(
+                    "{path}: configuration OK ({} warning(s)); JWKS of every issuer loaded",
+                    warnings.len()
+                );
+                return Ok(());
+            }
             eprintln!(
-                "{path}: invalid configuration:\n  - {}",
-                problems.join("\n  - ")
+                "{path}: configuration valid ({} warning(s)), but a start would fail: no usable JWKS for\n  - {}",
+                warnings.len(),
+                failed.join("\n  - ")
             );
-            std::process::exit(1);
+            std::process::exit(EXIT_JWKS);
         }
         Mode::Run => {
             for w in &loaded.warnings {

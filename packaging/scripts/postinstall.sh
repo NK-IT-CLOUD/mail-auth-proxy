@@ -1,6 +1,7 @@
 #!/bin/sh
 # Never enables or starts the service. On upgrade: restart only a running unit,
-# and only with a valid config; otherwise the old process keeps running.
+# and only with a valid config and the JWKS of every issuer reachable; otherwise
+# the old process keeps running.
 set -e
 upgrade=0
 case "$1" in
@@ -22,23 +23,36 @@ fi
 systemctl daemon-reload || echo "mail-auth-proxy: warning: systemctl daemon-reload failed" >&2
 
 # Check with the service's credentials, so an unreadable key or config blocks
-# the restart as it would block the start.
+# the restart as it would block the start. --online also fetches the JWKS of
+# every issuer, which a start needs: status 3 means the config is valid but an
+# identity provider is unreachable or has no usable key.
 check_config() {
     if command -v systemd-run >/dev/null 2>&1; then
         systemd-run --wait --pipe --collect --quiet -p User=mail-auth-proxy -p Group=mail-auth-proxy \
-            /usr/bin/mail-auth-proxy --check-config "$conf"
+            /usr/bin/mail-auth-proxy --check-config --online "$conf"
     else
         echo "mail-auth-proxy: warning: no systemd-run, config checked as root (file permissions not checked)" >&2
-        /usr/bin/mail-auth-proxy --check-config "$conf"
+        /usr/bin/mail-auth-proxy --check-config --online "$conf"
     fi
 }
 
 if [ "$upgrade" = 1 ] && systemctl is-active --quiet mail-auth-proxy.service; then
-    if check_config; then
-        systemctl try-restart mail-auth-proxy.service \
-            || echo "mail-auth-proxy: warning: restart failed, see: journalctl -u mail-auth-proxy" >&2
-    else
-        echo "mail-auth-proxy: warning: config check failed, the running service was NOT restarted" >&2
-    fi
+    status=0
+    check_config || status=$?
+    case $status in
+        0)
+            systemctl try-restart mail-auth-proxy.service \
+                || echo "mail-auth-proxy: warning: restart failed, see: journalctl -u mail-auth-proxy" >&2
+            ;;
+        3)
+            echo "mail-auth-proxy: warning: the JWKS of an identity provider could not be loaded (see above);" \
+                "the running service was kept and NOT restarted, the new version starts with its next restart." \
+                "Once the provider answers, restart it:" \
+                "mail-auth-proxy --check-config --online $conf && systemctl restart mail-auth-proxy" >&2
+            ;;
+        *)
+            echo "mail-auth-proxy: warning: config check failed, the running service was NOT restarted" >&2
+            ;;
+    esac
 fi
 exit 0

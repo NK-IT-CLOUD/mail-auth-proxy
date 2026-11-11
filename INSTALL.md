@@ -195,7 +195,8 @@ sudo systemd-run --wait --pipe --quiet -p User=mail-auth-proxy -p Group=mail-aut
 ```
 
 At start the proxy fetches every JWKS; if one is unreachable or has no usable key, it
-refuses to start. A successful start logs `imap listener up` (and `submission`/`sieve`)
+refuses to start. `--check-config --online` fetches them the same way before you start
+and names each issuer that would stop the start (exit status 3). A successful start logs `imap listener up` (and `submission`/`sieve`)
 with the listen and backend addresses. Test with a mail client and look for
 `authresult result="ok"` in the journal.
 
@@ -220,8 +221,16 @@ With APT: `sudo apt update && sudo apt upgrade`. With RPM: verify the new RPM an
 `dnf install` it as above. Read the [changelog](CHANGELOG.md) before upgrading.
 
 On upgrade the package restarts a **running** service only if the configuration passes
-`--check-config` with the service's credentials; otherwise the old process keeps running
-and a warning is printed. A stopped service stays stopped. Your `config.toml` is not a
+`--check-config --online` with the service's credentials: the file is valid and the JWKS of
+every issuer loads. Otherwise the old process, which already has its keys, keeps running
+and a warning is printed; when only an identity provider was unreachable, the new version
+starts with the next restart. Once the provider answers:
+
+```bash
+sudo mail-auth-proxy --check-config --online /etc/mail-auth-proxy/config.toml && sudo systemctl restart mail-auth-proxy
+```
+
+A stopped service stays stopped. Your `config.toml` is not a
 conffile: an upgrade never changes it and asks nothing, so unattended upgrades work. Compare
 it with `/usr/share/mail-auth-proxy/config.example.toml` for new settings. (Releases up to
 0.2.0 shipped `config.toml` as conffile; upgrading from them keeps your file as it is, and

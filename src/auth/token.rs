@@ -254,6 +254,54 @@ async fn fetch_jwks(client: &reqwest::Client, url: &str) -> Result<Value> {
     Ok(serde_json::from_slice(&body)?)
 }
 
+/// Why an issuer's JWKS gave no usable signing key.
+enum JwksFailure {
+    /// The fetch failed: connection, status, size or JSON.
+    Fetch(anyhow::Error),
+    /// The JWKS is no key set the proxy can read.
+    Parse(anyhow::Error),
+    /// The JWKS holds no usable signing key.
+    NoUsableKeys,
+}
+
+/// An issuer whose JWKS gave no usable signing key, and why.
+struct FailedJwks {
+    issuer: String,
+    url: String,
+    why: JwksFailure,
+}
+
+impl FailedJwks {
+    /// The warning of a start, reload or refresh.
+    fn log(&self) {
+        let issuer = &self.issuer;
+        match &self.why {
+            JwksFailure::Fetch(e) => {
+                tracing::warn!(target: crate::obs::target::TOKEN, %issuer, url = %self.url, error = %e, "fetching JWKS")
+            }
+            JwksFailure::Parse(e) => {
+                tracing::warn!(target: crate::obs::target::TOKEN, %issuer, error = %e, "parsing JWKS")
+            }
+            JwksFailure::NoUsableKeys => {
+                tracing::warn!(target: crate::obs::target::TOKEN, %issuer, "JWKS has no usable signing keys")
+            }
+        }
+    }
+}
+
+/// `<issuer>: <why>`, the line of `--check-config --online`.
+impl std::fmt::Display for FailedJwks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.why {
+            JwksFailure::Fetch(e) => write!(f, "{}: fetching {}: {e:#}", self.issuer, self.url),
+            JwksFailure::Parse(e) => write!(f, "{}: parsing the JWKS: {e:#}", self.issuer),
+            JwksFailure::NoUsableKeys => {
+                write!(f, "{}: the JWKS has no usable signing keys", self.issuer)
+            }
+        }
+    }
+}
+
 impl Validator {
     /// The current key map. Poison-tolerant: the lock is held only to clone
     /// or swap the `Arc`, which cannot leave the map half-written.
@@ -271,6 +319,32 @@ impl Validator {
     /// unable to validate that realm's tokens. The periodic refresh is the part
     /// that tolerates a partial outage.
     pub async fn new(oauth: &crate::config::OAuth) -> Result<Validator> {
+        let (v, failed) = Self::load(oauth).await?;
+        if !failed.is_empty() {
+            for f in &failed {
+                f.log();
+            }
+            let issuers: Vec<&str> = failed.iter().map(|f| f.issuer.as_str()).collect();
+            return Err(anyhow!(
+                "JWKS unavailable at startup for: {}",
+                issuers.join(", ")
+            ));
+        }
+        Ok(v)
+    }
+
+    /// What `new` would find, without logging it: one line per issuer
+    /// whose JWKS gives no usable signing key, naming the reason (for
+    /// `--check-config --online`). Empty when a start would load the keys
+    /// of every issuer.
+    pub async fn check(oauth: &crate::config::OAuth) -> Result<Vec<String>> {
+        let (_, failed) = Self::load(oauth).await?;
+        Ok(failed.iter().map(ToString::to_string).collect())
+    }
+
+    /// The validator of `oauth` with the keys of every JWKS that loaded,
+    /// and the issuers whose JWKS did not, unlogged (`new` and `check`).
+    async fn load(oauth: &crate::config::OAuth) -> Result<(Validator, Vec<FailedJwks>)> {
         if oauth.issuers.is_empty() {
             return Err(anyhow!("no issuers configured"));
         }
@@ -293,18 +367,12 @@ impl Validator {
             last_kid_refetch: tokio::sync::Mutex::new(None),
             jwks: Default::default(),
         };
-        let (keys, failed) = v.fetch_all().await;
-        if !failed.is_empty() {
-            return Err(anyhow!(
-                "JWKS unavailable at startup for: {}",
-                failed.join(", ")
-            ));
-        }
-        if keys.is_empty() {
+        let (keys, failed) = v.fetch_unlogged(&v.policies).await;
+        if failed.is_empty() && keys.is_empty() {
             return Err(anyhow!("no sig keys in any JWKS"));
         }
         v.set_keys(keys);
-        Ok(v)
+        Ok((v, failed))
     }
 
     /// Fetch every configured JWKS. Sources are independent: a source that
@@ -320,11 +388,23 @@ impl Validator {
         self.fetch(&self.policies).await
     }
 
-    /// `fetch_all` for the issuers of `policies`.
+    /// `fetch_all` for the issuers of `policies`; logs each issuer that failed.
     async fn fetch(
         &self,
         policies: &[Arc<Policy>],
     ) -> (HashMap<String, Vec<KeyEntry>>, Vec<String>) {
+        let (keys, failed) = self.fetch_unlogged(policies).await;
+        for f in &failed {
+            f.log();
+        }
+        (keys, failed.into_iter().map(|f| f.issuer).collect())
+    }
+
+    /// `fetch` without the log lines, the issuers that failed with the reason.
+    async fn fetch_unlogged(
+        &self,
+        policies: &[Arc<Policy>],
+    ) -> (HashMap<String, Vec<KeyEntry>>, Vec<FailedJwks>) {
         let mut fetches = tokio::task::JoinSet::new();
         for (i, policy) in policies.iter().enumerate() {
             let (client, url) = (self.client.clone(), policy.jwks_url.clone());
@@ -342,7 +422,7 @@ impl Validator {
         for (policy, result) in policies.iter().zip(fetched) {
             let issuer = &policy.issuer;
             let result = result.unwrap_or_else(|| Err(anyhow!("JWKS fetch task failed")));
-            match result {
+            let failure = match result {
                 Ok(jwks) => {
                     // Staged, so a JWKS that fails half-way leaves none of its
                     // keys in the map (refresh would add the previous keys on
@@ -356,10 +436,7 @@ impl Validator {
                         // A realm that publishes zero usable keys is treated as
                         // failed: replacing its keys with nothing would lock
                         // that realm's users out until the next refresh.
-                        Ok(_) if staged.is_empty() => {
-                            tracing::warn!(target: crate::obs::target::TOKEN, %issuer, "JWKS has no usable signing keys");
-                            failed.push(issuer.clone());
-                        }
+                        Ok(_) if staged.is_empty() => Some(JwksFailure::NoUsableKeys),
                         Ok(_) => {
                             crate::obs::metrics::record_jwks_fetch(issuer, true);
                             self.jwks
@@ -369,21 +446,20 @@ impl Validator {
                             for (kid, entries) in staged {
                                 keys.entry(kid).or_default().extend(entries);
                             }
+                            None
                         }
-                        Err(e) => {
-                            tracing::warn!(target: crate::obs::target::TOKEN, %issuer, error = %e, "parsing JWKS");
-                            failed.push(issuer.clone());
-                        }
+                        Err(e) => Some(JwksFailure::Parse(e)),
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(target: crate::obs::target::TOKEN, %issuer, url = %policy.jwks_url, error = %e, "fetching JWKS");
-                    failed.push(issuer.clone());
-                }
-            }
-            // Any of the three failures above pushed this issuer.
-            if failed.last() == Some(issuer) {
+                Err(e) => Some(JwksFailure::Fetch(e)),
+            };
+            if let Some(why) = failure {
                 crate::obs::metrics::record_jwks_fetch(issuer, false);
+                failed.push(FailedJwks {
+                    issuer: issuer.clone(),
+                    url: policy.jwks_url.clone(),
+                    why,
+                });
             }
         }
         (keys, failed)

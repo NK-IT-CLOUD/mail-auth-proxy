@@ -227,8 +227,20 @@ backend (`doveadm kick`).
   restart-only needs `systemctl restart mail-auth-proxy`. The users and domains files are
   also re-read by themselves within seconds of a change.
 - **Package update** (a new binary): a restart. The package does it itself for a running
-  service, after checking the configuration ([INSTALL.md](../INSTALL.md#5-upgrade)); a
-  reload would keep the old binary running.
+  service, after `mail-auth-proxy --check-config --online` with the service's credentials
+  ([INSTALL.md](../INSTALL.md#5-upgrade)); a reload would keep the old binary running.
+  The check's exit status decides:
+
+  | Status | Meaning | The package |
+  |---|---|---|
+  | 0 | valid configuration, the JWKS of every issuer loaded | restarts the service |
+  | 1 | invalid configuration (or a file the service cannot read) | keeps the running service, warns `config check failed, the running service was NOT restarted` |
+  | 3 | valid configuration, but the JWKS of an issuer cannot be fetched or has no usable signing key: a start would fail | keeps the running service, warns `… the running service was kept and NOT restarted, the new version starts with its next restart` |
+
+  After status 3 the old binary runs on with the keys it has. Once the identity provider
+  answers, `mail-auth-proxy --check-config --online /etc/mail-auth-proxy/config.toml &&
+  systemctl restart mail-auth-proxy` starts the new one. A reboot or a manual restart
+  still needs every provider ([architecture.md](architecture.md)).
 
 ## Log-based blocking
 
@@ -250,7 +262,8 @@ and an `Environment=` line) while you look for them, and switch back afterwards.
 
 | Symptom | Where to look | Common cause |
 |---|---|---|
-| The service does not start | `journalctl -u mail-auth-proxy`; `mail-auth-proxy --check-config <file>` | invalid key or value (all are listed), including a relative file path; a JWKS unreachable or without usable key at start; no system RNG (`password fingerprint key`); a listener address in use; certificate, key or config not readable by group `mail-auth-proxy` |
+| The service does not start | `journalctl -u mail-auth-proxy`; `mail-auth-proxy --check-config --online <file>` | invalid key or value (all are listed), including a relative file path; a JWKS unreachable or without usable key at start (status 3, the issuer is named); no system RNG (`password fingerprint key`); a listener address in use; certificate, key or config not readable by group `mail-auth-proxy` |
+| The old version still runs after a package upgrade | the upgrade's output: `config check failed` or `the running service was kept` | the configuration was invalid, or an identity provider did not answer during the upgrade ([package update](#configuration-change-or-package-update)): fix it, or wait for the provider, then `mail-auth-proxy --check-config --online <file> && systemctl restart mail-auth-proxy` |
 | SMTP clients are shown no extensions (no `SIZE`, `PIPELINING`, …) after STARTTLS, or an outdated list | `WARN … submission backend EHLO extensions not available` | the proxy's EHLO probe of the submission backend fails; until one succeeds the last list is used, before the first none. Check the backend as for failing logins |
 | Every login ends with a retry-later reply; `mail_auth_proxy_backend_errors_total` rises | `WARN … session ended … error=` | `client_ip = "proxy_v2"` against a backend listener that does not expect the header (Dovecot without `haproxy = yes`, the proxy missing from `haproxy_trusted_networks`), or the other way round; a backend `tls` that does not match the backend port (`implicit` against a STARTTLS port gives a TLS error, `starttls` against an implicit-TLS port a greeting timeout or garbage); `refused the OAUTHBEARER request as invalid_request`: the backend could not use the OAUTHBEARER message (`auth_forward`); `invalid peer certificate: UnknownIssuer` (backend CA not in the system store: set `ca_file`); `NotValidForName` (set `verify_name`); backend down (with `addresses`: every address down or failing, `mail_auth_proxy_backend_up` 0, `WARN … backend address failed; trying the next`) |
 | OAuth logins fail with `reason="bad_token"` | `DEBUG … token rejected: …` | `InvalidAudience`: the mail audience is missing from the token (audience mapper); `not an access token`: wrong `token_type` or an ID token was sent; `email not verified`; `unknown kid`: the key is not in the JWKS even after a refresh (if the last on-demand refresh failed for the issuer the token claims, the client gets retry-later instead and the journal `WARN … unknown kid; JWKS refresh failed`); `identity outside the issuer's identity_domains`: the identity's domain is not in that issuer's `identity_domains`; `client not allowed`: the `client_claim` (`azp`, or `client_id` for `token_type = "rfc9068"`) not in `allowed_clients`; `ExpiredSignature`: client clock or token lifetime; `token larger than 16384 bytes`: keep large claims (groups, roles) out of mail tokens |

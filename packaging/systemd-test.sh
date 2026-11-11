@@ -6,7 +6,8 @@
 # `run` installs /pkg/old.deb (a release that shipped config.toml as conffile;
 # 0.1.1 created only the group mail-auth-proxy), changes the config, upgrades to
 # /pkg/new.deb, starts the service with a local JWKS and a self-signed
-# certificate (the backends are never contacted), reloads, upgrades and stops it.
+# certificate (the backends are never contacted), reloads, upgrades (also with the
+# JWKS endpoint down: the running service is kept) and stops it.
 # It writes its output to /out/log; systemd then exits with its status
 # (SuccessAction= and FailureAction=). The caller also requires the final OK line.
 set -eu
@@ -46,6 +47,17 @@ fail() {
     exit 1
 }
 main_pid() { systemctl show -P MainPID $unit; }
+# The local JWKS endpoint (/srv/jwks) as the transient unit test-jwks.
+start_jwks() {
+    systemd-run --quiet --collect --unit=test-jwks -p DynamicUser=yes \
+        python3 -m http.server --bind 127.0.0.1 --directory /srv/jwks 8080
+    for _ in $(seq 50); do
+        python3 -c 'import urllib.request as u; u.urlopen("http://127.0.0.1:8080/certs.json", timeout=1)' \
+            2>/dev/null && return 0
+        sleep 0.2
+    done
+    fail "local JWKS endpoint did not start"
+}
 
 test_run() {
     echo "== systemd $(systemctl --version | head -n 1), $(systemctl is-system-running || true)"
@@ -69,13 +81,7 @@ test_run() {
     y=$(openssl ec -in /srv/jwk-key.pem -pubout -outform DER 2>/dev/null | tail -c 32 | b64url)
     printf '{"keys":[{"kty":"EC","crv":"P-256","use":"sig","alg":"ES256","kid":"test","x":"%s","y":"%s"}]}\n' \
         "$x" "$y" > /srv/jwks/certs.json
-    systemd-run --quiet --unit=test-jwks -p DynamicUser=yes \
-        python3 -m http.server --bind 127.0.0.1 --directory /srv/jwks 8080
-    for _ in $(seq 50); do
-        python3 -c 'import urllib.request as u; u.urlopen("http://127.0.0.1:8080/certs.json", timeout=1)' \
-            2>/dev/null && break
-        sleep 0.2
-    done
+    start_jwks
 
     # The local change to the conffile. The backends are never contacted: no client
     # logs in.
@@ -144,6 +150,22 @@ EOF
     ! echo "$out" | grep -q "mail-auth-proxy: warning" || fail "reinstall warned"
     systemctl is-active --quiet $unit || fail "not active after upgrade"
     [ "$(main_pid)" != "$pid" ] || fail "upgrade did not restart the service"
+    pid=$(main_pid)
+
+    echo "== upgrade while the identity provider is down: the running service is kept"
+    systemctl stop test-jwks.service
+    out=$(dpkg -i "$pkg" 2>&1) || { echo "$out"; fail "reinstall"; }
+    echo "$out"
+    echo "$out" | grep -q "the running service was kept and NOT restarted" \
+        || fail "JWKS unreachable: no warning"
+    ! echo "$out" | grep -q "config check failed" || fail "JWKS unreachable: reported as an invalid config"
+    systemctl is-active --quiet $unit || fail "not active after the upgrade with the JWKS unreachable"
+    [ "$(main_pid)" = "$pid" ] || fail "JWKS unreachable: restarted anyway"
+    echo "== the provider answers again: the restart the warning names"
+    start_jwks
+    mail-auth-proxy --check-config --online $conf && systemctl restart $unit || fail "restart after the provider is back"
+    systemctl is-active --quiet $unit || fail "not active after the restart"
+    [ "$(main_pid)" != "$pid" ] || fail "restart kept the process"
     pid=$(main_pid)
 
     echo "== upgrade with a key the service cannot read: no restart"

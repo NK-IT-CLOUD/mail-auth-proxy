@@ -8,7 +8,7 @@ to `/etc/mail-auth-proxy/config.toml`, with all password settings commented out.
 ## Command line
 
 ```
-mail-auth-proxy [-t | --check-config | --print-config] [CONFIG]
+mail-auth-proxy [-t | --check-config [--online] | --print-config] [CONFIG]
 mail-auth-proxy --version
 mail-auth-proxy -h | --help
 ```
@@ -16,13 +16,14 @@ mail-auth-proxy -h | --help
 | Argument | Effect |
 |---|---|
 | `CONFIG` | configuration file, default `/etc/mail-auth-proxy/config.toml` |
-| `-t`, `--check-config` | validate the file and exit: every problem at once, including unreadable certificates, keys and CA files, the legacy users and domains files and the doveadm key and CA file; JWKS reachability is not checked. Exit status 0 when valid, 1 otherwise. |
+| `-t`, `--check-config` | validate the file and exit: every problem at once, including unreadable certificates, keys and CA files, the legacy users and domains files and the doveadm key and CA file; JWKS reachability is not checked without `--online`. Exit status 0 when valid, 1 otherwise. |
+| `--online` | with `--check-config` only: after the checks above pass, fetch the JWKS of every issuer as a start does and list each issuer whose JWKS cannot be fetched or has no usable signing key, with the reason. Exit status 0 when a start would load the keys of every issuer, 3 when the file is valid but one does not, 1 when the file is invalid (nothing is fetched then). |
 | `--print-config` | print the effective configuration as TOML on stdout (defaults filled in, `[password_gate]` shown as the rule it stands for); exits non-zero after printing if the file is invalid |
 | `--version` | print `mail-auth-proxy X.Y.Z (commit <sha12>)`; `commit unknown` for a plain `cargo build` |
 | `-h`, `--help` | print the usage on stdout and exit with status 0 |
 
-An unknown option or a second `CONFIG` argument prints the usage on stderr and exits with
-status 2.
+An unknown option, a second `CONFIG` argument or `--online` without `--check-config`
+prints the usage on stderr and exits with status 2.
 
 Warnings (settings that are allowed but weaken something) are logged as `config: …` at
 `WARN`, at startup, on a reload and with `--check-config`; the list is in

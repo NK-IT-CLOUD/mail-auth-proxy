@@ -3,7 +3,8 @@
 #   smoke-test.sh OLD.deb|rpm NEW.deb|rpm COMMIT systemd-sysusers|useradd
 # OLD and NEW are the same build with two versions: install, check, upgrade with
 # a changed config, remove (and purge on deb). Then the restart logic of the
-# maintainer scripts against a stub systemctl (and systemd-run, where installed).
+# maintainer scripts against a stub systemctl (and systemd-run, where installed),
+# with a local JWKS endpoint that is then taken down.
 set -eu
 old=$1 new=$2 commit=$3 branch=$4
 conf=/etc/mail-auth-proxy/config.toml
@@ -100,7 +101,7 @@ getent group mail-auth-proxy >/dev/null || fail "remove deleted the group"
 getent passwd mail-auth-proxy >/dev/null || fail "remove deleted the user"
 
 echo "== restart logic (stub systemctl, /run/systemd/system)"
-if [ $fmt = deb ]; then apt-get install -y -qq openssl >/dev/null; else dnf install -y -q openssl >/dev/null; fi
+if [ $fmt = deb ]; then apt-get install -y -qq openssl python3 >/dev/null; else dnf install -y -q openssl python3 >/dev/null; fi
 calls=/tmp/systemctl.calls
 mkdir -p /run/systemd/system
 cat > /usr/bin/systemctl <<'STUB'
@@ -144,6 +145,34 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
 chown root:mail-auth-proxy /path/to/privkey.pem /path/to/fullchain.pem
 chmod 0640 /path/to/privkey.pem /path/to/fullchain.pem
 mail-auth-proxy --check-config $conf >/dev/null || fail "test config is not valid"
+# The upgrade check fetches the JWKS: serve one on 127.0.0.1 (an ephemeral port, the
+# container may share the runner's network) and point the example's issuer at it.
+# An EC P-256 public key in DER ends with the point 0x04 || X || Y (32 bytes each).
+mkdir -p /srv/jwks
+openssl ecparam -name prime256v1 -genkey -noout -out /srv/jwk-key.pem
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d =; }
+x=$(openssl ec -in /srv/jwk-key.pem -pubout -outform DER 2>/dev/null | tail -c 64 | head -c 32 | b64url)
+y=$(openssl ec -in /srv/jwk-key.pem -pubout -outform DER 2>/dev/null | tail -c 32 | b64url)
+printf '{"keys":[{"kty":"EC","crv":"P-256","use":"sig","alg":"ES256","kid":"test","x":"%s","y":"%s"}]}\n' \
+    "$x" "$y" > /srv/jwks/certs.json
+python3 -c 'import functools, http.server as h
+s = h.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(h.SimpleHTTPRequestHandler, directory="/srv/jwks"))
+with open("/srv/jwks.port", "w") as f: f.write(str(s.server_address[1]))
+s.serve_forever()' >/dev/null 2>&1 &
+jwks_pid=$!
+for _ in $(seq 50); do [ -s /srv/jwks.port ] && break; sleep 0.2; done
+[ -s /srv/jwks.port ] || fail "local JWKS server did not start"
+python3 - "$conf" "http://127.0.0.1:$(cat /srv/jwks.port)/certs.json" <<'PY'
+import sys
+path, url = sys.argv[1:]
+old = "https://sso.example.org/realms/mail/protocol/openid-connect/certs"
+with open(path) as f:
+    text = f.read()
+assert text.count(old) == 1, "the example's jwks_url not found once"
+with open(path, "w") as f:
+    f.write(text.replace(old, url))
+PY
+mail-auth-proxy --check-config --online $conf >/dev/null || fail "test config: JWKS not loaded"
 
 : > $calls
 install_pkg "$new" >/dev/null
@@ -152,6 +181,7 @@ called "try-restart mail-auth-proxy.service" || fail "upgrade, valid config: no 
 if [ $sd_run = 1 ]; then
     called "systemd-run .*User=mail-auth-proxy -p Group=mail-auth-proxy" || fail "check did not run with the service's credentials"
     called "systemd-run .*--collect" || fail "check without --collect (a failed unit would stay loaded)"
+    called "systemd-run .*--check-config --online" || fail "check without --online"
 fi
 
 cp $conf /tmp/config.good
@@ -161,6 +191,16 @@ out=$(reinstall_pkg "$new" 2>&1) || { echo "$out"; fail "reinstall with an inval
 ! called "try-restart" || fail "invalid config: restarted anyway"
 echo "$out" | grep -q "config check failed, the running service was NOT restarted" || fail "invalid config: no warning"
 cp /tmp/config.good $conf
+
+# The identity provider is down: valid config, but a start would fail.
+kill $jwks_pid
+wait $jwks_pid 2>/dev/null || true
+: > $calls
+out=$(reinstall_pkg "$new" 2>&1) || { echo "$out"; fail "reinstall with the JWKS unreachable failed"; }
+! called "try-restart" || fail "JWKS unreachable: restarted anyway"
+echo "$out" | grep -q "no usable JWKS for" || { echo "$out"; fail "JWKS unreachable: the check did not name the issuer"; }
+echo "$out" | grep -q "the running service was kept and NOT restarted" || { echo "$out"; fail "JWKS unreachable: no warning"; }
+! echo "$out" | grep -q "config check failed" || { echo "$out"; fail "JWKS unreachable: reported as an invalid config"; }
 
 if [ $sd_run = 1 ]; then
     # Readable for root only: the root check passes, the service check must not.

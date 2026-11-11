@@ -260,7 +260,7 @@ Validation is local; the proxy makes no introspection or userinfo call. A token 
 JWKS handling:
 
 - The JWKS of all issuers are fetched in parallel, each with a 10 s timeout, at startup, on every refresh and for an unknown `kid`. One round therefore takes at most one fetch timeout, however many IdPs are down, and so does the wait of a token that needs it.
-- At startup, if any configured JWKS is unreachable, unparsable, or has no usable key, **the proxy refuses to start**.
+- At startup, if any configured JWKS is unreachable, unparsable, or has no usable key, **the proxy refuses to start**. A reboot or a restart therefore needs every identity provider to answer. `--check-config --online` runs the same fetch without starting and names each issuer that would stop the start (exit status 3); the package upgrade runs it before it restarts a running service and keeps that service, which already has its keys, when it fails.
 - It refreshes all JWKS every `oauth.refresh_secs` (default 300 s). An issuer whose refresh succeeds has its keys fully replaced, which is how key revocation takes effect. An issuer whose refresh fails keeps its previous keys.
 - A key with missing or undecodable members is skipped with a warning (RFC 7517 §5) and counted in `mail_auth_proxy_jwks_keys_skipped_total`; the other keys of the set are used. Only a set without any usable key fails.
 - A signing key published after the last refresh is picked up by the unknown-`kid` refresh (step 1), so it is accepted within seconds. Random `kid`s cannot cause more than one refresh per 30 s.

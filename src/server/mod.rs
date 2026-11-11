@@ -804,6 +804,13 @@ pub fn check(loaded: &config::Loaded) -> (Vec<String>, Vec<String>) {
     (problems, warnings)
 }
 
+/// What `--check-config --online` adds: the JWKS of every issuer of `cfg`,
+/// fetched and read as a start does. One line per issuer without a usable
+/// signing key, naming the reason; empty when a start would load them all.
+pub async fn check_jwks(cfg: &config::Config) -> Result<Vec<String>> {
+    crate::auth::token::Validator::check(&cfg.oauth).await
+}
+
 /// Serve `cfg` (already validated, read from `path`): build the listeners'
 /// shared context, fetch the JWKS, start the metrics endpoint and the
 /// configured listeners, then serve until SIGTERM or SIGINT.
