@@ -37,8 +37,9 @@ pub struct Shutdown {
     /// Becomes `true` when the drain time of a shutdown is over.
     close: watch::Receiver<bool>,
     /// Upgraded by each relay for as long as it runs: the server's receiver
-    /// sees the channel close once the last relay has closed its streams.
-    /// Weak, so a session before login does not count.
+    /// sees the channel close once the last relay has closed its streams,
+    /// or a message from a relay that gave up closing them
+    /// (`close_timed_out`). Weak, so a session before login does not count.
     relays: mpsc::WeakSender<()>,
 }
 
@@ -53,6 +54,17 @@ impl Shutdown {
         let mut close = self.close.clone();
         if close.wait_for(|c| *c).await.is_err() {
             std::future::pending::<()>().await;
+        }
+    }
+
+    /// A relay the server closes gave up closing its streams after
+    /// `CLOSE_GRACE` (a peer that does not read): tell the server, so that
+    /// it reports it whichever of the two ends first, this relay or the
+    /// server's wait for the relays. One message is enough for any number
+    /// of relays.
+    fn close_timed_out(&self) {
+        if let Some(relays) = self.relays.upgrade() {
+            let _ = relays.try_send(());
         }
     }
 }
@@ -236,10 +248,14 @@ where
         _ = shutdown.closing() => SessionEnd::Shutdown,
     };
     if is_limit(end) || matches!(end, SessionEnd::Blocked | SessionEnd::Shutdown) {
-        let _ = tokio::time::timeout(super::CLOSE_GRACE, async {
+        let closed = tokio::time::timeout(super::CLOSE_GRACE, async {
             tokio::join!(client.shutdown(), backend.shutdown())
         })
-        .await;
+        .await
+        .is_ok();
+        if !closed && end == SessionEnd::Shutdown {
+            shutdown.close_timed_out();
+        }
     }
     end
 }
@@ -552,7 +568,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn shutdown_closes_an_open_session_like_a_limit() {
         let (close, close_rx) = watch::channel(false);
-        let (relays, _) = mpsc::channel(1);
+        let (relays, mut relays_closed) = mpsc::channel(1);
         let shutdown = Shutdown::new(close_rx, relays.downgrade());
         let (mut client, mut proxy_client) = tokio::io::duplex(1024);
         let (mut backend, mut proxy_backend) = tokio::io::duplex(1024);
@@ -575,6 +591,68 @@ mod tests {
         assert_eq!(task.await.unwrap(), SessionEnd::Shutdown);
         assert_closed(&mut client).await;
         assert_closed(&mut backend).await;
+        // Closed in time: nothing to tell the server.
+        assert!(relays_closed.try_recv().is_err());
+    }
+
+    /// A stream that takes every write and never finishes its shutdown: a
+    /// peer that does not read while a TLS close_notify waits to be sent.
+    struct NeverCloses;
+
+    impl AsyncRead for NeverCloses {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for NeverCloses {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    /// A relay the server closes whose client does not take the close gives
+    /// up after `CLOSE_GRACE` and tells the server so; the server then
+    /// reports it whichever of the two ends first.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_reports_a_close_that_timed_out() {
+        let (close, close_rx) = watch::channel(false);
+        let (relays, mut relays_closed) = mpsc::channel(1);
+        let shutdown = Shutdown::new(close_rx, relays.downgrade());
+        let (_backend, mut proxy_backend) = tokio::io::duplex(1024);
+        let task = tokio::spawn(async move {
+            relay(
+                &mut NeverCloses,
+                &mut proxy_backend,
+                &limits(None, None),
+                None,
+                &SystemTime::now,
+                None,
+                &shutdown,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(!task.is_finished());
+        let t0 = Instant::now();
+        close.send(true).unwrap();
+        assert_eq!(task.await.unwrap(), SessionEnd::Shutdown);
+        assert_eq!(t0.elapsed(), crate::wire::CLOSE_GRACE);
+        assert_eq!(relays_closed.try_recv(), Ok(()));
     }
 
     /// Keep both directions busy until the relay ends; how long it ran.

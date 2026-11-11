@@ -793,6 +793,12 @@ fn metrics_access(m: &config::Metrics) -> Result<metrics::Access> {
 /// How long a shutdown waits for open sessions to end before it closes them.
 const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How much longer than `wire::CLOSE_GRACE` a shutdown waits for the relays
+/// it closes: a relay gives up its close after that grace and says so, and
+/// what the relays say is to decide what is reported, not which of two equal
+/// timers ends first.
+const RELAY_END_MARGIN: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Everything `--check-config` finds in a loaded configuration: the
 /// problems (validation errors and file problems, all of them) and the
 /// warnings (validation and certificate files). A reload checks the same.
@@ -818,8 +824,8 @@ pub async fn check_jwks(cfg: &config::Config) -> Result<Vec<String>> {
 /// SIGHUP reloads the configuration from `path` without touching open
 /// connections (`reload`). SIGTERM/SIGINT stop accepting and give open
 /// sessions up to `SHUTDOWN_DRAIN` to end; then the relays still open close
-/// both TLS streams, and the function returns once they have or after
-/// `wire::CLOSE_GRACE`. Under systemd
+/// both TLS streams, and the function returns once they have, or once one
+/// of them gave up after `wire::CLOSE_GRACE`. Under systemd
 /// (`$NOTIFY_SOCKET`) readiness and shutdown are notified.
 pub async fn run(path: String, cfg: config::Config) -> Result<()> {
     // First, before anything slow: SIGHUP's default action terminates the
@@ -967,13 +973,14 @@ pub async fn run(path: String, cfg: config::Config) -> Result<()> {
     tracing::warn!(target: crate::obs::target::MAIN, drain_secs = SHUTDOWN_DRAIN.as_secs(), close_grace_secs = grace.as_secs(),
         "sessions still open after the drain time; closing them");
     let _ = close.send(true);
-    // `None` once no relay holds a sender any more.
+    // `None` once no relay holds a sender any more; a message from a relay
+    // that gave up closing its streams after the grace.
     drop(relays);
-    match tokio::time::timeout(grace, relays_closed.recv()).await {
-        Ok(_) => {
+    match tokio::time::timeout(grace + RELAY_END_MARGIN, relays_closed.recv()).await {
+        Ok(None) => {
             tracing::info!(target: crate::obs::target::MAIN, "logged-in sessions closed; exiting")
         }
-        Err(_) => {
+        Ok(Some(())) | Err(_) => {
             tracing::warn!(target: crate::obs::target::MAIN, close_grace_secs = grace.as_secs(), "logged-in sessions not closed within the close grace; exiting")
         }
     }
