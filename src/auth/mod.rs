@@ -263,8 +263,8 @@ pub struct Session<'a> {
     /// (network + SNI + protocol).
     pub pw_mechs: legacy::MechSet,
     /// End of the connection's pre-auth budget (`Tuning::preauth`). Token
-    /// validation, the legacy gate and the backend login must finish by
-    /// then; the padding of a refused password may run past it.
+    /// validation, the legacy gate and the backend login, real or simulated,
+    /// must finish by then; the padding of a failed password may run past it.
     pub preauth_until: tokio::time::Instant,
 }
 
@@ -283,6 +283,42 @@ async fn within_budget<C>(
                 "the backend login",
             )))
         })
+}
+
+/// The end of a password attempt the legacy gate refused, already logged:
+/// a simulated backend login (`legacy::Gate::simulated_login`, at `backend`
+/// or, before the backend is known, `None`), then the answer at the time of
+/// a backend rejection. Every password attempt whose mechanism the
+/// connection offers thus ends with a backend login, real or simulated, and
+/// is answered at `max(started + failure_delay, end of the login) + jitter`.
+///
+/// The turn and the simulated login run within the pre-auth budget, like
+/// the real ones. When it runs out, the attempt ends as a real one whose
+/// budget runs out while it waits for its turn or logs in: answered as
+/// unavailable, no earlier than an outage is; nothing was unavailable, so no
+/// backend error is counted.
+async fn refuse<C>(
+    ctx: &Shared,
+    s: &Session<'_>,
+    user: &str,
+    backend: Option<&str>,
+    started: tokio::time::Instant,
+) -> Outcome<C> {
+    let gate = &ctx.legacy;
+    let login = gate.simulated_login(s.proto, backend, user);
+    if tokio::time::timeout_at(s.preauth_until, login)
+        .await
+        .is_err()
+    {
+        tokio::time::sleep_until(gate.outage_deadline(s.proto, backend, started)).await;
+        // `Refused`: the authresult line has recorded the attempt.
+        return Outcome::Unavailable(refused(format!(
+            "password refused by the legacy gate; {}",
+            budget_used_up(ctx, "its simulated backend login")
+        )));
+    }
+    tokio::time::sleep_until(gate.answer_deadline(s.proto, backend, started)).await;
+    Outcome::Denied
 }
 
 /// The pre-auth budget ran out during `what`: an outage, not a verdict.
@@ -588,26 +624,29 @@ pub enum Outcome<C> {
 ///
 /// - a mechanism the connection does not offer: `blocked_endpoint`, answered
 ///   as "not available here";
-/// - refused by the gate (`blocked_endpoint` for a user no rule allows,
-///   `unknown_domain` also for a domain no route takes, `unknown_account`,
-///   `throttled`) or by the backend
-///   (`backend_reject`): the same answer to the client. A refusal is
-///   answered as late as a typical backend rejection (the larger of
-///   `legacy.failure_delay_ms` and the median of the recent rejection
-///   latencies of the chosen backend, or of the slowest backend of the
-///   protocol for a refusal before the route), a rejection no earlier than
-///   `failure_delay_ms`; both get the same random jitter, so neither text nor
-///   timing tells the cases apart;
+/// - refused by the gate (`oversize` before it, `blocked_endpoint` for a
+///   user no rule allows, `unknown_domain` also for a domain no route
+///   takes, `unknown_account`, `throttled`) or by the backend
+///   (`backend_reject`): the same answer to the client. Both end with a
+///   backend login, the refusal with a simulated one (`refuse`): with
+///   `legacy.throttle` in the account's turn (a refusal in a table of its
+///   own), lasting the median of the recent rejection latencies of the
+///   chosen backend (of the slowest backend of the protocol for a refusal
+///   before the route). Both are answered at the end of that login, no
+///   earlier than `failure_delay_ms` after the credential, with the same
+///   random jitter, so neither text nor timing tells the cases apart. The
+///   `authresult` line is written when the gate or the backend decides;
 /// - the backend's `ok`, logged with the rule that let the password through.
 ///
-/// Token validation, the account check and the backend login run within the
-/// pre-auth budget; one that does not finish by `Session::preauth_until` is
-/// unavailable.
+/// Token validation, the account check, the turns and the backend login,
+/// real or simulated, run within the pre-auth budget; one that does not
+/// finish by `Session::preauth_until` is unavailable.
 ///
 /// An unavailable backend or account check: no `authresult` line and no
 /// failed attempt, only `backend_errors`. On the password path it is answered
-/// no earlier than a refusal (same deadline and jitter); on the token path
-/// at once, since the gate there is the token, not the account.
+/// no earlier than a refusal (`legacy::Gate::outage_deadline`, same jitter);
+/// on the token path at once, since the gate there is the token, not the
+/// account.
 pub async fn authorize<B: BackendLogin>(
     ctx: &Shared,
     s: &Session<'_>,
@@ -745,8 +784,7 @@ pub async fn authorize<B: BackendLogin>(
                 // Before the gate, so the answer does not depend on the
                 // account; answered like any refusal.
                 event(user, Reason::Oversize, &pwfp, "", "");
-                tokio::time::sleep_until(gate.refusal_deadline(s.proto, None, started)).await;
-                return Outcome::Denied;
+                return refuse(ctx, s, user, None, started).await;
             }
             // The route by the login's domain, before the gate's account
             // check: that belongs to the backend, and a domain no route
@@ -788,20 +826,20 @@ pub async fn authorize<B: BackendLogin>(
                     }
                     event(user, reason, &pwfp, rule, "");
                     let backend = backend_name.filter(|_| for_backend);
-                    tokio::time::sleep_until(gate.refusal_deadline(s.proto, backend, started))
-                        .await;
-                    return Outcome::Denied;
+                    return refuse(ctx, s, user, backend, started).await;
                 }
                 legacy::Verdict::Unavailable(e) => {
                     metrics::record_backend_error(s.proto);
                     // Padded like a refusal: an instant retry-later would
                     // tell accounts that reach the check from those the
                     // gate refuses earlier.
-                    tokio::time::sleep_until(gate.refusal_deadline(s.proto, backend_name, started))
+                    tokio::time::sleep_until(gate.outage_deadline(s.proto, backend_name, started))
                         .await;
                     return Outcome::Unavailable(e.context("legacy account check"));
                 }
             };
+            // The backend login starts in the account's turn: the latency
+            // the refusals learn is the backend's alone.
             let login_started = tokio::time::Instant::now();
             match within_budget(
                 ctx,
@@ -824,7 +862,8 @@ pub async fn authorize<B: BackendLogin>(
                     }
                 }
                 Err(BackendError::Rejected(reply)) => {
-                    let answer_at = gate.rejected_deadline(s.proto, backend_name, started);
+                    let answer_at =
+                        gate.rejected_deadline(s.proto, backend_name, started, login_started);
                     gate.backend_rejected(user);
                     drop(turn);
                     event(user, Reason::BackendReject, &pwfp, rule, backend_name);
@@ -836,7 +875,7 @@ pub async fn authorize<B: BackendLogin>(
                     metrics::record_backend_error(s.proto);
                     // Only accounts that passed the gate get here: padded
                     // like a refusal, so the timing does not tell them apart.
-                    tokio::time::sleep_until(gate.refusal_deadline(
+                    tokio::time::sleep_until(gate.outage_deadline(
                         s.proto,
                         Some(backend_name),
                         started,

@@ -75,8 +75,10 @@ accepts a password only where a rule allows it.
 - Connections without a matching rule are OAuth-only.
 - Rules per source network, TLS server name, protocol, mechanism and user; allowed domains;
   account check via the doveadm HTTP API; per-account throttle.
-- Refused and wrong passwords get the same reply with similar timing; the log keeps the
-  reasons apart. Passwords are never logged, only a per-process keyed fingerprint.
+- Refused and wrong passwords get the same reply and the same timing, parallel attempts
+  for one account included (a refusal simulates the backend login); a backend delay that
+  grows with a source's failures is not equalised and must be off behind the proxy. The
+  log keeps the reasons apart. Passwords are never logged, only a per-process keyed fingerprint.
 
 **Protocols**
 - IMAPS on 993, SMTP submission on 587 (STARTTLS) and optionally 465 (implicit TLS, RFC

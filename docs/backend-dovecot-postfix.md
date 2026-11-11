@@ -61,8 +61,47 @@ ssl_server_key_file = /etc/ssl/mail/privkey.pem
 backend it sends `oauthbearer` instead (RFC 7628, with the backend's name and port as
 `host` and `port`). The working installation uses `xoauth2`; the `oauthbearer` path
 against Dovecot is **not verified**.
+
+### Failure delay and auth penalty
+
 Keep Dovecot's `auth_failure_delay` at its default (2 s) or set it explicitly; the proxy
 pads its own refusals to it (`legacy.failure_delay_ms`).
+
+Turn off Dovecot's authentication penalty when the legacy gate is used:
+
+```
+service anvil {
+  unix_listener anvil-auth-penalty {
+    mode = 0
+  }
+}
+```
+
+The penalty is a second delay that depends on the source's history: after each failed
+login of a client address (an IPv6 /48), Dovecot waits 4, 8, then 15 s before it even
+starts the next authentication from that address, on top of `auth_failure_delay`, until
+29 s pass without a failure. Behind the proxy that address is the real client's, from the
+PROXY header. The proxy's refusals cannot follow such a delay: a second wrong password
+for an account the gate lets through would then come seconds later than a second refusal,
+and that tells the two apart. With the penalty off, the proxy's
+[rate limit](architecture.md#failed-login-rate-limit), the per-account
+[throttle](architecture.md#throttle) and log-based blocking on the `authresult` lines
+(`contrib/crowdsec/`) take its role.
+
+In Dovecot 2.4.5 the switch is global: the listener `anvil-auth-penalty` with mode 0 is
+not created, and the auth process then runs without the penalty for every login, direct
+clients included ([Authentication Penalty, "Disabling"](https://doc.dovecot.org/2.4.5/core/config/auth/penalty.html);
+in the source at tag 2.4.5, `src/master/service.c` skips a unix listener with mode 0 and
+`src/auth/auth-penalty.c` disables the penalty when it cannot connect to it). If the
+same Dovecot also serves clients directly, protect those listeners by other means. The
+page also says a source in `login_trusted_networks` skips the penalty. That path is
+**not verified**: in the 2.4.5 source the function that builds the request flags of a
+login (`client_get_auth_flags` in `src/login-common/sasl-proxy.c`) does not set the flag
+for it (`AUTH_REQUEST_FLAG_NO_PENALTY`). Use the switch above.
+
+For another backend the requirement is the same: a wrong password must take the same
+time on every attempt, whatever the source did before. A failure delay that grows with
+the failures of a client address cannot be matched by the proxy's refusals.
 
 ### Listeners with PROXY protocol v2
 

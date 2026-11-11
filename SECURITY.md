@@ -47,7 +47,7 @@ relays the session (IMAP and ManageSieve through a command guard unless a backen
 | A valid token used for another mailbox | the backend login is the token's identity claim; a different SASL user name is refused |
 | Password guessing and spraying from the internet | no password mechanism unless a legacy rule matches the source network; per-account throttle; a failed-login rate limit per source address; `authresult` lines with keyed password fingerprints for log-based blocking |
 | Token guessing and scanning with new connections per attempt | a failed-login rate limit per source address (IPv4 address; IPv6 network of `limits.ipv6_source_prefix`, by default /64) that closes a blocked source's connections at accept, and an open one at its next credential; at most `limits.max_auth_attempts` attempts per connection |
-| Account and domain enumeration | refusals and wrong passwords get the same reply and similar timing (see [Hardening](#hardening)) |
+| Account and domain enumeration | refusals and wrong passwords get the same reply and the same timing model, parallel attempts included; a backend delay that grows with a source's failures is not equalised and must be off behind the proxy (see [Hardening](#hardening)) |
 | Resource exhaustion before login | connection caps, per-IP cap on unauthenticated connections, one pre-authentication time budget, command, line, literal, token and password size limits |
 | STARTTLS command injection | nothing is read ahead of the TLS switch, so plaintext pipelined after `STARTTLS` cannot reach the encrypted session |
 | Log injection | client text escaped or reduced to a fixed character set in every log field |
@@ -84,7 +84,7 @@ relays the session (IMAP and ManageSieve through a command guard unless a backen
    forged (among the names of the configured certificates; any other name is refused in
    the handshake); the source address is the real boundary. A password refused anywhere is parsed
    only to log the attempt (with a keyed fingerprint, never in clear) and is never
-   forwarded. Refusals and wrong passwords get the same reply and padded timing (see
+   forwarded. Refusals and wrong passwords get the same reply and the same timing (see
    [Hardening](#hardening)), so the proxy does not reveal which accounts or domains
    exist. A users or domains file that becomes missing or invalid fails closed (its rule
    or the domain gate matches nothing). An unavailable account check is an outage (retry
@@ -151,11 +151,17 @@ relays the session (IMAP and ManageSieve through a command guard unless a backen
   token in the largest SASL message the proxy accepts; every other line is at most 16384
   bytes; a ManageSieve literal at most 64 KiB. A longer line ends the connection
   ([architecture](docs/architecture.md#line-reading)).
-- Refusal timing: a refusal by the legacy gate is answered after the larger of
-  `failure_delay_ms` and the median of the last 32 rejections of the backend the login
-  goes to (at most 10 s); a backend rejection no earlier than `failure_delay_ms`; both with the
-  same random jitter; a password-path outage (retry-later) no earlier than a refusal.
-  OAuth failures are not delayed.
+- Refusal timing: every password attempt ends with a backend login, real or simulated,
+  and is answered at its end, no earlier than `failure_delay_ms` after the credential,
+  with the same random jitter. A refusal by the legacy gate simulates the login: it waits
+  the median of the last 32 rejection latencies (at most an hour old) of the backend the
+  login goes to (at most 10 s). With `throttle`, refused attempts take turns per account
+  like real ones, in a separate table, so parallel attempts are answered one backend login
+  apart in both cases and refusals never delay a real login. A password-path outage
+  (retry-later) is answered no earlier than a refusal. OAuth failures are not delayed.
+  Not equalised: a backend whose failure delay grows with a source's failures (Dovecot's
+  authentication penalty), and single slow rejections; turn such a backend delay off
+  behind the proxy (see Operator responsibilities).
 - Client-controlled text never reaches error texts or log fields unescaped. The
   `authresult` line (target `authlog`) has a fixed format intended for log-based blocking
   (e.g. CrowdSec, Wazuh).
@@ -187,7 +193,10 @@ relays the session (IMAP and ManageSieve through a command guard unless a backen
 - **Failure delay.** Keep the backend's own failure delay on behind the proxy (Dovecot
   `auth_failure_delay`, default 2 s) and set `legacy.failure_delay_ms` close to it. Right
   after a start, before the proxy has seen any backend rejection, it pads refusals to
-  `failure_delay_ms` alone.
+  `failure_delay_ms` alone. Turn off a delay that grows with a source's failures (Dovecot:
+  the authentication penalty, [docs/backend-dovecot-postfix.md](docs/backend-dovecot-postfix.md#failure-delay-and-auth-penalty)):
+  the proxy's refusals cannot follow it, so the second wrong password for an account a
+  rule lets through would come later than the second refusal.
 - **Identity-preserving logins.** The legacy gate checks the login the client sent. The
   backend must use that same login as the account name (no `auth_username_format` that
   strips the domain or folds several logins onto one account); otherwise domain gate, user

@@ -138,7 +138,7 @@ checked any more, and `[session]` limits apply as they were at its accept.
 
 What runs across configurations is kept: open connections count against the new limits,
 failed-login counts and blocks go on under the new `[auth_ratelimit]` settings (a source
-the new settings exempt is free at once), the legacy throttle keeps its counts, a backend
+the new settings exempt is free at once), the legacy throttle keeps its counts and turns, a backend
 that stays (same name and settings) keeps its cached capabilities and its learned
 refusal timing, a backend that keeps its name keeps its counters and the health of each
 address it keeps, and an issuer that stays (same `issuer` and
@@ -245,8 +245,8 @@ key over (`yes`) or it needs a restart ([Reload](#reload)).
 | `legacy.doveadm_url` | URL | required with `doveadm` | yes | doveadm HTTP API endpoint (`…/doveadm/v1`); https, http only for localhost; no `user:password@` |
 | `legacy.doveadm_key_file` | path | required with `doveadm` | yes | file with the `doveadm_api_key` |
 | `legacy.doveadm_ca_file` | path | system store | yes | PEM CAs for the doveadm certificate |
-| `legacy.throttle` | `{ failures, window_secs }` | off | yes | per account: after `failures` backend rejections within `window_secs`, refuse locally until the window ends; both ≥ 1 |
-| `legacy.failure_delay_ms` | integer | 2000 | yes | minimum time from credential to a failed legacy reply (refusals also follow the median backend-rejection latency; jitter added); ≤ 10000, 0 gives a warning |
+| `legacy.throttle` | `{ failures, window_secs }` | off | yes | per account: after `failures` backend rejections within `window_secs`, refuse locally until the window ends; both ≥ 1. Attempts for one account take turns; refused ones take turns among themselves for their simulated backend login, so parallel attempts are answered one backend login apart either way ([refusal timing](architecture.md#refusal-replies-and-timing)) |
+| `legacy.failure_delay_ms` | integer | 2000 | yes | minimum time from credential to a failed legacy reply. Every failed password is answered at the end of its backend login, a refusal after a simulated one as long as the median backend-rejection latency (jitter added); a backend delay that grows with a source's failures is not followed ([refusal timing](architecture.md#refusal-replies-and-timing)); ≤ 10000, 0 gives a warning |
 | `password_gate.enabled` | bool | `false` | yes | short form: one rule `password_gate` |
 | `password_gate.sni` | array | required when enabled | yes | the rule's `sni` |
 | `password_gate.internal_networks` | array of CIDR | required when enabled | yes | the rule's `networks` (with `public = true` if one is public), and the scope label when `[scope]` is absent, even with the gate off; every public network gives the same warning as a rule with `public = true`; not combinable with `[[legacy.rules]]` |

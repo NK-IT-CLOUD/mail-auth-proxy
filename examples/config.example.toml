@@ -126,7 +126,9 @@ identity_claim = "email"                   # the mailbox login forwarded to the 
 # (4) the account is not throttled — each only as far as configured. Without any
 # [[legacy.rules]] every endpoint is OAuth-only (the default here).
 # Unknown domain, unknown account, throttled and wrong password look the same to the
-# client (same reply, answered after failure_delay_ms); the log tells them apart.
+# client (same reply; a refusal waits like a backend login, never less than
+# failure_delay_ms); the log tells them apart. Turn off a backend delay that grows with a
+# source's failures (Dovecot: the auth penalty, see docs/backend-dovecot-postfix.md).
 # The proxy must see real client addresses (DNAT is fine; behind a load balancer or
 # SNAT every client would match the rules' networks).
 

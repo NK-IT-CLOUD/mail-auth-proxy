@@ -646,7 +646,10 @@ pub enum AccountCheck {
 }
 
 /// Failed backend logins per account before further attempts are refused
-/// without asking the backend, for the rest of the window.
+/// without asking the backend, for the rest of the window. With a throttle,
+/// password attempts for one account take turns; refused attempts take
+/// turns among themselves for their simulated backend login, so parallel
+/// attempts are answered one backend login apart either way.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Throttle {
@@ -682,9 +685,12 @@ pub struct Legacy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub throttle: Option<Throttle>,
     /// Minimum time before a failed legacy login is answered, counted from
-    /// the credential. Refusals by the gate also wait as long as the median
-    /// recent backend rejection, and both get random jitter, so a refusal
-    /// is as slow as a wrong password.
+    /// the credential. Every password attempt ends with a backend login, a
+    /// refusal by the gate with a simulated one as long as the median recent
+    /// backend rejection, and is answered at its end, never before this
+    /// delay, with random jitter, so a refusal is as slow as a wrong
+    /// password. A backend delay that grows with a source's failures is not
+    /// followed.
     #[serde(default = "default_failure_delay_ms")]
     pub failure_delay_ms: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

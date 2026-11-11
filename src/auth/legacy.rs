@@ -62,6 +62,9 @@ const MAX_LOGIN: usize = 255;
 
 /// Backend-rejection latencies kept per backend for refusal timing.
 const LATENCY_SAMPLES: usize = 32;
+/// Age after which a latency sample no longer counts: a few slow rejections
+/// must not set the refusal time for good on a backend that rarely rejects.
+const SAMPLE_MAX_AGE: Duration = Duration::from_secs(3600);
 /// Upper bound of the learned refusal time (a slow or stuck backend must not
 /// make every refusal wait longer).
 const MAX_LEARNED_DELAY: Duration = Duration::from_secs(10);
@@ -320,15 +323,25 @@ impl Rule {
 /// Password attempts for one account take turns (`turns`): the next attempt
 /// is checked only after the previous one has its backend verdict counted, so
 /// parallel connections cannot run more attempts than `failures` allows.
+/// Refused attempts take turns as well, in a table of their own
+/// (`refused_turns`, `Gate::simulated_login`), so parallel refusals are
+/// answered one backend login apart like parallel wrong passwords, and a
+/// flood of refused attempts for an account never delays a real login of it.
 struct Throttle {
     failures: u32,
     window: Duration,
     /// Shared with the gate of a reloaded configuration (`Gate::carry_over`),
-    /// like `turns`.
+    /// like `turns` and `refused_turns`.
     seen: Arc<Mutex<HashMap<String, (u32, Instant)>>>,
     /// Accounts with an attempt in flight or waiting.
-    turns: Arc<Mutex<HashMap<String, TurnSlot>>>,
+    turns: Arc<Turns>,
+    /// Accounts with a refused attempt in its simulated login or waiting for
+    /// it (`Throttle::refused_key`).
+    refused_turns: Arc<Turns>,
 }
+
+/// A table of turns by account key.
+type Turns = Mutex<HashMap<String, TurnSlot>>;
 
 /// One account's turn lock and the number of attempts holding or waiting for
 /// it; the slot is removed when that number drops to 0.
@@ -406,38 +419,53 @@ impl Throttle {
             .remove(&Self::key(user));
     }
 
+    /// The key of a refused attempt in `refused_turns`: the account's key of
+    /// the login cut to `MAX_LOGIN` bytes, so the logins the gate does not
+    /// look at (longer ones among them) have a bounded key too. Logins that
+    /// share the cut prefix share a turn, which only orders refusals.
+    fn refused_key(user: &str) -> String {
+        let mut end = user.len().min(MAX_LOGIN);
+        while !user.is_char_boundary(end) {
+            end -= 1;
+        }
+        Self::key(&user[..end])
+    }
+
     /// Waits until no other attempt for `user` is in flight. Cancelling the
     /// wait (the client's time budget ran out) releases the claim as well.
     async fn turn(&self, user: &str) -> Turn<'_> {
-        let key = Self::key(user);
-        let lock = {
-            let mut turns = self.turns.lock().unwrap_or_else(|p| p.into_inner());
-            let slot = turns.entry(key.clone()).or_default();
-            slot.claims += 1;
-            slot.lock.clone()
-        };
-        let claim = Claim {
-            throttle: self,
-            key,
-        };
-        let guard = lock.lock_owned().await;
-        Turn(Some((guard, claim)))
+        take_turn(&self.turns, Self::key(user)).await
     }
+
+    /// The same for a refused attempt, in the table of refused attempts.
+    async fn refused_turn(&self, user: &str) -> Turn<'_> {
+        take_turn(&self.refused_turns, Self::refused_key(user)).await
+    }
+}
+
+/// Waits for the turn of `key` in `table`; the slot exists while an attempt
+/// holds or waits for it.
+async fn take_turn(table: &Turns, key: String) -> Turn<'_> {
+    let lock = {
+        let mut turns = table.lock().unwrap_or_else(|p| p.into_inner());
+        let slot = turns.entry(key.clone()).or_default();
+        slot.claims += 1;
+        slot.lock.clone()
+    };
+    let claim = Claim { table, key };
+    let guard = lock.lock_owned().await;
+    Turn(Some((guard, claim)))
 }
 
 /// One attempt waiting for or holding an account's turn.
 struct Claim<'a> {
-    throttle: &'a Throttle,
+    table: &'a Turns,
     key: String,
 }
 
 impl Drop for Claim<'_> {
     fn drop(&mut self) {
-        let mut turns = self
-            .throttle
-            .turns
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut turns = self.table.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(slot) = turns.get_mut(&self.key) {
             slot.claims -= 1;
             if slot.claims == 0 {
@@ -448,7 +476,8 @@ impl Drop for Claim<'_> {
 }
 
 /// An account's turn for one password attempt: held from the throttle check
-/// until the backend verdict is counted, then dropped (lock first, then claim).
+/// until the backend verdict is counted (a refused attempt: for its simulated
+/// login), then dropped (lock first, then claim).
 pub struct Turn<'a>(Option<(tokio::sync::OwnedMutexGuard<()>, Claim<'a>)>);
 
 impl Turn<'_> {
@@ -472,13 +501,34 @@ struct Latencies {
     proto: usize,
     /// The backend's name (`auth::backend_name`).
     backend: String,
-    samples: Arc<Mutex<std::collections::VecDeque<Duration>>>,
+    /// When each rejection came and how long the backend took for it, from
+    /// the start of the backend login to its verdict; the last
+    /// `LATENCY_SAMPLES`.
+    samples: Arc<Mutex<std::collections::VecDeque<(tokio::time::Instant, Duration)>>>,
 }
 
 impl Latencies {
+    fn learn(&self, latency: Duration) {
+        let mut q = self.samples.lock().unwrap_or_else(|p| p.into_inner());
+        if q.len() == LATENCY_SAMPLES {
+            q.pop_front();
+        }
+        q.push_back((tokio::time::Instant::now(), latency));
+    }
+
     fn median(&self) -> Duration {
+        self.median_at(tokio::time::Instant::now())
+    }
+
+    /// The median of the samples at `now`, those older than `SAMPLE_MAX_AGE`
+    /// left out; zero without any.
+    fn median_at(&self, now: tokio::time::Instant) -> Duration {
         let samples = self.samples.lock().unwrap_or_else(|p| p.into_inner());
-        let mut v: Vec<Duration> = samples.iter().copied().collect();
+        let mut v: Vec<Duration> = samples
+            .iter()
+            .filter(|(at, _)| now.saturating_duration_since(*at) < SAMPLE_MAX_AGE)
+            .map(|(_, latency)| *latency)
+            .collect();
         drop(samples);
         v.sort_unstable();
         v.get(v.len() / 2).copied().unwrap_or_default()
@@ -495,11 +545,13 @@ pub enum Verdict<'a> {
         turn: Turn<'a>,
         backend: (usize, &'a str),
     },
-    /// Refused before the backend. `rule` is the matching rule, or empty
+    /// Refused before the backend; the caller ends it with a simulated login
+    /// (`Gate::simulated_login`). `rule` is the matching rule, or empty
     /// when no rule allows this user. `for_backend`: refused by a step that
     /// runs for the backend the login goes to (the account check, the
-    /// throttle), so the refusal is padded like that backend's rejections;
-    /// the earlier steps (login, rule, domain) do not depend on it.
+    /// throttle), so the simulated login is one at that backend; the earlier
+    /// steps (login, rule, domain) do not depend on it. A throttled attempt
+    /// has released the account's turn already.
     /// `no_route`: refused because no route takes the login's domain.
     Deny {
         reason: Reason,
@@ -622,6 +674,7 @@ impl Gate {
                 window: Duration::from_secs(t.window_secs),
                 seen: Arc::default(),
                 turns: Arc::default(),
+                refused_turns: Arc::default(),
             }),
             failure_delay: Duration::from_millis(cfg.failure_delay_ms),
         })
@@ -672,12 +725,14 @@ impl Gate {
     }
 
     /// Take over the running state of the gate `old` (a configuration
-    /// reload): the throttle's failure counts and turns, when both gates
-    /// throttle, and the learned refusal timing of every backend both know.
+    /// reload): the throttle's failure counts and turns (both tables), when
+    /// both gates throttle, and the learned refusal timing of every backend
+    /// both know.
     pub fn carry_over(&mut self, old: &Gate) {
         if let (Some(new), Some(old)) = (&mut self.throttle, &old.throttle) {
             new.seen = old.seen.clone();
             new.turns = old.turns.clone();
+            new.refused_turns = old.refused_turns.clone();
         }
         for pool in &mut self.reject_latency {
             if let Some(kept) = old
@@ -722,15 +777,14 @@ impl Gate {
             .find(|l| l.proto == proto && l.backend == backend)
     }
 
-    /// The time a failed legacy login is answered after: `failure_delay`,
-    /// or the learned rejection time when that is longer (bounded by
-    /// `MAX_LEARNED_DELAY`). The learned time is the median of `backend`'s
-    /// recent rejections. Without a backend (a refusal before the backend is
-    /// known), or for one without a pool, it is the largest median of the
-    /// protocol's backends: a refusal must not be quicker than a wrong
-    /// password at any backend the login could have gone to, and a mixed
-    /// median would be quicker than the slower backend's rejections.
-    fn failure_time(&self, proto: Proto, backend: Option<&str>) -> Duration {
+    /// The learned rejection time of `backend`: the median of its recent
+    /// rejections (bounded by `MAX_LEARNED_DELAY`), zero without samples.
+    /// Without a backend (a refusal before the backend is known), or for
+    /// one without a pool, it is the largest median of the protocol's
+    /// backends: a refusal must not be quicker than a wrong password at any
+    /// backend the login could have gone to, and a mixed median would be
+    /// quicker than the slower backend's rejections.
+    fn learned(&self, proto: Proto, backend: Option<&str>) -> Duration {
         let learned = match backend.and_then(|b| self.latencies(proto, b)) {
             Some(pool) => pool.median(),
             None => {
@@ -743,7 +797,13 @@ impl Gate {
                     .unwrap_or_default()
             }
         };
-        self.failure_delay.max(learned.min(MAX_LEARNED_DELAY))
+        learned.min(MAX_LEARNED_DELAY)
+    }
+
+    /// The shortest time after which a failed legacy login is answered:
+    /// `failure_delay`, or the learned rejection time when that is longer.
+    fn failure_time(&self, proto: Proto, backend: Option<&str>) -> Duration {
+        self.failure_delay.max(self.learned(proto, backend))
     }
 
     /// Random extra delay added to every failed legacy reply: a quarter of
@@ -754,11 +814,39 @@ impl Gate {
         random_up_to(span)
     }
 
-    /// When to answer a login the gate refused (credential read at
-    /// `started`): as late as a typical wrong password at `backend`, or at
-    /// the slowest backend of the protocol when the refusal came before the
-    /// backend was known (`None`), plus jitter.
-    pub fn refusal_deadline(
+    /// The backend login of a password attempt the gate refused (of `user`,
+    /// at `backend`, or before the backend was known: `None`), simulated so
+    /// the refusal takes the time a wrong password takes: with a throttle,
+    /// the turn of `user` among the refused attempts (`Throttle::
+    /// refused_turn`), held for the login; the login waits the learned
+    /// rejection time (`learned`; none while nothing is learned). Answer
+    /// afterwards at `answer_deadline`, like a rejection.
+    pub async fn simulated_login(&self, proto: Proto, backend: Option<&str>, user: &str) {
+        let _turn = match &self.throttle {
+            Some(t) => t.refused_turn(user).await,
+            None => Turn::none(),
+        };
+        tokio::time::sleep(self.learned(proto, backend)).await;
+    }
+
+    /// When to answer a failed password attempt (credential read at
+    /// `started`) whose backend login, real or simulated, has just ended:
+    /// never before `failure_delay`, plus jitter.
+    pub fn answer_deadline(
+        &self,
+        proto: Proto,
+        backend: Option<&str>,
+        started: tokio::time::Instant,
+    ) -> tokio::time::Instant {
+        (started + self.failure_delay).max(tokio::time::Instant::now())
+            + self.jitter(proto, backend)
+    }
+
+    /// When to answer an outage on the password path (credential read at
+    /// `started`): no earlier than a refusal that waited for no turn, as late
+    /// as a typical wrong password at `backend` (or at the slowest backend of
+    /// the protocol, `None`), plus the same jitter.
+    pub fn outage_deadline(
         &self,
         proto: Proto,
         backend: Option<&str>,
@@ -767,25 +855,21 @@ impl Gate {
         started + self.failure_time(proto, backend) + self.jitter(proto, backend)
     }
 
-    /// `backend` rejected a password `latency` after the credential was
-    /// read: learn the latency for that backend, return when to answer
-    /// (never before `failure_delay`, plus the same jitter as a refusal).
+    /// `backend` rejected a password whose backend login started at
+    /// `login_started` (with a throttle: when the account's turn was
+    /// obtained): learn the latency from there to the verdict for that
+    /// backend, and return when to answer (`answer_deadline`).
     pub fn rejected_deadline(
         &self,
         proto: Proto,
         backend: &str,
         started: tokio::time::Instant,
+        login_started: tokio::time::Instant,
     ) -> tokio::time::Instant {
-        let latency = started.elapsed();
         if let Some(pool) = self.latencies(proto, backend) {
-            let mut q = pool.samples.lock().unwrap_or_else(|p| p.into_inner());
-            if q.len() == LATENCY_SAMPLES {
-                q.pop_front();
-            }
-            q.push_back(latency);
+            pool.learn(login_started.elapsed());
         }
-        (started + self.failure_delay).max(tokio::time::Instant::now())
-            + self.jitter(proto, Some(backend))
+        self.answer_deadline(proto, Some(backend), started)
     }
 
     /// No rule at all: every endpoint is OAuth-only.
@@ -932,6 +1016,9 @@ impl Gate {
             Some(t) => {
                 let turn = t.turn(user).await;
                 if t.is_throttled(user) {
+                    // The turn ends here; the simulated login takes one
+                    // among the refused attempts.
+                    drop(turn);
                     return deny_for_backend(Reason::Throttled);
                 }
                 turn
@@ -1316,6 +1403,7 @@ mod tests {
             window: Duration::from_secs(3600),
             seen: Arc::default(),
             turns: Arc::default(),
+            refused_turns: Arc::default(),
         };
         let first = t.turn("a@x").await;
         let waited = tokio::time::timeout(Duration::from_millis(20), t.turn("A@x")).await;
@@ -1331,6 +1419,49 @@ mod tests {
         assert!(t.turns.lock().unwrap().is_empty());
     }
 
+    /// Refused attempts take turns per account in a table of their own: they
+    /// wait for each other, never for a real attempt nor a real attempt for
+    /// them; every login, also one the gate does not look at, has a bounded
+    /// key, and nothing is left behind.
+    #[tokio::test]
+    async fn refused_attempts_take_turns_apart_from_real_ones() {
+        let t = Throttle {
+            failures: 5,
+            window: Duration::from_secs(3600),
+            seen: Arc::default(),
+            turns: Arc::default(),
+            refused_turns: Arc::default(),
+        };
+        let wait = Duration::from_millis(20);
+        let refused = t.refused_turn("a@x").await;
+        assert!(
+            tokio::time::timeout(wait, t.refused_turn("A@X"))
+                .await
+                .is_err(),
+            "a second refusal for the account waits"
+        );
+        let real = tokio::time::timeout(wait, t.turn("a@x"))
+            .await
+            .expect("a real attempt does not wait for a refusal");
+        let other = tokio::time::timeout(wait, t.refused_turn("b@x"))
+            .await
+            .expect("another account does not wait");
+        drop((real, other));
+        let long = format!("{}@example.org", "ä".repeat(300));
+        let key = Throttle::refused_key(&long);
+        assert!(key.len() <= MAX_LOGIN, "{}", key.len());
+        assert_eq!(key, Throttle::refused_key(&format!("{long}x")));
+        for odd in ["", "a\u{7}@x", "a@b@x", long.as_str()] {
+            let turn = tokio::time::timeout(wait, t.refused_turn(odd))
+                .await
+                .expect("an unusable login has a turn of its own");
+            drop(turn);
+        }
+        drop(refused);
+        assert!(t.turns.lock().unwrap().is_empty());
+        assert!(t.refused_turns.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn throttle_window_expires_and_capacity_is_bounded() {
         let t = Throttle {
@@ -1338,6 +1469,7 @@ mod tests {
             window: Duration::from_millis(1),
             seen: Arc::default(),
             turns: Arc::default(),
+            refused_turns: Arc::default(),
         };
         t.failure("a@x");
         std::thread::sleep(Duration::from_millis(5));
@@ -1347,6 +1479,7 @@ mod tests {
             window: Duration::from_secs(3600),
             seen: Arc::default(),
             turns: Arc::default(),
+            refused_turns: Arc::default(),
         };
         let evictions = || {
             crate::obs::metrics::render_for_tests()
@@ -1497,15 +1630,104 @@ mod tests {
     /// Record a backend rejection of `ms` for `backend` directly.
     fn learn(g: &Gate, proto: Proto, backend: &str, ms: u64) {
         let pool = g.latencies(proto, backend).expect("registered backend");
-        pool.samples
-            .lock()
-            .unwrap()
-            .push_back(Duration::from_millis(ms));
+        pool.learn(Duration::from_millis(ms));
+    }
+
+    /// A rejection's sample is the backend's latency alone, from the start
+    /// of the backend login (after the wait for the turn) to the verdict,
+    /// not the time since the credential; samples older than an hour no
+    /// longer count, and the pool keeps the last `LATENCY_SAMPLES`.
+    #[tokio::test]
+    async fn samples_measure_the_backend_login_and_expire() {
+        let g = gate_with(Legacy {
+            failure_delay_ms: 0,
+            rules: vec![rule("all", &["127.0.0.0/8"])],
+            ..Legacy::default()
+        })
+        .with_backends([(Proto::Imap, "imap")]);
+        let now = tokio::time::Instant::now();
+        let started = now - Duration::from_secs(5);
+        let login_started = now - Duration::from_millis(300);
+        g.rejected_deadline(Proto::Imap, "imap", started, login_started);
+        let learned = g.learned(Proto::Imap, Some("imap"));
+        assert!(
+            learned >= Duration::from_millis(300) && learned < Duration::from_secs(1),
+            "the turn's wait is not part of the sample: {learned:?}"
+        );
+        let pool = g.latencies(Proto::Imap, "imap").unwrap();
+        let later = tokio::time::Instant::now();
+        assert_eq!(pool.median_at(later), learned);
+        assert_eq!(
+            pool.median_at(later + SAMPLE_MAX_AGE),
+            Duration::ZERO,
+            "expired after an hour"
+        );
+        // Newer samples outlive older ones: the median at a time is that of
+        // the samples younger than an hour then.
+        for _ in 0..3 {
+            learn(&g, Proto::Imap, "imap", 900);
+        }
+        assert_eq!(pool.median_at(later), Duration::from_millis(900));
+        let newest = pool.samples.lock().unwrap().back().unwrap().0;
+        assert_eq!(
+            pool.median_at(newest + SAMPLE_MAX_AGE - Duration::from_millis(1)),
+            Duration::from_millis(900)
+        );
+        for _ in 0..LATENCY_SAMPLES {
+            learn(&g, Proto::Imap, "imap", 100);
+        }
+        assert_eq!(pool.samples.lock().unwrap().len(), LATENCY_SAMPLES);
+        assert_eq!(pool.median(), Duration::from_millis(100));
+    }
+
+    /// A simulated login waits the learned rejection time; with a throttle,
+    /// refused attempts for one account take turns for it, so parallel ones
+    /// end one learned time apart; without, they run side by side. An empty
+    /// pool takes no time.
+    #[tokio::test(start_paused = true)]
+    async fn simulated_logins_take_the_learned_time_in_turn() {
+        let cfg = |throttle| Legacy {
+            failure_delay_ms: 0,
+            throttle,
+            rules: vec![rule("all", &["127.0.0.0/8"])],
+            ..Legacy::default()
+        };
+        let throttled = gate_with(cfg(Some(config::Throttle {
+            failures: 5,
+            window_secs: 3600,
+        })))
+        .with_backends([(Proto::Imap, "imap")]);
+        let unthrottled = gate_with(cfg(None)).with_backends([(Proto::Imap, "imap")]);
+        let t0 = tokio::time::Instant::now();
+        throttled.simulated_login(Proto::Imap, None, "a@x").await;
+        assert_eq!(t0.elapsed(), Duration::ZERO, "nothing learned yet");
+        for g in [&throttled, &unthrottled] {
+            learn(g, Proto::Imap, "imap", 800);
+        }
+        let ends = |g: &'static Gate| async move {
+            let t0 = tokio::time::Instant::now();
+            let one = || async move {
+                g.simulated_login(Proto::Imap, Some("imap"), "a@x").await;
+                t0.elapsed()
+            };
+            let (a, b, c) = tokio::join!(one(), one(), one());
+            let mut v = vec![a, b, c];
+            v.sort();
+            v
+        };
+        let ms = Duration::from_millis;
+        let throttled: &'static Gate = Box::leak(Box::new(throttled));
+        let unthrottled: &'static Gate = Box::leak(Box::new(unthrottled));
+        assert_eq!(ends(throttled).await, [ms(800), ms(1600), ms(2400)]);
+        assert_eq!(ends(unthrottled).await, [ms(800), ms(800), ms(800)]);
+        let t = throttled.throttle.as_ref().unwrap();
+        assert!(t.refused_turns.lock().unwrap().is_empty());
     }
 
     /// Refusals are padded to the median of the recent rejections of the
-    /// backend (bounded), plus jitter; never below the delay.
-    #[tokio::test]
+    /// backend (bounded), plus jitter; never below the delay. The clock
+    /// stands still, so the deadlines depend on the gate alone.
+    #[tokio::test(start_paused = true)]
     async fn refusal_time_follows_backend_rejections() {
         let g = gate_with(Legacy {
             failure_delay_ms: 100,
@@ -1544,23 +1766,33 @@ mod tests {
         assert_eq!(g.failure_time(Proto::Imap, None), MAX_LEARNED_DELAY);
         let now = tokio::time::Instant::now();
         for _ in 0..50 {
-            let d = g.refusal_deadline(Proto::Smtp, None, now) - now;
+            let d = g.outage_deadline(Proto::Smtp, None, now) - now;
+            assert!(
+                d >= Duration::from_millis(100) && d <= Duration::from_millis(150),
+                "{d:?}"
+            );
+            // A login that ended at once is answered after the delay too.
+            let d = g.answer_deadline(Proto::Smtp, None, now) - now;
             assert!(
                 d >= Duration::from_millis(100) && d <= Duration::from_millis(150),
                 "{d:?}"
             );
         }
+        // One that ended after the delay: answered then, plus jitter.
+        let early = now - Duration::from_secs(2);
+        let d = g.answer_deadline(Proto::Smtp, None, early) - early;
+        assert!(d >= Duration::from_secs(2), "{d:?}");
         let spread: std::collections::HashSet<_> = (0..20)
-            .map(|_| g.refusal_deadline(Proto::Smtp, None, now))
+            .map(|_| g.outage_deadline(Proto::Smtp, None, now))
             .collect();
         assert!(spread.len() > 1, "jitter");
         for _ in 0..40 {
-            g.rejected_deadline(Proto::Sieve, "sieve", now);
+            g.rejected_deadline(Proto::Sieve, "sieve", now, now);
         }
         let sieve = g.latencies(Proto::Sieve, "sieve").unwrap();
         assert_eq!(sieve.samples.lock().unwrap().len(), LATENCY_SAMPLES);
         // A rejection of a backend without a pool teaches nothing.
-        g.rejected_deadline(Proto::Sieve, "other", now);
+        g.rejected_deadline(Proto::Sieve, "other", now, now);
         assert!(g.latencies(Proto::Sieve, "other").is_none());
     }
 
@@ -1605,7 +1837,7 @@ mod tests {
         assert_eq!(g.failure_time(Proto::Smtp, None), Duration::ZERO);
         // The deadline of a rejection learns for its own backend only.
         let started = tokio::time::Instant::now() - Duration::from_millis(5000);
-        g.rejected_deadline(Proto::Imap, "a", started);
+        g.rejected_deadline(Proto::Imap, "a", started, started);
         assert_eq!(
             g.latencies(Proto::Imap, "b")
                 .unwrap()

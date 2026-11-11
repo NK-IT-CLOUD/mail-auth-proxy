@@ -815,6 +815,251 @@ async fn refusals_follow_a_slow_backend() {
     assert!(rmax > rmin && bmax > bmin, "jitter on both");
 }
 
+// ── Parallel attempts ───────────────────────────────────────────────────────
+
+/// `failure_delay_ms` of the parallel tests: well below the mock's
+/// `SLOW_REJECT`, so the backend's latency sets the timing.
+const PARALLEL_DELAY_MS: u64 = 100;
+
+/// One IMAP connection from `src` per login, all connected first, then each
+/// sends `AUTHENTICATE PLAIN` with a wrong password at the same moment: per
+/// login the answer and the time from that moment to the reply, in the
+/// order of `users`.
+async fn at_once(h: &Harness, src: Src, users: &[String]) -> Vec<(Answer, Duration)> {
+    let sent = send_all(connect_all(h, src, users).await);
+    let mut out = Vec::new();
+    for t in sent {
+        out.push(t.await.unwrap());
+    }
+    out
+}
+
+/// The connections of `at_once`, greeted and ready for the credential.
+async fn connect_all(h: &Harness, src: Src, users: &[String]) -> Vec<(Client, String)> {
+    let mut clients = Vec::new();
+    for user in users {
+        let (c, greeting) = h.imap(src, Sni::None).await;
+        assert!(greeting.contains("AUTH=PLAIN"), "{greeting}");
+        clients.push((c, user.clone()));
+    }
+    clients
+}
+
+/// The sending half of `at_once`: one task per connection.
+fn send_all(clients: Vec<(Client, String)>) -> Vec<tokio::task::JoinHandle<(Answer, Duration)>> {
+    let t0 = Instant::now();
+    clients
+        .into_iter()
+        .map(|(mut c, user)| {
+            tokio::spawn(async move {
+                c.send(&format!("a AUTHENTICATE PLAIN {}", plain(&user, "pw")))
+                    .await;
+                let reply = c.line().await;
+                (classify(Kind::Imap, &reply), t0.elapsed())
+            })
+        })
+        .collect()
+}
+
+/// The reasons of the authresult lines after the first `before`.
+async fn reasons_since(h: &Harness, before: usize, n: usize) -> Vec<String> {
+    let ars = h.proxy.wait_authresults(before + n).await;
+    ars[before..].iter().map(|a| a.reason.clone()).collect()
+}
+
+/// Warm the sample pool of the IMAP backend: `n` rejections after
+/// `SLOW_REJECT`, one after the other, for `user`.
+async fn prime(h: &Harness, user: &str, n: usize) {
+    for _ in 0..n {
+        let a = attempt(
+            h,
+            Kind::Imap,
+            Src::Internal,
+            Sni::None,
+            Mech::Plain,
+            user,
+            "pw",
+        )
+        .await;
+        assert_eq!(a.answer, Answer::Failed, "{}", a.reply);
+    }
+}
+
+/// With a throttle, parallel attempts for one account take turns. Three
+/// parallel wrong passwords for an allowed account are answered one backend
+/// login apart (about 0.8 s, 1.6 s, 2.4 s with the mock's `SLOW_REJECT`);
+/// three parallel refusals for a login in no rule, for one in an unknown
+/// domain and for a throttled account must show the same staggered pattern,
+/// not all answer at once: that difference told the gate's refusals from
+/// wrong passwords after two attempts.
+///
+/// Tolerance: the i-th reply (sorted, from 1) is due after i backend
+/// logins, so it is never earlier than i × `SLOW_REJECT` (a real rejection
+/// takes at least that, a simulated login the median of such rejections).
+/// It may be later by the jitter (up to a quarter of the learned time,
+/// 200 ms), the mock's connect and TLS per login (counted at 150 ms each, which
+/// also covers the sample's share of it) and 300 ms for a loaded runner.
+/// Answers all at once put the second and third reply about 0.8 s and 1.6 s
+/// before their lower bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parallel_refusals_take_turns_like_wrong_passwords() {
+    let h = Harness::start_with(opts(format!(
+        r#"[legacy]
+allowed_domains = ["example.test"]
+failure_delay_ms = {PARALLEL_DELAY_MS}
+throttle = {{ failures = 3, window_secs = 3600 }}
+[[legacy.rules]]
+name = "users"
+networks = ["127.0.0.0/8"]
+users = ["*@example.test", "*@gone.test"]
+"#
+    )))
+    .await;
+    // Three rejections: the pool learns the backend's latency, and the
+    // account is throttled.
+    prime(&h, "slowreject-t@example.test", 3).await;
+    let classes = [
+        ("slowreject-a@example.test", "backend_reject"),
+        ("someone@elsewhere.test", "blocked_endpoint"),
+        ("a@gone.test", "unknown_domain"),
+        ("slowreject-t@example.test", "throttled"),
+    ];
+    let mut report = Vec::new();
+    for (user, reason) in classes {
+        let before = h.proxy.authresults().len();
+        let users = vec![user.to_string(); 3];
+        let answers = at_once(&h, Src::Internal, &users).await;
+        assert!(
+            answers.iter().all(|(a, _)| *a == Answer::Failed),
+            "{user}: {answers:?}"
+        );
+        assert_eq!(reasons_since(&h, before, 3).await, [reason; 3], "{user}");
+        let mut times: Vec<Duration> = answers.iter().map(|(_, t)| *t).collect();
+        times.sort();
+        for (i, t) in times.iter().enumerate() {
+            let logins = i as u32 + 1;
+            let early = SLOW_REJECT * logins;
+            let late =
+                (SLOW_REJECT + Duration::from_millis(150)) * logins + Duration::from_millis(500);
+            assert!(
+                *t >= early && *t <= late,
+                "{reason}: reply {logins} after {t:?}, due within [{early:?}, {late:?}]: {times:?}"
+            );
+        }
+        report.push(format!(
+            "{reason}: {:?}",
+            times.iter().map(|t| t.as_millis()).collect::<Vec<_>>()
+        ));
+    }
+    eprintln!("parallel reply times (ms): {report:?}");
+}
+
+/// Refused attempts take their turns apart from the real ones: a flood of
+/// refusals for an account, from a source no rule allows it from, does not
+/// delay a real login of that account from where it is allowed, and the
+/// refusals still take turns among themselves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refusals_do_not_delay_a_real_login() {
+    let h = Harness::start_with(opts(format!(
+        r#"[legacy]
+failure_delay_ms = {PARALLEL_DELAY_MS}
+throttle = {{ failures = 3, window_secs = 3600 }}
+[[legacy.rules]]
+name = "inside"
+networks = ["127.0.0.1/32"]
+[[legacy.rules]]
+name = "outside"
+networks = ["127.0.0.2/32"]
+users = ["nobody@example.test"]
+"#
+    )))
+    .await;
+    prime(&h, "slowreject-p@example.test", 2).await;
+    let before = h.proxy.authresults().len();
+    let users = vec!["carol@example.test".to_string(); 4];
+    let flood = send_all(connect_all(&h, Src::External, &users).await);
+    // The four refusals are decided and hold or wait for their turns.
+    let decided = h.proxy.wait_authresults(before + 4).await;
+    assert!(
+        decided[before..]
+            .iter()
+            .all(|a| a.reason == "blocked_endpoint"),
+        "the gate refused them"
+    );
+    let real = attempt(
+        &h,
+        Kind::Imap,
+        Src::Internal,
+        Sni::None,
+        Mech::Plain,
+        "carol@example.test",
+        "pw",
+    )
+    .await;
+    let mut refused = Vec::new();
+    for t in flood {
+        refused.push(t.await.unwrap());
+    }
+    assert_eq!(real.answer, Answer::Ok, "{}", real.reply);
+    assert!(
+        real.took < SLOW_REJECT,
+        "the real login waited for the refusals: {:?}",
+        real.took
+    );
+    assert!(
+        refused.iter().all(|(a, _)| *a == Answer::Failed),
+        "{refused:?}"
+    );
+    let mut times: Vec<Duration> = refused.iter().map(|(_, t)| *t).collect();
+    times.sort();
+    for (i, t) in times.iter().enumerate() {
+        assert!(*t >= SLOW_REJECT * (i as u32 + 1), "{times:?}");
+    }
+}
+
+/// Without a throttle nobody takes turns: parallel wrong passwords for one
+/// account and parallel refusals are all answered after one backend login
+/// (tolerance as in `parallel_refusals_take_turns_like_wrong_passwords`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_throttle_parallel_attempts_are_answered_together() {
+    let h = Harness::start_with(opts(format!(
+        r#"[legacy]
+failure_delay_ms = {PARALLEL_DELAY_MS}
+[[legacy.rules]]
+name = "users"
+networks = ["127.0.0.0/8"]
+users = ["*@example.test"]
+"#
+    )))
+    .await;
+    prime(&h, "slowreject-p@example.test", 3).await;
+    let before = h.proxy.authresults().len();
+    let mut users = vec!["slowreject-a@example.test".to_string(); 3];
+    users.extend(vec!["someone@elsewhere.test".to_string(); 3]);
+    let answers = at_once(&h, Src::Internal, &users).await;
+    let mut reasons = reasons_since(&h, before, 6).await;
+    reasons.sort();
+    assert_eq!(
+        reasons,
+        [
+            "backend_reject",
+            "backend_reject",
+            "backend_reject",
+            "blocked_endpoint",
+            "blocked_endpoint",
+            "blocked_endpoint"
+        ]
+    );
+    let late = SLOW_REJECT + Duration::from_millis(650);
+    for (user, (answer, t)) in users.iter().zip(&answers) {
+        assert_eq!(*answer, Answer::Failed, "{user}");
+        assert!(
+            *t >= SLOW_REJECT && *t <= late,
+            "{user}: {t:?}, all: {answers:?}"
+        );
+    }
+}
+
 /// An outage on the password path (account check down, backend temporarily
 /// unavailable) only happens to accounts that passed the earlier stages, so
 /// it is answered no earlier than a refusal: an instant retry-later next to
