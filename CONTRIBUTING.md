@@ -120,7 +120,7 @@ cargo install cargo-fuzz --locked
 | `token` | `auth/token.rs`: unverified `iss`, header and payload decoding, claim checks | no token without a valid signature passes; the identity is one plain address; error texts carry no control characters |
 | `config` | `config::parse`, `config::plan` (the reload comparison) | a valid configuration printed with `--print-config` parses again, is valid and compares as unchanged; two configurations separated by a line `#---` compare symmetrically, with changes exactly when their printed forms differ |
 | `backend_auth` | `auth/sasl.rs`: the backend's OAUTHBEARER error result (RFC 7628 §3.2.2) and the forwarded OAUTHBEARER response; `proto/sieve/backend.rs`: the ManageSieve challenge string (RFC 5804 §4) | a status that reaches a log line is a short plain word; nothing read past the challenge; a literal challenge at most 4096 octets; build/parse roundtrip of the forwarded response |
-| `relay_guard` | `wire/guard.rs`: the command guard after login, client and backend octets interleaved in any chunks (IMAP and ManageSieve framing: lines, quoted strings, literals, continuations) | until the backend sends a `+`, no complete line naming `UNAUTHENTICATE` (ManageSieve: first word; IMAP: after a tag) reaches the backend |
+| `relay_guard` | `wire/guard.rs`: the command guard after login, client and backend octets interleaved in any chunks (IMAP and ManageSieve framing: lines, quoted strings, literals, continuations) | IMAP: until the backend sends a `+`, no complete line naming `UNAUTHENTICATE`, `AUTHENTICATE`, `LOGIN`, `STARTTLS` or `COMPRESS` after a tag reaches the backend. ManageSieve: no line starting with `UNAUTHENTICATE`, literal data included, and no command line starting with `AUTHENTICATE` or `STARTTLS` |
 | `tls_not_after` | `server/tls.rs`: the DER walk to a certificate's `notAfter` (RFC 5280 §4.1) | on raw bytes and as the time value in a certificate skeleton: never a time past year 9999, every well-formed time from 1970 on parses |
 
 Run a target from `fuzz/`. New inputs go to the first directory; keep it outside the
@@ -133,8 +133,13 @@ cargo +nightly fuzz run sasl /tmp/corpus-sasl corpus/sasl -- \
 ```
 
 `proxyproto` has no dictionary. The workflow `.github/workflows/fuzz.yml` runs every
-target for 60 seconds once a week (Saturday 03:00 UTC) and on manual start; it is not
-part of the CI of pushes and pull requests. A crash is written to
+target once a week (Saturday 03:00 UTC) and on manual start, the stateful ones
+(`relay_guard`, `imap_preauth`, `sieve_preauth`) for 300 seconds, the others for 60; it
+is not part of the CI of pushes and pull requests. With the repository variable
+`FUZZ_CORPUS` set to a directory on a self-hosted runner, each target's corpus is kept
+there between runs (`FUZZ_CORPUS/<target>`) and reduced with `cargo fuzz cmin` after
+each run to the inputs that add coverage; without it, every run starts from the seed
+corpus. A crash is written to
 `fuzz/artifacts/<target>/`; `cargo +nightly fuzz tmin <target> <file>` minimises it.
 Every crash becomes a normal regression test in `src/` or `tests/` before it is fixed.
 

@@ -1,8 +1,10 @@
-# Weekly fuzzing: every fuzz target for 60 s from the seed corpus (fuzz/,
-# CONTRIBUTING.md "Fuzzing"). Scheduled runs only on the maintainer's Gitea
-# (repository variable CI_RUNNER); elsewhere only when started by hand, as the
-# job is not tested on GitHub-hosted runners. Nightly and cargo-fuzz are
-# pinned; new inputs stay in the runner's temp directory.
+# Weekly fuzzing: every fuzz target from the seed corpus (fuzz/, CONTRIBUTING.md
+# "Fuzzing"), 300 s for the stateful ones, 60 s for the others. Scheduled runs
+# only on the maintainer's Gitea (repository variable CI_RUNNER); elsewhere only
+# when started by hand, as the job is not tested on GitHub-hosted runners.
+# Nightly and cargo-fuzz are pinned. With FUZZ_CORPUS set (a directory on the
+# self-hosted runner) the corpus each target grows is kept there and minimised
+# after every run; without it new inputs stay in the runner's temp directory.
 name: Fuzz
 on:
   schedule:
@@ -18,12 +20,15 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: never
+  # Set on the maintainer's Gitea only (repository variable).
+  FUZZ_CORPUS: ${{ vars.FUZZ_CORPUS }}
 
 jobs:
   fuzz:
     runs-on: ${{ vars.CI_RUNNER || 'ubuntu-latest' }}
     if: vars.CI_RUNNER != '' || github.event_name == 'workflow_dispatch'
-    timeout-minutes: 30
+    # 3 x 300 s + 9 x 60 s of fuzzing, plus toolchain, build and minimising.
+    timeout-minutes: 50
     env:
       FUZZ_TOOLCHAIN: nightly-2026-09-28
     steps:
@@ -41,10 +46,18 @@ jobs:
         working-directory: fuzz
         run: |
           set -euo pipefail
+          corpus=${FUZZ_CORPUS:-$RUNNER_TEMP/corpus}
           cargo "+$FUZZ_TOOLCHAIN" fuzz build -O
           for t in $(cargo "+$FUZZ_TOOLCHAIN" fuzz list); do
-            args=(-max_total_time=60 -rss_limit_mb=1024)
+            case $t in
+              relay_guard | imap_preauth | sieve_preauth) secs=300 ;;
+              *) secs=60 ;;
+            esac
+            args=(-max_total_time="$secs" -rss_limit_mb=1024)
             [ ! -f "dict/$t.dict" ] || args+=("-dict=dict/$t.dict")
-            mkdir -p "$RUNNER_TEMP/corpus/$t"
-            cargo "+$FUZZ_TOOLCHAIN" fuzz run -O "$t" "$RUNNER_TEMP/corpus/$t" "corpus/$t" -- "${args[@]}"
+            mkdir -p "$corpus/$t"
+            cargo "+$FUZZ_TOOLCHAIN" fuzz run -O "$t" "$corpus/$t" "corpus/$t" -- "${args[@]}"
+            # Keep only inputs that add coverage, so the kept corpus does not
+            # grow from week to week.
+            [ -z "$FUZZ_CORPUS" ] || cargo "+$FUZZ_TOOLCHAIN" fuzz cmin -O "$t" "$corpus/$t" -- -rss_limit_mb=1024
           done

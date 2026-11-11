@@ -1,0 +1,7 @@
+0a APPEND INBOX {45}
+†+ go
+7b LOGIN x y
+c STARTTLS
+d COMPRESS DEFLATE
+
+e NOOP
