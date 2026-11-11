@@ -139,10 +139,21 @@ EOF
 
     echo "== reload (SIGHUP)"
     systemctl reload $unit || fail "reload"
-    sleep 2
+    # The reload is logged once the new configuration is in use. systemd has
+    # only sent the signal by now, and on a busy host the reload takes a
+    # moment: wait for the line instead of a fixed time, and print how long.
+    reloaded=
+    for i in $(seq 100); do
+        if journalctl --no-pager -u $unit | grep -q "reload: certificate loaded"; then
+            reloaded=$i
+            break
+        fi
+        sleep 0.2
+    done
+    [ -n "$reloaded" ] || fail "no reload in the journal"
+    echo "reload logged after about $(((reloaded - 1) * 200)) ms"
     systemctl is-active --quiet $unit || fail "not active after reload"
     [ "$(main_pid)" = "$pid" ] || fail "reload replaced the process"
-    journalctl --no-pager -u $unit | grep -q "reload: certificate loaded" || fail "no reload in the journal"
 
     echo "== upgrade (reinstall) while running: config check with the service's credentials, restart"
     out=$(dpkg -i "$pkg" 2>&1) || { echo "$out"; fail "reinstall"; }
