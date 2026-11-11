@@ -10,7 +10,8 @@
 //! section 3.4, RFC 5804 section 1.2 and RFC 5321 section 3.8 ask for one,
 //! but one inside a literal would become part of the client's data); it
 //! closes both TLS streams (close_notify, then FIN) and the client sees a
-//! closed connection. The same goes for a session the guard ends.
+//! closed connection. The same goes for a session the guard ends, and for one
+//! still open when a shutdown's drain time is over (`Shutdown`).
 
 use super::guard::{Dialect, Event, Guard};
 use super::Tuning;
@@ -22,17 +23,45 @@ use std::sync::{Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::Instant;
 
 const CLIENT: u8 = 1;
 const BACKEND: u8 = 2;
 
-/// Relay bytes both ways until either side closes or a `[session]` limit
-/// ends the session; record why it ended. `guarded`: IMAP and ManageSieve
-/// pass the command guard (SMTP has none, whatever it says). `token_exp`: the
-/// `exp` (Unix seconds) of the token the client logged in with, `None` for a
-/// password.
+/// The server's shutdown as every session sees it from its accept: when the
+/// relays still open are to close, and what the server waits on until they
+/// have.
+#[derive(Clone)]
+pub struct Shutdown {
+    /// Becomes `true` when the drain time of a shutdown is over.
+    close: watch::Receiver<bool>,
+    /// Upgraded by each relay for as long as it runs: the server's receiver
+    /// sees the channel close once the last relay has closed its streams.
+    /// Weak, so a session before login does not count.
+    relays: mpsc::WeakSender<()>,
+}
+
+impl Shutdown {
+    pub(crate) fn new(close: watch::Receiver<bool>, relays: mpsc::WeakSender<()>) -> Shutdown {
+        Shutdown { close, relays }
+    }
+
+    /// Resolves once the server closes the open relays; never if the server
+    /// is gone without doing so.
+    async fn closing(&self) {
+        let mut close = self.close.clone();
+        if close.wait_for(|c| *c).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Relay bytes both ways until either side closes, a `[session]` limit ends
+/// the session or the server closes it at shutdown; record why it ended.
+/// `guarded`: IMAP and ManageSieve pass the command guard (SMTP has none,
+/// whatever it says). `token_exp`: the `exp` (Unix seconds) of the token the
+/// client logged in with, `None` for a password.
 /// A peer that disconnects without a TLS close_notify ends the relay with an
 /// error; that is the normal end of many sessions, so it counts as that
 /// peer's close and is not worth a warning.
@@ -43,10 +72,14 @@ pub async fn splice<A, B>(
     guarded: bool,
     tuning: &Tuning,
     token_exp: Option<u64>,
+    shutdown: &Shutdown,
 ) where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
     B: AsyncRead + AsyncWrite + Unpin + ?Sized,
 {
+    // Held until the end is recorded. `None` once the server has stopped
+    // waiting for relays: this one then closes at once, unwaited.
+    let _running = shutdown.relays.upgrade();
     let start = Instant::now();
     let token_end = tuning
         .token_expiry_grace
@@ -64,12 +97,16 @@ pub async fn splice<A, B>(
         token_end,
         &SystemTime::now,
         dialect,
+        shutdown,
     )
     .await;
     metrics::record_session_end(proto, end);
     if is_limit(end) {
         tracing::info!(target: crate::obs::target::RELAY, proto = proto.label(), reason = end.label(),
             secs = start.elapsed().as_secs(), "session closed by limit");
+    } else if end == SessionEnd::Shutdown {
+        tracing::info!(target: crate::obs::target::RELAY, proto = proto.label(), reason = end.label(),
+            secs = start.elapsed().as_secs(), "session closed at shutdown");
     }
 }
 
@@ -136,6 +173,7 @@ async fn relay<A, B>(
     token_end: Option<SystemTime>,
     clock: &(dyn Fn() -> SystemTime + Sync),
     dialect: Option<Dialect>,
+    shutdown: &Shutdown,
 ) -> SessionEnd
 where
     A: AsyncRead + AsyncWrite + Unpin + ?Sized,
@@ -195,8 +233,9 @@ where
         _ = idle => SessionEnd::IdleLimit,
         _ = max => SessionEnd::MaxSession,
         _ = token => SessionEnd::TokenExpired,
+        _ = shutdown.closing() => SessionEnd::Shutdown,
     };
-    if is_limit(end) || end == SessionEnd::Blocked {
+    if is_limit(end) || matches!(end, SessionEnd::Blocked | SessionEnd::Shutdown) {
         let _ = tokio::time::timeout(super::CLOSE_GRACE, async {
             tokio::join!(client.shutdown(), backend.shutdown())
         })
@@ -494,10 +533,48 @@ mod tests {
                 end,
                 &now,
                 None,
+                &no_shutdown(),
             )
             .await
         });
         (client, backend, task, clock)
+    }
+
+    /// A server that never closes the relays (its sender is gone).
+    fn no_shutdown() -> Shutdown {
+        let (_, close) = watch::channel(false);
+        let (relays, _) = mpsc::channel(1);
+        Shutdown::new(close, relays.downgrade())
+    }
+
+    /// The server closing open relays at shutdown: a busy session ends with
+    /// its own reason, both sides closed like a limit closes them.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_closes_an_open_session_like_a_limit() {
+        let (close, close_rx) = watch::channel(false);
+        let (relays, _) = mpsc::channel(1);
+        let shutdown = Shutdown::new(close_rx, relays.downgrade());
+        let (mut client, mut proxy_client) = tokio::io::duplex(1024);
+        let (mut backend, mut proxy_backend) = tokio::io::duplex(1024);
+        let task = tokio::spawn(async move {
+            relay(
+                &mut proxy_client,
+                &mut proxy_backend,
+                &limits(Some(1800), None),
+                None,
+                &SystemTime::now,
+                None,
+                &shutdown,
+            )
+            .await
+        });
+        exchange(&mut client, &mut backend).await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(!task.is_finished());
+        close.send(true).unwrap();
+        assert_eq!(task.await.unwrap(), SessionEnd::Shutdown);
+        assert_closed(&mut client).await;
+        assert_closed(&mut backend).await;
     }
 
     /// Keep both directions busy until the relay ends; how long it ran.

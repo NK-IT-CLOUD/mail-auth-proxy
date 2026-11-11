@@ -116,7 +116,7 @@ async fn sigterm_drains_open_sessions_then_exits() {
 }
 
 /// A session that never ends does not hold the shutdown up for longer than
-/// the drain time (10 s).
+/// the drain time (10 s) and its close.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sigterm_closes_sessions_after_the_drain_time() {
     let mut h = Harness::start().await;
@@ -138,6 +138,78 @@ async fn sigterm_closes_sessions_after_the_drain_time() {
         .proxy
         .log_contains("sessions still open after the drain time"));
     session.expect_closed().await;
+}
+
+/// A logged-in session still open after the drain time is closed the way a
+/// session limit closes it: TLS close_notify and nothing of the proxy's
+/// own, logged with its own reason; then the process exits at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_closes_open_sessions_with_close_notify() {
+    let mut h = Harness::start().await;
+    let mut session = logged_in(&h).await;
+    let started = std::time::Instant::now();
+    h.proxy.signal("TERM");
+    let status = h
+        .proxy
+        .wait_exit(Duration::from_secs(20))
+        .await
+        .expect("exited after the drain time");
+    let took = started.elapsed();
+    assert!(status.success(), "{status}");
+    // Drain (10 s), then a close the client takes at once.
+    assert!(
+        (Duration::from_secs(9)..Duration::from_secs(11)).contains(&took),
+        "{took:?}"
+    );
+    session.expect_close_notify().await;
+    for line in [
+        "sessions still open after the drain time; closing them",
+        "session closed at shutdown proto=\"imap\" reason=\"shutdown\"",
+        "logged-in sessions closed; exiting",
+    ] {
+        assert!(h.proxy.log_contains(line), "{line}");
+    }
+}
+
+/// A client that does not read cannot hold the exit up past the drain time
+/// plus the close grace (2 s); a session that reads is closed cleanly
+/// meanwhile and counted as `shutdown`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_exit_is_bounded_when_a_client_does_not_read() {
+    const ENDED: &str = "mail_auth_proxy_sessions_ended_total{proto=\"imap\",reason=\"shutdown\"}";
+    let mut h = Harness::start().await;
+    let mut reader = logged_in(&h).await;
+    let mut stuck = logged_in(&h).await;
+    // More than the socket buffers on both sides of the proxy hold.
+    stuck.send("f FLOOD 67108864").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(h.proxy.metric(ENDED).await, 0);
+    let started = std::time::Instant::now();
+    h.proxy.signal("TERM");
+    tokio::time::sleep(Duration::from_secs(9)).await;
+    reader.expect_close_notify().await;
+    // The stuck session is still in its close grace: the process runs, and
+    // the reader's end is counted right after its close.
+    let until = std::time::Instant::now() + Duration::from_secs(1);
+    while h.proxy.metric(ENDED).await == 0 {
+        assert!(std::time::Instant::now() < until, "end not counted");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let status = h
+        .proxy
+        .wait_exit(Duration::from_secs(10))
+        .await
+        .expect("exited after the drain time and the close grace");
+    let took = started.elapsed();
+    assert!(status.success(), "{status}");
+    assert!(
+        (Duration::from_millis(11_500)..Duration::from_secs(13)).contains(&took),
+        "{took:?}"
+    );
+    assert!(h
+        .proxy
+        .log_contains("logged-in sessions not closed within the close grace; exiting"));
+    drop(stuck);
 }
 
 /// A slow JWKS refresh after SIGHUP does not hold up SIGTERM, and a second

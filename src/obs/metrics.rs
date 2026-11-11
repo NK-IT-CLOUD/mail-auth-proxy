@@ -279,9 +279,12 @@ pub enum SessionEnd {
     /// `session.end_at_token_expiry`: the token of the login expired, plus
     /// `session.token_expiry_grace_secs`.
     TokenExpired,
+    /// Still open when the drain time of a shutdown (SIGTERM, SIGINT) was
+    /// over: the proxy closed it.
+    Shutdown,
 }
 
-const SESSION_ENDS: [SessionEnd; 7] = [
+const SESSION_ENDS: [SessionEnd; 8] = [
     SessionEnd::ClientClose,
     SessionEnd::BackendClose,
     SessionEnd::IdleLimit,
@@ -289,6 +292,7 @@ const SESSION_ENDS: [SessionEnd; 7] = [
     SessionEnd::Error,
     SessionEnd::Blocked,
     SessionEnd::TokenExpired,
+    SessionEnd::Shutdown,
 ];
 
 impl SessionEnd {
@@ -302,6 +306,7 @@ impl SessionEnd {
             SessionEnd::Error => "error",
             SessionEnd::Blocked => "blocked",
             SessionEnd::TokenExpired => "token_expired",
+            SessionEnd::Shutdown => "shutdown",
         }
     }
 

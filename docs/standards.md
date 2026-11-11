@@ -199,7 +199,7 @@ Bearer tokens are validated locally as signed JWTs (JWS compact serialisation) a
 | TCP keepalive switched on per connection by the application; interval configurable | MUST (of the TCP stack) | RFC 9293 §3.8.4 (MUST-24, MUST-27) | Yes | On for client and backend connections (`session.keepalive_*`, default 600 s / 60 s / 5). The stack's 2-hour default (MUST-28) is for connections the application leaves alone. |
 | One unanswered keepalive probe does not mean a dead connection | MUST | RFC 9293 §3.8.4 (MUST-29) | Yes | `session.keepalive_count` must be at least 2 |
 | Post-login autologout at least 30 minutes | MUST | RFC 9051 §5.4, RFC 5804 §1.2 | Depends on configuration | No autologout by default. `session.idle_limit_secs` and `session.max_session_secs` below 1800 give a warning; `session.end_at_token_expiry` (off) follows the access token's lifetime, often shorter, without a warning |
-| BYE / 421 before the server closes | SHOULD | RFC 9051 §3.4, RFC 5804 §1.2, RFC 5321 §3.8 | Deviation | Not sent when a session limit closes a logged-in session. D-GEN-3. |
+| BYE / 421 before the server closes | SHOULD | RFC 9051 §3.4, RFC 5804 §1.2, RFC 5321 §3.8 | Deviation | Not sent when a session limit or a shutdown closes a logged-in session. D-GEN-3. |
 
 ## 8. Metrics
 
@@ -275,7 +275,7 @@ The relay after login with the command guard, the default; details in [protocols
 
 ### D-GEN-3: no BYE or 421 when a session limit ends a session
 
-- Behaviour: when `session.idle_limit_secs`, `session.max_session_secs` or `session.end_at_token_expiry` ends a logged-in session, the proxy closes both TLS streams (close_notify, then FIN) without a protocol message of its own. All three are off by default. A session the command guard ends ([After login](#9-after-login)) is closed the same way.
+- Behaviour: when `session.idle_limit_secs`, `session.max_session_secs` or `session.end_at_token_expiry` ends a logged-in session, the proxy closes both TLS streams (close_notify, then FIN) without a protocol message of its own. All three are off by default. A session the command guard ends ([After login](#9-after-login)) is closed the same way, and so is a logged-in session still open when the drain time of a shutdown is over ([operations: signals](operations.md#signals-and-service-manager)).
 - What the specifications say:
   - IMAP: a server SHOULD NOT close the connection without an untagged `BYE` (RFC 9051 §3.4); a post-login autologout timer MUST be at least 30 minutes (RFC 9051 §5.4).
   - ManageSieve: `BYE` SHOULD be used when the server closes the connection; an autologout timer MUST be at least 30 minutes after authentication (RFC 5804 §1.2).

@@ -537,6 +537,7 @@ async fn open_sessions_survive_every_reload() {
             "max_session",
             "error",
             "token_expired",
+            "shutdown",
         ] {
             let key = format!(
                 "mail_auth_proxy_sessions_ended_total{{proto=\"{proto}\",reason=\"{reason}\"}}"

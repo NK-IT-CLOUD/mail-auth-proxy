@@ -233,7 +233,8 @@ An upgrade replaces the binary, so it needs this restart; `systemctl reload` wou
 the old binary running. A configuration change needs only a reload ([4](#4-check-and-start)).
 
 On `SIGTERM` (stop, restart) the proxy stops accepting and gives open sessions 10 s to
-finish; clients reconnect after that.
+finish. Then it closes the logged-in sessions still open with a TLS close_notify and
+exits once they are closed, after at most 2 s more; clients reconnect after that.
 
 ## 6. Remove
 

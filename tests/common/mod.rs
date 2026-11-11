@@ -16,7 +16,8 @@
 //!   rejected after `SLOW_REJECT`, `stall…` → accepted after `STALL`,
 //!   `unavail…` → temporary failure, `garbled…` → SMTP `501` / IMAP `BAD`, anything else →
 //!   accepted, then every line is echoed as `ECHO <line>` until the line
-//!   `BACKEND-CLOSE`, on which the backend drops the connection. A rejected XOAUTH2
+//!   `BACKEND-CLOSE`, on which the backend drops the connection (`<tag> FLOOD <n>`:
+//!   `n` octets of untagged lines instead of the echo). A rejected XOAUTH2
 //!   login first gets an error challenge (IMAP `+ <json>`, SMTP `334 <json>`)
 //!   that must be answered with an empty line; a rejected OAUTHBEARER login
 //!   gets one on all three (ManageSieve: a string) that must be answered with
@@ -904,13 +905,27 @@ fn oauthbearer_error(login: &str) -> String {
 
 /// After a successful login: record and echo every line as `ECHO <line>`;
 /// `BACKEND-CLOSE` drops the connection (no TLS close_notify), as a backend
-/// that ends the session. IMAP and ManageSieve also act on what the relay's
-/// guard must keep in order (`echo_imap`, `echo_sieve`).
+/// that ends the session; `<tag> FLOOD <n>` sends at least `n` octets of
+/// untagged `* OK` lines, which fill the buffers of a client that does not
+/// read. IMAP and ManageSieve also act on what the relay's guard must keep
+/// in order (`echo_imap`, `echo_sieve`).
 async fn echo<S: AsyncRead + AsyncWrite + Unpin>(s: &mut S, rec: &Rec, kind: Kind) {
     while let Some(l) = read_line_raw(s).await {
         rec.update(|r| r.relayed.push(l.clone()));
         if l == "BACKEND-CLOSE" {
             return;
+        }
+        if let Some(n) = l
+            .split_once(" FLOOD ")
+            .and_then(|(_, n)| n.parse::<usize>().ok())
+        {
+            let line = format!("* OK {}\r\n", "x".repeat(1000));
+            for _ in 0..n.div_ceil(line.len()) {
+                if s.write_all(line.as_bytes()).await.is_err() {
+                    return;
+                }
+            }
+            continue;
         }
         let reply = match kind {
             Kind::Imap => echo_imap(s, rec, &l).await,

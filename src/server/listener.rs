@@ -22,6 +22,8 @@ pub(super) struct Lifecycle {
     /// Held by every accept loop and session; the server's receiver sees
     /// the channel close when the last one is dropped.
     pub alive: mpsc::Sender<()>,
+    /// Handed to every session: closes its relay after the drain time.
+    pub relays: crate::wire::Shutdown,
 }
 
 /// Accept on `listener` until shutdown, one task per admitted connection. A
@@ -40,10 +42,17 @@ pub(super) fn spawn_listener<P, F, Fut>(
     life: Lifecycle,
 ) where
     P: Send + Sync + 'static,
-    F: Fn(TcpStream, SocketAddr, Arc<Ctx<P>>, limits::ConnPermit) -> Fut + Copy + Send + 'static,
+    F: Fn(TcpStream, SocketAddr, Arc<Ctx<P>>, limits::ConnPermit, crate::wire::Shutdown) -> Fut
+        + Copy
+        + Send
+        + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
-    let Lifecycle { mut stop, alive } = life;
+    let Lifecycle {
+        mut stop,
+        alive,
+        relays,
+    } = life;
     tokio::spawn(async move {
         loop {
             let accepted = tokio::select! {
@@ -76,10 +85,10 @@ pub(super) fn spawn_listener<P, F, Fut>(
                     if let Err(e) = ctx.tuning.keepalive.apply(&tcp) {
                         tracing::warn!(target: crate::obs::target::MAIN, %peer, error=%e, "{ended}: TCP keepalive not set");
                     }
-                    let alive = alive.clone();
+                    let (alive, relays) = (alive.clone(), relays.clone());
                     tokio::spawn(async move {
                         let _alive = alive;
-                        if let Err(e) = handler(tcp, peer, ctx, permit).await {
+                        if let Err(e) = handler(tcp, peer, ctx, permit, relays).await {
                             // The whole chain (`{:#}`), so an outage keeps its
                             // cause. Error texts can carry client input; escape it.
                             let error = authlog::escape(&format!("{e:#}"));

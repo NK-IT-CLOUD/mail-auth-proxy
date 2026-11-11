@@ -32,6 +32,7 @@ pub async fn handle(
     peer: SocketAddr,
     ctx: Arc<Ctx<Imap>>,
     mut permit: limits::ConnPermit,
+    shutdown: wire::Shutdown,
 ) -> Result<()> {
     let _conn = metrics::ConnGuard::open(metrics::Proto::Imap);
     metrics::record_listener_connection(metrics::Listener::Imap);
@@ -161,6 +162,7 @@ pub async fn handle(
                         guarded,
                         tuning,
                         token_exp,
+                        &shutdown,
                     )
                     .await;
                     return Ok(());

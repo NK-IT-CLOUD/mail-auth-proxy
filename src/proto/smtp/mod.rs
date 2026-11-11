@@ -66,6 +66,7 @@ pub async fn handle(
     peer: SocketAddr,
     ctx: Arc<Ctx<Submission>>,
     permit: ConnPermit,
+    shutdown: crate::wire::Shutdown,
 ) -> Result<()> {
     let _conn = crate::obs::metrics::ConnGuard::open(crate::obs::metrics::Proto::Smtp);
     crate::obs::metrics::record_listener_connection(Listener::Submission);
@@ -144,6 +145,7 @@ pub async fn handle(
             local,
             listener: Listener::Submission,
             preauth_until,
+            shutdown,
         },
         ctx,
         permit,
@@ -158,6 +160,7 @@ pub async fn handle_implicit(
     peer: SocketAddr,
     ctx: Arc<Ctx<Submission>>,
     permit: ConnPermit,
+    shutdown: crate::wire::Shutdown,
 ) -> Result<()> {
     let _conn = crate::obs::metrics::ConnGuard::open(Proto::Smtp);
     crate::obs::metrics::record_listener_connection(Listener::Submissions);
@@ -172,6 +175,7 @@ pub async fn handle_implicit(
             local,
             listener: Listener::Submissions,
             preauth_until,
+            shutdown,
         },
         ctx,
         permit,
@@ -212,6 +216,8 @@ struct Conn {
     listener: Listener,
     /// End of the pre-auth budget, counted from the accept.
     preauth_until: tokio::time::Instant,
+    /// For the relay: the server's shutdown.
+    shutdown: crate::wire::Shutdown,
 }
 
 /// The dialog over TLS up to AUTH, gate, credential check and backend
@@ -228,6 +234,7 @@ async fn serve(
         local,
         listener,
         preauth_until,
+        shutdown,
     } = conn;
     let name = ctx.hostname();
     let (internal, scope) = ctx.scope(peer);
@@ -435,7 +442,7 @@ async fn serve(
                     tracing::info!(target: crate::obs::target::SUBMISSION, user=%crate::obs::authlog::sanitize(&identity), mech=%mech, issuer=%issuer.as_deref().unwrap_or(""), "submission auth ok; splicing");
                     // No command guard for SMTP: the backend refuses a
                     // second AUTH (RFC 4954 section 4).
-                    crate::wire::splice(&mut client_tls, &mut be, Proto::Smtp, false, &ctx.tuning, token_exp)
+                    crate::wire::splice(&mut client_tls, &mut be, Proto::Smtp, false, &ctx.tuning, token_exp, &shutdown)
                         .await;
                     return Ok(());
                 }

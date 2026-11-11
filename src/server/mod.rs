@@ -52,7 +52,8 @@ pub struct BackendConn {
 impl BackendConn {
     /// The connection to `address` of the backend `b`. `xclient` is
     /// `submission.xclient`, `default_tls` the protocol's default of `tls`
-    /// (both already applied by `config::parse`).
+    /// (both already applied by `config::parse`); `system` the system trust
+    /// store of the generation, for a backend without `ca_file`.
     fn new(
         id: &str,
         b: &config::Backend,
@@ -60,6 +61,7 @@ impl BackendConn {
         xclient: bool,
         default_tls: config::BackendTls,
         keepalive: crate::wire::Keepalive,
+        system: &tls::SystemRoots,
     ) -> Result<BackendConn> {
         let name = b
             .verify_name
@@ -71,7 +73,7 @@ impl BackendConn {
             id: id.to_owned(),
             address: address.to_owned(),
             name,
-            tls: tls::backend_connector(b.ca_file.as_deref())?,
+            tls: tls::backend_connector(b.ca_file.as_deref(), system)?,
             client_ip: b.effective_client_ip(xclient),
             tls_mode: b.tls.unwrap_or(default_tls),
             auth_forward: b.auth_forward,
@@ -254,6 +256,8 @@ impl Generation {
             checks
         });
         let keepalive = keepalive(&cfg.session);
+        // Read once for all the addresses without a `ca_file`.
+        let system = tls::SystemRoots::default();
         // Each backend a pool of its addresses. A backend that stays (same
         // name) keeps its counters, and each address it keeps its health.
         let pools = |p: Protocol| -> Result<Vec<(config::UsedBackend<'_>, Pool)>> {
@@ -279,6 +283,7 @@ impl Generation {
                                 xclient,
                                 default_tls,
                                 keepalive,
+                                &system,
                             )?;
                             let health = old
                                 .and_then(|o| o.members.iter().find(|m| m.conn.address == address))
@@ -683,7 +688,7 @@ pub fn file_problems(cfg: &config::Config) -> Vec<String> {
     }
     for (key, b) in backend_tables(cfg) {
         if let Some(ca) = b.ca_file.as_deref().filter(|p| !p.is_empty()) {
-            if let Err(e) = tls::backend_connector(Some(ca)) {
+            if let Err(e) = tls::ca_file_roots(ca) {
                 out.push(format!("{key}.ca_file: {e:#}"));
             }
         }
@@ -804,8 +809,10 @@ pub fn check(loaded: &config::Loaded) -> (Vec<String>, Vec<String>) {
 /// configured listeners, then serve until SIGTERM or SIGINT.
 ///
 /// SIGHUP reloads the configuration from `path` without touching open
-/// connections (`reload`). SIGTERM/SIGINT stop accepting, give open
-/// sessions up to `SHUTDOWN_DRAIN` to end, then return. Under systemd
+/// connections (`reload`). SIGTERM/SIGINT stop accepting and give open
+/// sessions up to `SHUTDOWN_DRAIN` to end; then the relays still open close
+/// both TLS streams, and the function returns once they have or after
+/// `wire::CLOSE_GRACE`. Under systemd
 /// (`$NOTIFY_SOCKET`) readiness and shutdown are notified.
 pub async fn run(path: String, cfg: config::Config) -> Result<()> {
     // First, before anything slow: SIGHUP's default action terminates the
@@ -860,9 +867,12 @@ pub async fn run(path: String, cfg: config::Config) -> Result<()> {
 
     let (stop, stop_rx) = tokio::sync::watch::channel(false);
     let (alive, mut all_ended) = tokio::sync::mpsc::channel::<()>(1);
+    let (close, close_rx) = tokio::sync::watch::channel(false);
+    let (relays, mut relays_closed) = tokio::sync::mpsc::channel::<()>(1);
     let life = listener::Lifecycle {
         stop: stop_rx,
         alive,
+        relays: crate::wire::Shutdown::new(close_rx, relays.downgrade()),
     };
 
     let cfg = &generation.config;
@@ -937,10 +947,27 @@ pub async fn run(path: String, cfg: config::Config) -> Result<()> {
     tracing::info!(target: crate::obs::target::MAIN, drain_secs = SHUTDOWN_DRAIN.as_secs(), "shutting down: listeners closed, waiting for open sessions");
     let _ = stop.send(true);
     // `None` once every accept loop and session has dropped its sender.
-    match tokio::time::timeout(SHUTDOWN_DRAIN, all_ended.recv()).await {
-        Ok(_) => tracing::info!(target: crate::obs::target::MAIN, "all sessions ended; exiting"),
+    if tokio::time::timeout(SHUTDOWN_DRAIN, all_ended.recv())
+        .await
+        .is_ok()
+    {
+        tracing::info!(target: crate::obs::target::MAIN, "all sessions ended; exiting");
+        return Ok(());
+    }
+    // The relays close both TLS streams, as when a session limit ends them;
+    // a session before login ends with the process.
+    let grace = crate::wire::CLOSE_GRACE;
+    tracing::warn!(target: crate::obs::target::MAIN, drain_secs = SHUTDOWN_DRAIN.as_secs(), close_grace_secs = grace.as_secs(),
+        "sessions still open after the drain time; closing them");
+    let _ = close.send(true);
+    // `None` once no relay holds a sender any more.
+    drop(relays);
+    match tokio::time::timeout(grace, relays_closed.recv()).await {
+        Ok(_) => {
+            tracing::info!(target: crate::obs::target::MAIN, "logged-in sessions closed; exiting")
+        }
         Err(_) => {
-            tracing::warn!(target: crate::obs::target::MAIN, drain_secs = SHUTDOWN_DRAIN.as_secs(), "sessions still open after the drain time; closing them")
+            tracing::warn!(target: crate::obs::target::MAIN, close_grace_secs = grace.as_secs(), "logged-in sessions not closed within the close grace; exiting")
         }
     }
     Ok(())

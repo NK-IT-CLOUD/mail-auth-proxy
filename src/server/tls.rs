@@ -478,36 +478,59 @@ pub(super) fn acceptor(store: &Arc<CertStore>, alpn: Option<&[u8]>) -> Acceptor 
     }
 }
 
-/// Trust anchors for a backend: the CAs in `ca_file` only, or the system
-/// store (public roots plus whatever internal CA the host trusts).
-pub(super) fn backend_connector(ca_file: Option<&str>) -> Result<TlsConnector> {
-    let mut roots = rustls::RootCertStore::empty();
-    match ca_file {
-        Some(path) => {
-            for cert in
-                CertificateDer::pem_file_iter(path).map_err(|e| anyhow::anyhow!("{path}: {e}"))?
-            {
-                roots.add(cert.map_err(|e| anyhow::anyhow!("{path}: {e}"))?)?;
-            }
-            if roots.is_empty() {
-                return Err(anyhow::anyhow!("{path}: no CA certificates"));
-            }
-        }
-        None => {
+/// The system trust store (public roots plus whatever internal CA the host
+/// trusts), shared by the backends of one generation that have no `ca_file`:
+/// read when the first of them needs it, then reused, and not at all if
+/// every backend has its own.
+#[derive(Default)]
+pub(super) struct SystemRoots(std::sync::OnceLock<Arc<rustls::RootCertStore>>);
+
+impl SystemRoots {
+    /// The store, read on the first call. An empty store fails every call.
+    fn get(&self) -> Result<Arc<rustls::RootCertStore>> {
+        let roots = self.0.get_or_init(|| {
             let native = rustls_native_certs::load_native_certs();
             for e in &native.errors {
                 tracing::warn!(target: crate::obs::target::MAIN, error=%e, "loading system CA certificates");
             }
+            let mut roots = rustls::RootCertStore::empty();
             for cert in native.certs {
                 let _ = roots.add(cert);
             }
-            if roots.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "no CA certificates found in system trust store"
-                ));
-            }
+            Arc::new(roots)
+        });
+        if roots.is_empty() {
+            return Err(anyhow::anyhow!(
+                "no CA certificates found in system trust store"
+            ));
         }
+        Ok(roots.clone())
     }
+}
+
+/// The CAs in the PEM file `path`; none is an error.
+pub(super) fn ca_file_roots(path: &str) -> Result<rustls::RootCertStore> {
+    let mut roots = rustls::RootCertStore::empty();
+    for cert in CertificateDer::pem_file_iter(path).map_err(|e| anyhow::anyhow!("{path}: {e}"))? {
+        roots.add(cert.map_err(|e| anyhow::anyhow!("{path}: {e}"))?)?;
+    }
+    if roots.is_empty() {
+        return Err(anyhow::anyhow!("{path}: no CA certificates"));
+    }
+    Ok(roots)
+}
+
+/// A TLS connector for one backend address, with its own client config (and
+/// session cache). Trust anchors: the CAs in `ca_file` only, or the system
+/// store from `system`.
+pub(super) fn backend_connector(
+    ca_file: Option<&str>,
+    system: &SystemRoots,
+) -> Result<TlsConnector> {
+    let roots = match ca_file {
+        Some(path) => Arc::new(ca_file_roots(path)?),
+        None => system.get()?,
+    };
     let cfg = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
@@ -712,6 +735,88 @@ mod tests {
         assert_eq!(served_der(&store, Some("mail.example.net")), Some(d1));
         assert_eq!(served_der(&store, Some("x.example.com")), Some(d2));
         assert_eq!(served_der(&store, Some("other.example")), None);
+    }
+
+    /// A CA and a rustls server config with a certificate for
+    /// `backend.test` that it issued.
+    fn backend_issued_by_new_ca() -> (
+        rcgen::CertifiedIssuer<'static, rcgen::KeyPair>,
+        Arc<rustls::ServerConfig>,
+    ) {
+        use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+        let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
+        p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = CertifiedIssuer::self_signed(p, KeyPair::generate().unwrap()).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let leaf = CertificateParams::new(vec!["backend.test".to_string()])
+            .unwrap()
+            .signed_by(&key, &ca)
+            .unwrap();
+        let server = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf.der().clone()],
+                PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+            )
+            .unwrap();
+        (ca, Arc::new(server))
+    }
+
+    /// Whether `connector` completes a handshake with `server` as
+    /// `backend.test`, that is, verifies its certificate.
+    async fn verifies(connector: &TlsConnector, server: &Arc<rustls::ServerConfig>) -> bool {
+        let (client, backend) = tokio::io::duplex(16 * 1024);
+        let accept = tokio_rustls::TlsAcceptor::from(server.clone()).accept(backend);
+        let name = rustls::pki_types::ServerName::try_from("backend.test").unwrap();
+        let (connected, _) = tokio::join!(connector.connect(name, client), accept);
+        connected.is_ok()
+    }
+
+    /// The system store, read once per generation and shared, verifies for
+    /// every backend without a `ca_file` as a store of its own did; each
+    /// keeps its own client config. A backend with a `ca_file` keeps its
+    /// own roots and does not read the system store, and an empty system
+    /// store fails only a backend that needs it, with the same error.
+    #[tokio::test]
+    async fn shared_system_roots_verify_like_a_store_of_its_own() {
+        let (ca, server) = backend_issued_by_new_ca();
+        let (other_ca, other_server) = backend_issued_by_new_ca();
+        let mut store = rustls::RootCertStore::empty();
+        store.add(ca.der().clone()).unwrap();
+        let system = SystemRoots::default();
+        system.0.set(Arc::new(store.clone())).unwrap();
+        let own = TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(store)
+                .with_no_client_auth(),
+        ));
+        let a = backend_connector(None, &system).unwrap();
+        let b = backend_connector(None, &system).unwrap();
+        for c in [&own, &a, &b] {
+            assert!(verifies(c, &server).await);
+            assert!(!verifies(c, &other_server).await);
+        }
+        assert!(Arc::ptr_eq(&system.get().unwrap(), &system.get().unwrap()));
+        assert!(!Arc::ptr_eq(a.config(), b.config()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca_file = dir.path().join("ca.pem").display().to_string();
+        std::fs::write(&ca_file, other_ca.pem()).unwrap();
+        let own_roots = backend_connector(Some(&ca_file), &system).unwrap();
+        assert!(verifies(&own_roots, &other_server).await);
+        assert!(!verifies(&own_roots, &server).await);
+        let unread = SystemRoots::default();
+        backend_connector(Some(&ca_file), &unread).unwrap();
+        assert!(unread.0.get().is_none(), "system store read for a ca_file");
+
+        let empty = SystemRoots::default();
+        empty
+            .0
+            .set(Arc::new(rustls::RootCertStore::empty()))
+            .unwrap();
+        let e = backend_connector(None, &empty).err().unwrap().to_string();
+        assert_eq!(e, "no CA certificates found in system trust store");
+        assert!(backend_connector(Some(&ca_file), &empty).is_ok());
     }
 
     #[test]

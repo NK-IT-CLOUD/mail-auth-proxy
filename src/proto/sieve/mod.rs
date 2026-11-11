@@ -129,6 +129,7 @@ pub async fn handle(
     peer: SocketAddr,
     ctx: Arc<Ctx<Sieve>>,
     mut permit: ConnPermit,
+    shutdown: crate::wire::Shutdown,
 ) -> Result<()> {
     let _conn = crate::obs::metrics::ConnGuard::open(crate::obs::metrics::Proto::Sieve);
     crate::obs::metrics::record_listener_connection(crate::obs::metrics::Listener::Sieve);
@@ -463,7 +464,7 @@ pub async fn handle(
                     client_tls.write_all(be_reply.as_bytes()).await?;
                     client_tls.write_all(b"\r\n").await?;
                     tracing::info!(target: crate::obs::target::SIEVE, user=%crate::obs::authlog::sanitize(&identity), mech=%mech, issuer=%issuer.as_deref().unwrap_or(""), "sieve auth ok; splicing");
-                    crate::wire::splice(&mut client_tls, &mut be, Proto::Sieve, guarded, &ctx.tuning, token_exp)
+                    crate::wire::splice(&mut client_tls, &mut be, Proto::Sieve, guarded, &ctx.tuning, token_exp, &shutdown)
                         .await;
                     return Ok(());
                 }
