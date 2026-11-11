@@ -128,10 +128,7 @@ pub async fn handle(
     // No credential was presented: a pre-auth abort.
     let starttls = match starttls {
         Ok(v) => v,
-        Err(e) => {
-            crate::obs::metrics::record_preauth_abort(crate::obs::metrics::Proto::Smtp, internal);
-            return Err(e);
-        }
+        Err(e) => return Err(auth::preauth_abort(Proto::Smtp, internal, e)),
     };
     if !starttls {
         return Ok(());
@@ -201,10 +198,7 @@ async fn accept_tls(
     .await
     {
         Ok(c) => Ok(c),
-        Err(e) => {
-            crate::obs::metrics::record_preauth_abort(Proto::Smtp, internal);
-            Err(e)
-        }
+        Err(e) => Err(auth::preauth_abort(Proto::Smtp, internal, e)),
     }
 }
 

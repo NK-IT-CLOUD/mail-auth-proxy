@@ -89,6 +89,25 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
+/// Marks the error of a session that ended before any credential was
+/// presented, a pre-auth abort (mostly scanners and probes), so the listener
+/// logs the session end at info instead of warn. Attached as context by
+/// [`preauth_abort`]; the listener leaves it out of the logged text.
+#[derive(Debug)]
+pub struct PreAuthAbort;
+
+impl std::fmt::Display for PreAuthAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ended before a credential")
+    }
+}
+
+/// Count the session ending with `e` as a pre-auth abort and mark `e`.
+pub fn preauth_abort(proto: metrics::Proto, internal: bool, e: anyhow::Error) -> anyhow::Error {
+    metrics::record_preauth_abort(proto, internal);
+    e.context(PreAuthAbort)
+}
+
 /// What the backend is asked to log in with.
 pub enum BackendCredential<'a> {
     /// A validated token, forwarded for `identity`, the token's verified
@@ -441,8 +460,7 @@ impl Attempts {
         self.presented |= presented;
         self.left = self.left.saturating_sub(1);
         if self.left == 0 {
-            self.abort_if_nothing_presented(s);
-            return Err(error);
+            return Err(self.abort_if_nothing_presented(s, error));
         }
         self.last = Some(error);
         Ok(())
@@ -458,19 +476,23 @@ impl Attempts {
         let clean_close = e
             .chain()
             .any(|c| c.downcast_ref::<LineError>().is_some_and(LineError::is_eof));
-        self.abort_if_nothing_presented(s);
         match self.last.take() {
-            Some(last) if clean_close => last,
+            Some(last) if clean_close => self.abort_if_nothing_presented(s, last),
             _ => {
+                let e = self.abort_if_nothing_presented(s, e);
                 no_credential(s);
                 e
             }
         }
     }
 
-    fn abort_if_nothing_presented(&self, s: &Session<'_>) {
-        if !self.presented {
-            metrics::record_preauth_abort(s.proto, s.internal);
+    /// `e`, counted and marked as a pre-auth abort if no credential was
+    /// ever presented.
+    fn abort_if_nothing_presented(&self, s: &Session<'_>, e: anyhow::Error) -> anyhow::Error {
+        if self.presented {
+            e
+        } else {
+            preauth_abort(s.proto, s.internal, e)
         }
     }
 }

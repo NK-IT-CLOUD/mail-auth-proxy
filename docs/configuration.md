@@ -66,7 +66,10 @@ The file is strict. Startup fails, and `--check-config` reports, when:
   outside 32-64, or a `[session]` value outside its range ([Keys](#keys));
 - a network (`scope.internal_networks`, a rule's `networks`,
   `password_gate.internal_networks`) is not a CIDR, or an `identity_domains`,
-  `allowed_domains` or `users` entry is not a domain or login;
+  `allowed_domains` or `users` entry is not a domain or login. A network written as
+  IPv4-mapped IPv6 (`::ffff:192.0.2.0/120`) in any network list is a warning: client
+  addresses are compared in their canonical form, an IPv4 client as its IPv4 address, so
+  it never matches; write the IPv4 network (`192.0.2.0/24`);
 - a backend sets `client_ip` together with its short form (`proxy_protocol`, or
   `submission.xclient` for the submission backend), the submission backend sets both
   short forms, or `client_ip = "xclient"` is set on the IMAP or ManageSieve backend
@@ -218,7 +221,7 @@ key over (`yes`) or it needs a restart ([Reload](#reload)).
 | `oauth.issuers[].audiences` | array | required | yes | the token's `aud` must contain one |
 | `oauth.issuers[].token_type` | `keycloak` \| `rfc9068` \| `any` | required | yes | access-token marker: claim `typ=Bearer`, header `typ=at+jwt`, or none (warning) |
 | `oauth.issuers[].identity_claim` | string | `email` | yes | claim forwarded to the backend as the login; one word, and one plain address for `email` |
-| `oauth.issuers[].require_email_verified` | bool | on for `email` | yes | require `email_verified = true` |
+| `oauth.issuers[].require_email_verified` | bool | on for `email` | yes | require `email_verified = true`; `false` with `identity_claim = "email"` is a warning (the mailbox then comes from an address the IdP has not verified) |
 | `oauth.issuers[].allowed_algorithms` | array | RS256/384/512, PS256/384/512, ES256, ES384 | yes | keys are used only with these |
 | `oauth.issuers[].infer_key_algorithm` | bool | `true` | yes | a JWKS key without `alg` is used with the one algorithm its type implies (ES256 for P-256, ES384 for P-384, RS256 for RSA); off: such keys are skipped |
 | `oauth.issuers[].allowed_clients` | array | empty (any) | yes | accepted values of `client_claim` |
@@ -447,7 +450,7 @@ cert = "/etc/mail-auth-proxy/tls/wildcard.pem"         # *.example.com
 key = "/etc/mail-auth-proxy/tls/wildcard.key"
 ```
 
-Environment: `RUST_LOG` (log filter, default `info`; see [operations.md](operations.md#logging)).
+Environment: `RUST_LOG` (log filter, default `error,mail_auth_proxy=info,authlog=info`; see [operations.md](operations.md#logging)).
 
 How the legacy keys act together is described in [architecture.md](architecture.md#legacy-gate),
 the token keys in [architecture.md](architecture.md#oauth-token-validation), and a worked

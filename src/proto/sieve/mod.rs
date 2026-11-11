@@ -192,10 +192,7 @@ pub async fn handle(
     // No credential was presented: a pre-auth abort.
     let starttls = match starttls {
         Ok(v) => v,
-        Err(e) => {
-            crate::obs::metrics::record_preauth_abort(crate::obs::metrics::Proto::Sieve, internal);
-            return Err(e);
-        }
+        Err(e) => return Err(auth::preauth_abort(Proto::Sieve, internal, e)),
     };
     if !starttls {
         return Ok(());
@@ -210,10 +207,7 @@ pub async fn handle(
     .await
     {
         Ok(c) => c,
-        Err(e) => {
-            crate::obs::metrics::record_preauth_abort(crate::obs::metrics::Proto::Sieve, internal);
-            return Err(e);
-        }
+        Err(e) => return Err(auth::preauth_abort(Proto::Sieve, internal, e)),
     };
 
     // The TLS session ends with close_notify whichever way the dialog

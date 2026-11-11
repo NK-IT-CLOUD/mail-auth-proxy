@@ -11,7 +11,7 @@ ExecStart=/usr/bin/mail-auth-proxy /etc/mail-auth-proxy/config.toml
 # SIGHUP: reload the config file (listener and metrics addresses need a
 # restart), the TLS certificates and the JWKS; open connections stay
 ExecReload=/bin/kill -HUP $MAINPID
-Environment=RUST_LOG=info
+# No RUST_LOG: the built-in filter keeps the libraries' log lines at error.
 # Unprivileged system user from sysusers.d; its group owns the config and the TLS
 # key (root:mail-auth-proxy 0640).
 User=mail-auth-proxy

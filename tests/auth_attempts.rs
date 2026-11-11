@@ -238,6 +238,52 @@ async fn attempts_without_a_credential_count() {
     );
 }
 
+/// The session-end line of a connection that ended before any credential
+/// (a pre-auth abort, mostly scanners) is INFO; once a credential was
+/// presented, a session that ends with an error is still WARN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_end_level_follows_the_credential() {
+    let h = Harness::start_with(opts(3)).await;
+    let unsupported = |kind: Kind| match kind {
+        Kind::Imap => "a AUTHENTICATE FOO",
+        Kind::Smtp => "AUTH FOO",
+        Kind::Sieve => "AUTHENTICATE \"FOO\"",
+    };
+    for kind in Kind::ALL {
+        let mut c = h.ready(kind, Src::Internal, Sni::Internal).await;
+        for _ in 0..3 {
+            c.send(unsupported(kind)).await;
+            c.line().await;
+        }
+        c.expect_end(kind).await;
+        let line = h.wait_session_ended(kind, 1).await;
+        assert!(line.contains(" INFO "), "{kind:?}: {line}");
+        // The text is the error chain as before, without the marker.
+        assert!(
+            line.contains(" error=authentication attempt without a credential: "),
+            "{kind:?}: {line}"
+        );
+
+        let mut c = h.ready(kind, Src::Internal, Sni::Internal).await;
+        c.send(&plain_command(kind, "a", "reject@example.test", "pw"))
+            .await;
+        assert_eq!(untagged(kind, &c.line().await), refusal(kind), "{kind:?}");
+        for _ in 0..2 {
+            c.send(unsupported(kind)).await;
+            c.line().await;
+        }
+        c.expect_end(kind).await;
+        let line = h.wait_session_ended(kind, 2).await;
+        assert!(line.contains(" WARN "), "{kind:?}: {line}");
+    }
+    assert_eq!(
+        h.proxy
+            .metric(&preauth_aborts(Kind::Imap, "internal"))
+            .await,
+        1
+    );
+}
+
 /// An outage ends the session although attempts are left: another attempt
 /// would meet it too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

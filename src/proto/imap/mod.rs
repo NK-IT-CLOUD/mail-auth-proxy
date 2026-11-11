@@ -50,10 +50,7 @@ pub async fn handle(
         .await
         {
             Ok(c) => c,
-            Err(e) => {
-                metrics::record_preauth_abort(metrics::Proto::Imap, internal);
-                return Err(e);
-            }
+            Err(e) => return Err(auth::preauth_abort(metrics::Proto::Imap, internal, e)),
         };
     // The TLS session ends with close_notify whichever way the dialog
     // ends (RFC 8314 §3.4); the relay closes its own.

@@ -197,6 +197,9 @@ impl Config {
             if iss.identity_claim != "email" && iss.requires_email_verified() {
                 warnings.push(format!("{at}: require_email_verified checks the email_verified claim although identity_claim is {:?}", iss.identity_claim));
             }
+            if iss.identity_claim == "email" && !iss.requires_email_verified() {
+                warnings.push(format!("{at}: require_email_verified = false with identity_claim = \"email\" takes the mailbox from an address the IdP has not verified"));
+            }
             if let Some(url) = &iss.openid_configuration_url {
                 match check_openid_configuration_url(url) {
                     Err(e) => err(format!("{at}.openid_configuration_url: {e}")),
@@ -255,6 +258,7 @@ impl Config {
                     // The rule this becomes has `public = true` (see
                     // `normalize`): the same warning as a written rule.
                     Ok(nets) => {
+                        warn_ipv4_mapped("password_gate.internal_networks", &nets, warnings);
                         for n in nets.iter().filter(|n| !is_private_net(n)) {
                             let anywhere = if n.prefix_len() == 0 {
                                 " (from anywhere)"
@@ -267,8 +271,11 @@ impl Config {
                     Err(e) => err(format!("password_gate.internal_networks: {e:#}")),
                 }
             } else {
-                if let Err(e) = crate::auth::policy::parse_internal_nets(&g.internal_networks) {
-                    err(format!("password_gate.internal_networks: {e:#}"));
+                match crate::auth::policy::parse_internal_nets(&g.internal_networks) {
+                    Ok(nets) => {
+                        warn_ipv4_mapped("password_gate.internal_networks", &nets, warnings)
+                    }
+                    Err(e) => err(format!("password_gate.internal_networks: {e:#}")),
                 }
                 if !g.sni.is_empty() {
                     warnings.push("password_gate is disabled; its sni is ignored (internal_networks still sets the scope label)".into());
@@ -278,8 +285,9 @@ impl Config {
                 err("[password_gate] and [[legacy.rules]] cannot be combined: write the password gate as a rule (see --print-config)".into());
             }
         }
-        if let Err(e) = crate::auth::policy::parse_internal_nets(&self.scope.internal_networks) {
-            err(format!("scope.internal_networks: {e:#}"));
+        match crate::auth::policy::parse_internal_nets(&self.scope.internal_networks) {
+            Ok(nets) => warn_ipv4_mapped("scope.internal_networks", &nets, warnings),
+            Err(e) => err(format!("scope.internal_networks: {e:#}")),
         }
         let gate_on = self.password_gate.as_ref().is_some_and(|g| g.enabled);
         self.legacy.check(gate_on, &mut err, warnings);
@@ -302,12 +310,6 @@ impl Config {
         // separate budget per address again.
         if !(32..=64).contains(&l.ipv6_source_prefix) {
             err("limits.ipv6_source_prefix must be between 32 and 64".into());
-        }
-        if l.max_connections > tokio::sync::Semaphore::MAX_PERMITS {
-            err(format!(
-                "limits.max_connections is larger than {}",
-                tokio::sync::Semaphore::MAX_PERMITS
-            ));
         }
         let t = &self.timeouts;
         if t.preauth_secs == 0 || t.idle_secs == 0 || t.connect_secs == 0 {
@@ -960,7 +962,10 @@ impl Legacy {
                 Vec::new()
             } else {
                 match crate::auth::policy::parse_internal_nets(&r.networks) {
-                    Ok(n) => n,
+                    Ok(n) => {
+                        warn_ipv4_mapped(&format!("{at}.networks"), &n, warnings);
+                        n
+                    }
                     Err(e) => {
                         err(format!("{at}.networks: {e:#}"));
                         Vec::new()
@@ -1094,6 +1099,26 @@ impl Session {
 /// True if every address of `net` is private: RFC 1918, loopback,
 /// link-local, or IPv6 ULA. Anything else (including 0.0.0.0/0 and ::/0) is
 /// public.
+/// Warn about each network of `key` written as IPv4-mapped IPv6
+/// (`::ffff:192.0.2.0/120`): client addresses are compared in canonical form
+/// (`auth::policy::is_internal`), so an IPv4 client is never inside it.
+fn warn_ipv4_mapped(key: &str, nets: &[ipnet::IpNet], warnings: &mut Vec<String>) {
+    for n in nets {
+        let ipnet::IpNet::V6(v6) = n else { continue };
+        let Some(v4) = v6.network().to_ipv4_mapped() else {
+            continue;
+        };
+        if v6.prefix_len() < 96 {
+            continue;
+        }
+        let v4 = ipnet::Ipv4Net::new(v4, v6.prefix_len() - 96)
+            .expect("a prefix of 96 to 128 leaves 0 to 32");
+        warnings.push(format!(
+            "{key}: {n} is an IPv4-mapped IPv6 network and never matches, because IPv4 clients are compared as IPv4 addresses; write {v4}"
+        ));
+    }
+}
+
 pub fn is_private_net(net: &ipnet::IpNet) -> bool {
     const PRIVATE: &[&str] = &[
         "10.0.0.0/8",
@@ -1193,6 +1218,7 @@ impl AuthRateLimit {
         }
         match crate::auth::policy::parse_internal_nets(&self.exempt_networks) {
             Ok(nets) => {
+                warn_ipv4_mapped("auth_ratelimit.exempt_networks", &nets, warnings);
                 for n in nets.iter().filter(|n| !is_private_net(n)) {
                     warnings.push(format!(
                         "auth_ratelimit.exempt_networks: sources in the public network {n} are never blocked"
@@ -1601,6 +1627,91 @@ mod tests {
                 "{bad:?}: {e}"
             );
         }
+    }
+
+    /// `require_email_verified = false` with the `email` identity takes the
+    /// mailbox from an unverified address: a warning. Explicitly on, the
+    /// default, and off for another claim are not warned about.
+    #[test]
+    fn unverified_email_identity_is_warned_about() {
+        let with = |extra: &str| {
+            let cfg = V2.replace(
+                "token_type = \"keycloak\"\n",
+                &format!("token_type = \"keycloak\"\n{extra}"),
+            );
+            let l = crate::config::parse(&cfg).unwrap();
+            assert!(l.errors.is_empty(), "{extra}: {:?}", l.errors);
+            l.warnings
+                .into_iter()
+                .filter(|w| w.contains("has not verified"))
+                .collect::<Vec<_>>()
+        };
+        let w = with("require_email_verified = false\n");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].starts_with("oauth.issuers[0]: "), "{w:?}");
+        let w = with("identity_claim = \"email\"\nrequire_email_verified = false\n");
+        assert_eq!(w.len(), 1, "{w:?}");
+        for quiet in [
+            "",
+            "require_email_verified = true\n",
+            "identity_claim = \"preferred_username\"\nrequire_email_verified = false\n",
+        ] {
+            assert!(with(quiet).is_empty(), "{quiet:?}");
+        }
+    }
+
+    /// A network written as IPv4-mapped IPv6 never matches (peers are
+    /// compared in canonical form): a warning naming the IPv4 network, in
+    /// every network list. IPv6 networks outside `::ffff:0:0/96`, and wider
+    /// ones that merely contain it, are not warned about.
+    #[test]
+    fn ipv4_mapped_networks_are_warned_about() {
+        let mapped = |l: &crate::config::Loaded| {
+            l.warnings
+                .iter()
+                .filter(|w| w.contains("IPv4-mapped"))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let users = "users = [\"*@example.org\"]\n";
+        for (extra, key, v4) in [
+            (
+                "[scope]\ninternal_networks = [\"10.0.0.0/8\", \"::ffff:192.0.2.0/120\"]\n".to_string(),
+                "scope.internal_networks",
+                "192.0.2.0/24",
+            ),
+            (
+                format!("[[legacy.rules]]\nname = \"r\"\nnetworks = [\"::ffff:10.1.2.3/128\"]\n{users}"),
+                "legacy.rules[r].networks",
+                "10.1.2.3/32",
+            ),
+            (
+                "[auth_ratelimit]\nexempt_networks = [\"::ffff:0:0/96\"]\n".to_string(),
+                "auth_ratelimit.exempt_networks",
+                "0.0.0.0/0",
+            ),
+            (
+                "[password_gate]\nenabled = true\nsni = [\"m.example\"]\ninternal_networks = [\"::ffff:10.0.0.0/104\"]\n".to_string(),
+                "password_gate.internal_networks",
+                "10.0.0.0/8",
+            ),
+            (
+                "[password_gate]\nenabled = false\ninternal_networks = [\"::ffff:10.0.0.0/104\"]\n".to_string(),
+                "password_gate.internal_networks",
+                "10.0.0.0/8",
+            ),
+        ] {
+            let l = crate::config::parse(&format!("{V2}{extra}")).unwrap();
+            let w = mapped(&l);
+            assert_eq!(w.len(), 1, "{extra}: {:?}", l.warnings);
+            assert!(w[0].starts_with(&format!("{key}: ")), "{w:?}");
+            assert!(w[0].ends_with(&format!("write {v4}")), "{w:?}");
+        }
+        let quiet = crate::config::parse(&format!(
+            "{V2}[scope]\ninternal_networks = [\"10.0.0.0/8\", \"2001:db8::/32\", \"::/0\", \"::ffff:0:0/80\", \"::1/128\"]\n"
+        ))
+        .unwrap();
+        assert!(mapped(&quiet).is_empty(), "{:?}", quiet.warnings);
     }
 
     /// `[password_gate]` short form: one rule plus the scope label; `[scope]`

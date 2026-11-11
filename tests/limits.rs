@@ -146,6 +146,8 @@ async fn preauth_budget_closes_silent_clients() {
             .all(|l| l.contains("pre-auth budget of 1s used up")),
         "{ended:#?}"
     );
+    // No credential was presented: pre-auth aborts, logged at INFO.
+    assert!(ended.iter().all(|l| l.contains(" INFO ")), "{ended:#?}");
 
     // IMAP writes a protocol record for a pre-auth failure after TLS; a TLS
     // timeout and the plaintext phases of SMTP/ManageSieve write none.

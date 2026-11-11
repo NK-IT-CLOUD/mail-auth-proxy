@@ -89,12 +89,23 @@ pub(super) fn spawn_listener<P, F, Fut>(
                     tokio::spawn(async move {
                         let _alive = alive;
                         if let Err(e) = handler(tcp, peer, ctx, permit, relays).await {
-                            // The whole chain (`{:#}`), so an outage keeps its
-                            // cause. Error texts can carry client input; escape it.
-                            let error = authlog::escape(&format!("{e:#}"));
+                            // The whole chain (as `{:#}` writes it, without the
+                            // pre-auth marker), so an outage keeps its cause.
+                            // Error texts can carry client input; escape it.
+                            let preauth = e.is::<crate::auth::PreAuthAbort>();
+                            let chain: Vec<String> = e
+                                .chain()
+                                .skip(usize::from(preauth))
+                                .map(ToString::to_string)
+                                .collect();
+                            let error = authlog::escape(&chain.join(": "));
                             if e.is::<crate::auth::Refused>() {
                                 // The authresult line already recorded it.
                                 tracing::debug!(target: crate::obs::target::MAIN, %peer, error=%error, "{}", ended);
+                            } else if preauth {
+                                // Before any credential: mostly scanners and
+                                // probes, counted in preauth_aborts_total.
+                                tracing::info!(target: crate::obs::target::MAIN, %peer, error=%error, "{}", ended);
                             } else {
                                 tracing::warn!(target: crate::obs::target::MAIN, %peer, error=%error, "{}", ended);
                             }
